@@ -22,6 +22,28 @@ A localhost-first web console for WSL with a session-management scaffold suitabl
 - Touch and wheel scrolling support for terminal history across desktop and iOS clients
 - Top pill view switch with an in-depth metrics dashboard (calendar + filters + summary cards)
 
+## Screenshots
+### 1) Console view with Codex open
+![Console view with Codex open](docs/screenshots/image-1.jpg)
+
+### 2) Codex session list
+![Codex session list](docs/screenshots/image-2.jpg)
+
+### 3) Metric filters
+![Metric filters](docs/screenshots/image-3.jpg)
+
+### 4) Calendar
+![Calendar](docs/screenshots/image-4.jpg)
+
+### 5) iOS console synced with desktop (from screenshot 6)
+![iOS console synced with desktop](docs/screenshots/image-5.jpg)
+
+### 6) Desktop console synced with iOS (from screenshot 5)
+![Desktop console synced with iOS](docs/screenshots/image-6.jpg)
+
+### 7) Calendar and metrics on desktop
+![Calendar and metrics on desktop](docs/screenshots/image-7.jpg)
+
 ## Requirements
 - Windows with WSL installed and a default distro configured
 - Node.js 18+
