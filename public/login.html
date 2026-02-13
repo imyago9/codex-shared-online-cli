@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign In | Local Codex WSL Console</title>
+  <link rel="stylesheet" href="/assets/login.css">
+</head>
+<body>
+  <main class="login-page">
+    <section class="login-card" aria-label="Sign in">
+      <h1 class="login-title">Local Codex WSL Console</h1>
+      <p class="login-subtitle">Enter your password to open the shared console.</p>
+      <form id="login-form" class="login-form">
+        <label for="password-input" class="field-label">Password</label>
+        <input id="password-input" class="field-input" type="password" autocomplete="current-password" required>
+        <button id="submit-button" class="submit-button" type="submit">Unlock</button>
+        <p id="status-text" class="status-text" role="status" aria-live="polite"></p>
+      </form>
+    </section>
+  </main>
+  <script src="/assets/login.js"></script>
+</body>
+</html>

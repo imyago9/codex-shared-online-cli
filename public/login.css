@@ -1,0 +1,122 @@
+:root {
+  color-scheme: light;
+  --bg: #f2f0ea;
+  --bg-accent: #ddd6c8;
+  --card: rgba(255, 255, 255, 0.9);
+  --ink: #1f1f1f;
+  --muted: #606060;
+  --line: rgba(0, 0, 0, 0.14);
+  --accent: #d97a41;
+  --danger: #8b2727;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", "Gill Sans", Calibri, sans-serif;
+  color: var(--ink);
+  background: radial-gradient(circle at top left, var(--bg) 0%, var(--bg-accent) 68%, #d1c7b5 100%);
+}
+
+.login-page {
+  height: 100%;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.login-card {
+  width: min(420px, 100%);
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 22px;
+  box-shadow: 0 20px 50px rgba(10, 10, 10, 0.18);
+}
+
+.login-title {
+  margin: 0;
+  font-size: 20px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.login-subtitle {
+  margin: 8px 0 0;
+  font-size: 14px;
+  color: var(--muted);
+}
+
+.login-form {
+  margin-top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.field-label {
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.field-input {
+  height: 40px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  padding: 0 12px;
+  font-size: 14px;
+  color: var(--ink);
+  background: #fff;
+}
+
+.field-input:focus {
+  outline: 2px solid rgba(217, 122, 65, 0.35);
+  outline-offset: 1px;
+  border-color: rgba(217, 122, 65, 0.7);
+}
+
+.submit-button {
+  height: 40px;
+  border-radius: 10px;
+  border: 1px solid rgba(0, 0, 0, 0.18);
+  background: linear-gradient(180deg, #f9f7f1 0%, #ece7da 100%);
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.submit-button:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
+.status-text {
+  min-height: 18px;
+  margin: 4px 0 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.status-text.error {
+  color: var(--danger);
+}
+
+@media (max-width: 640px) {
+  .login-card {
+    padding: 18px;
+    border-radius: 14px;
+  }
+
+  .login-title {
+    font-size: 18px;
+  }
+}

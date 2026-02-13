@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local Codex WSL Console</title>
+  <link rel="stylesheet" href="/vendor/xterm-css/xterm.css">
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <div class="page">
+    <header class="topbar">
+      <div class="title-wrap">
+        <div class="title">Local Codex WSL Console</div>
+        <div class="subtitle">localhost session manager scaffold</div>
+      </div>
+
+      <div class="controls">
+        <label class="session-label" for="session-select">Session</label>
+        <select id="session-select" class="session-select"></select>
+        <button id="new-session" class="control-btn" type="button">New</button>
+        <button id="delete-session" class="control-btn danger" type="button">End</button>
+        <div id="connection" class="status">Connecting...</div>
+      </div>
+    </header>
+
+    <main class="content">
+      <div class="view-switch" role="tablist" aria-label="View picker">
+        <button id="view-pill-console" class="view-pill active" type="button" role="tab" aria-selected="true">Console</button>
+        <button id="view-pill-metrics" class="view-pill" type="button" role="tab" aria-selected="false">Metrics</button>
+      </div>
+
+      <section id="console-view" class="app-view active" aria-label="Console view">
+        <div class="terminal-layout">
+          <div id="terminal" class="terminal-shell"></div>
+          <div
+            id="scroll-slider"
+            class="scroll-slider"
+            role="slider"
+            tabindex="0"
+            aria-label="Terminal history scroll control"
+            aria-orientation="horizontal"
+            aria-valuemin="-100"
+            aria-valuemax="100"
+            aria-valuenow="0"
+          >
+            <div class="scroll-slider-track"></div>
+            <div id="scroll-slider-thumb" class="scroll-slider-thumb"></div>
+          </div>
+        </div>
+        <div id="hint" class="hint">Tap or click inside the terminal to focus. Session input is shared per selected session.</div>
+        <div class="attach-row">
+          <div class="hint" id="local-attach-line"></div>
+          <button id="copy-attach-command" class="control-btn" type="button">Copy Attach Cmd</button>
+        </div>
+        <section class="codex-panel" aria-label="Codex sessions">
+          <div class="codex-head">
+            <div class="codex-title">Codex Sessions On This Device</div>
+            <div class="codex-actions">
+              <input id="codex-search" class="codex-search" type="search" placeholder="Search id, cwd, model">
+              <button id="codex-refresh" class="control-btn" type="button">Refresh</button>
+            </div>
+          </div>
+          <div id="codex-summary" class="codex-summary">Loading session index...</div>
+          <div id="codex-status" class="codex-status"></div>
+          <div id="codex-list" class="codex-list"></div>
+        </section>
+      </section>
+
+      <section id="metrics-view" class="app-view" aria-label="Metrics view">
+        <section class="metrics-panel" aria-label="Session metrics controls">
+          <div class="metrics-head">
+            <div class="metrics-title">Session Metrics</div>
+          </div>
+          <div class="metrics-filters">
+            <label class="metrics-field">
+              <span>Date Scope</span>
+              <select id="metrics-date-scope">
+                <option value="all">All Data</option>
+                <option value="range">Date Range</option>
+              </select>
+            </label>
+            <label class="metrics-field">
+              <span>Calendar Month</span>
+              <input id="metrics-month" type="month">
+            </label>
+            <label class="metrics-field">
+              <span>From</span>
+              <input id="metrics-from" type="date">
+            </label>
+            <label class="metrics-field">
+              <span>To</span>
+              <input id="metrics-to" type="date">
+            </label>
+            <label class="metrics-field">
+              <span>Status</span>
+              <select id="metrics-status">
+                <option value="">All</option>
+                <option value="resumable">Resumable</option>
+                <option value="not_resumable">Non-resumable</option>
+                <option value="unknown">Unknown</option>
+              </select>
+            </label>
+            <label class="metrics-field">
+              <span>Model</span>
+              <select id="metrics-model">
+                <option value="">All</option>
+              </select>
+            </label>
+            <label class="metrics-field">
+              <span>Cwd</span>
+              <select id="metrics-cwd">
+                <option value="">All</option>
+              </select>
+            </label>
+            <label class="metrics-field metrics-search-field">
+              <span>Search</span>
+              <input id="metrics-search" type="search" placeholder="Search id, cwd, model">
+            </label>
+            <button id="metrics-clear" class="control-btn" type="button">Clear Filters</button>
+          </div>
+          <div id="metrics-status-text" class="metrics-status"></div>
+        </section>
+
+        <section class="metrics-summary-grid" aria-label="Metrics summary">
+          <article class="metric-card">
+            <div class="metric-label">Sessions</div>
+            <div id="metric-sessions" class="metric-value">0</div>
+          </article>
+          <article class="metric-card">
+            <div class="metric-label">Tokens</div>
+            <div id="metric-tokens" class="metric-value">0</div>
+          </article>
+          <article class="metric-card">
+            <div class="metric-label">Tool Calls</div>
+            <div id="metric-tools" class="metric-value">0</div>
+          </article>
+          <article class="metric-card">
+            <div class="metric-label">Avg Duration</div>
+            <div id="metric-duration" class="metric-value">0m</div>
+          </article>
+        </section>
+
+        <section class="metrics-panel" aria-label="Calendar heatmap">
+          <div class="metrics-head">
+            <div class="metrics-title">Calendar</div>
+            <div id="calendar-legend" class="metrics-status"></div>
+          </div>
+          <div id="metrics-calendar" class="metrics-calendar"></div>
+        </section>
+
+        <section class="metrics-panel" aria-label="Filtered sessions">
+          <div class="metrics-head">
+            <div class="metrics-title">Filtered Sessions</div>
+            <div id="metrics-results" class="metrics-status"></div>
+          </div>
+          <div id="metrics-list" class="metrics-list"></div>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <script src="/vendor/xterm/xterm.js"></script>
+  <script src="/vendor/xterm-addon-fit/xterm-addon-fit.js"></script>
+  <script src="/assets/app.js"></script>
+</body>
+</html>
