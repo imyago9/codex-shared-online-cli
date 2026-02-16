@@ -35,6 +35,7 @@ const metricsResultsElement = document.getElementById('metrics-results');
 const metricsListElement = document.getElementById('metrics-list');
 const scrollSliderElement = document.getElementById('scroll-slider');
 const scrollSliderThumbElement = document.getElementById('scroll-slider-thumb');
+const terminalFullscreenToggleElement = document.getElementById('terminal-fullscreen-toggle');
 const isLikelyIOS =
   /iPad|iPhone|iPod/.test(navigator.userAgent) ||
   (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
@@ -57,6 +58,7 @@ const state = {
   codexRefreshTimer: null,
   codexSearchTerm: '',
   codexLoading: false,
+  terminalFullscreen: false,
   localAttachCommand: '',
   singleConsoleMode: false,
   metricsFilters: {
@@ -136,6 +138,43 @@ terminalElement.addEventListener('click', () => {
   term.focus();
 });
 
+function updateFullscreenToggleButton() {
+  if (!terminalFullscreenToggleElement) {
+    return;
+  }
+
+  const isFullscreen = state.terminalFullscreen === true;
+  terminalFullscreenToggleElement.textContent = isFullscreen ? 'Exit' : 'Fullscreen';
+  terminalFullscreenToggleElement.setAttribute('aria-pressed', isFullscreen ? 'true' : 'false');
+  terminalFullscreenToggleElement.setAttribute(
+    'aria-label',
+    isFullscreen ? 'Exit terminal fullscreen' : 'Enter terminal fullscreen'
+  );
+}
+
+function updateFullscreenViewportHeight() {
+  const viewportHeight = window.visualViewport ? Math.round(window.visualViewport.height) : window.innerHeight;
+  if (Number.isFinite(viewportHeight) && viewportHeight > 0) {
+    document.documentElement.style.setProperty('--terminal-fullscreen-height', `${viewportHeight}px`);
+  }
+}
+
+function setTerminalFullscreen(enabled) {
+  const shouldEnable = enabled === true && state.activeView === 'console';
+  if (state.terminalFullscreen === shouldEnable) {
+    updateFullscreenToggleButton();
+    return;
+  }
+
+  state.terminalFullscreen = shouldEnable;
+  document.body.classList.toggle('terminal-fullscreen-active', shouldEnable);
+  if (shouldEnable) {
+    updateFullscreenViewportHeight();
+  }
+  updateFullscreenToggleButton();
+  scheduleTerminalLayoutSync(0);
+}
+
 function syncTerminalLayout() {
   if (state.activeView !== 'console') {
     return;
@@ -168,6 +207,9 @@ function resetTerminalViewport() {
   term.clear();
   term.reset();
 }
+
+updateFullscreenViewportHeight();
+updateFullscreenToggleButton();
 
 function decodeSocketFrame(frameData) {
   if (typeof frameData === 'string') {
@@ -474,6 +516,9 @@ function setView(view) {
   if (isConsole) {
     scheduleTerminalLayoutSync(0);
   } else {
+    if (state.terminalFullscreen) {
+      setTerminalFullscreen(false);
+    }
     renderMetricsDashboard();
   }
 }
@@ -2038,7 +2083,11 @@ window.addEventListener('resize', () => {
   viewportResizeState.width = nextWidth;
   viewportResizeState.height = nextHeight;
 
-  if (isLikelyIOS && deltaWidth < 2 && deltaHeight < 2) {
+  if (state.terminalFullscreen) {
+    updateFullscreenViewportHeight();
+  }
+
+  if (isLikelyIOS && deltaWidth < 2 && deltaHeight < 2 && !state.terminalFullscreen) {
     return;
   }
 
@@ -2053,11 +2102,17 @@ if (window.visualViewport) {
     const deltaHeight = Math.abs(nextHeight - viewportResizeState.height);
 
     if (deltaWidth < 1 && deltaHeight < 1) {
+      if (state.terminalFullscreen) {
+        updateFullscreenViewportHeight();
+      }
       return;
     }
 
     viewportResizeState.width = nextWidth;
     viewportResizeState.height = nextHeight;
+    if (state.terminalFullscreen) {
+      updateFullscreenViewportHeight();
+    }
     scheduleTerminalLayoutSync(45);
   };
 
@@ -2115,6 +2170,12 @@ viewPillConsoleElement.addEventListener('click', () => {
 viewPillMetricsElement.addEventListener('click', () => {
   setView('metrics');
 });
+
+if (terminalFullscreenToggleElement) {
+  terminalFullscreenToggleElement.addEventListener('click', () => {
+    setTerminalFullscreen(!state.terminalFullscreen);
+  });
+}
 
 codexSearchElement.addEventListener('input', (event) => {
   state.codexSearchTerm = event.target.value || '';

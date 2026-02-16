@@ -33,19 +33,30 @@
       <section id="console-view" class="app-view active" aria-label="Console view">
         <div class="terminal-layout">
           <div id="terminal" class="terminal-shell"></div>
-          <div
-            id="scroll-slider"
-            class="scroll-slider"
-            role="slider"
-            tabindex="0"
-            aria-label="Terminal history scroll control"
-            aria-orientation="horizontal"
-            aria-valuemin="-100"
-            aria-valuemax="100"
-            aria-valuenow="0"
-          >
-            <div class="scroll-slider-track"></div>
-            <div id="scroll-slider-thumb" class="scroll-slider-thumb"></div>
+          <div class="terminal-controls-row">
+            <div
+              id="scroll-slider"
+              class="scroll-slider"
+              role="slider"
+              tabindex="0"
+              aria-label="Terminal history scroll control"
+              aria-orientation="horizontal"
+              aria-valuemin="-100"
+              aria-valuemax="100"
+              aria-valuenow="0"
+            >
+              <div class="scroll-slider-track"></div>
+              <div id="scroll-slider-thumb" class="scroll-slider-thumb"></div>
+            </div>
+            <button
+              id="terminal-fullscreen-toggle"
+              class="terminal-fullscreen-btn"
+              type="button"
+              aria-pressed="false"
+              aria-label="Enter terminal fullscreen"
+            >
+              Fullscreen
+            </button>
           </div>
         </div>
         <div id="hint" class="hint">Tap or click inside the terminal to focus. Session input is shared per selected session.</div>
