@@ -36,6 +36,8 @@ const metricsListElement = document.getElementById('metrics-list');
 const scrollSliderElement = document.getElementById('scroll-slider');
 const scrollSliderThumbElement = document.getElementById('scroll-slider-thumb');
 const terminalFullscreenToggleElement = document.getElementById('terminal-fullscreen-toggle');
+const terminalPopoutToggleElement = document.getElementById('terminal-popout-toggle');
+const terminalPopoutVideoElement = document.getElementById('terminal-popout-video');
 const isLikelyIOS =
   /iPad|iPhone|iPod/.test(navigator.userAgent) ||
   (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
@@ -59,6 +61,7 @@ const state = {
   codexSearchTerm: '',
   codexLoading: false,
   terminalFullscreen: false,
+  terminalPopoutActive: false,
   localAttachCommand: '',
   singleConsoleMode: false,
   metricsFilters: {
@@ -110,6 +113,16 @@ const viewportResizeState = {
   width: window.visualViewport ? Math.round(window.visualViewport.width) : window.innerWidth,
   height: window.visualViewport ? Math.round(window.visualViewport.height) : window.innerHeight
 };
+
+const terminalPopoutState = {
+  canvas: null,
+  context: null,
+  stream: null,
+  renderTimer: null,
+  tailLines: [],
+  tailPartial: ''
+};
+
 const wsTextDecoder = new TextDecoder();
 let redirectingToLogin = false;
 
@@ -175,6 +188,384 @@ function setTerminalFullscreen(enabled) {
   scheduleTerminalLayoutSync(0);
 }
 
+function updatePopoutToggleButton() {
+  if (!terminalPopoutToggleElement) {
+    return;
+  }
+
+  const isActive = state.terminalPopoutActive === true;
+  terminalPopoutToggleElement.textContent = isActive ? 'Exit PiP' : 'Popout';
+  terminalPopoutToggleElement.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+  terminalPopoutToggleElement.setAttribute(
+    'aria-label',
+    isActive ? 'Exit terminal popout' : 'Start terminal popout'
+  );
+}
+
+function getActiveSessionName() {
+  const activeSession = state.sessions.find((session) => session.id === state.activeSessionId);
+  return activeSession && activeSession.name ? activeSession.name : 'Terminal';
+}
+
+function normalizeTerminalPopoutText(text) {
+  if (typeof text !== 'string' || text.length === 0) {
+    return '';
+  }
+
+  // Remove common ANSI CSI + OSC escapes before painting to the preview canvas.
+  let cleaned = text
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, '');
+
+  cleaned = cleaned
+    .replace(/\r/g, '')
+    .replace(/[^\n\t\x20-\x7E]/g, '');
+
+  return cleaned;
+}
+
+function appendTerminalPopoutText(text) {
+  const cleaned = normalizeTerminalPopoutText(text);
+  if (!cleaned) {
+    return;
+  }
+
+  const combined = `${terminalPopoutState.tailPartial}${cleaned}`;
+  const split = combined.split('\n');
+  terminalPopoutState.tailPartial = split.pop() || '';
+
+  for (const line of split) {
+    const trimmedLine = line.replace(/\t/g, '  ');
+    if (trimmedLine.length > 0 || terminalPopoutState.tailLines.length > 0) {
+      terminalPopoutState.tailLines.push(trimmedLine);
+    }
+  }
+
+  if (terminalPopoutState.tailPartial.length > 0) {
+    const lastIndex = terminalPopoutState.tailLines.length - 1;
+    if (lastIndex >= 0 && terminalPopoutState.tailLines[lastIndex] === '') {
+      terminalPopoutState.tailLines[lastIndex] = terminalPopoutState.tailPartial;
+    }
+  }
+
+  if (terminalPopoutState.tailLines.length > 320) {
+    terminalPopoutState.tailLines.splice(0, terminalPopoutState.tailLines.length - 320);
+  }
+}
+
+function getTerminalSnapshotLines(maxLines) {
+  const activeBuffer = term.buffer && term.buffer.active ? term.buffer.active : null;
+  const lineCount = Math.max(8, Math.min(72, maxLines || 28));
+  if (!activeBuffer || typeof activeBuffer.getLine !== 'function') {
+    return terminalPopoutState.tailLines.slice(-lineCount);
+  }
+
+  const rows = Math.max(1, Number(term.rows) || 24);
+  const bottom = Math.max(
+    (activeBuffer.baseY || 0) + (activeBuffer.cursorY || 0),
+    (activeBuffer.viewportY || 0) + rows - 1
+  );
+  const first = Math.max(0, bottom - lineCount + 1);
+  const lines = [];
+
+  for (let lineIndex = first; lineIndex <= bottom; lineIndex += 1) {
+    const line = activeBuffer.getLine(lineIndex);
+    const translated = line ? line.translateToString(true) : '';
+    lines.push(translated.replace(/\t/g, '  '));
+  }
+
+  const fromBuffer = lines.slice(-lineCount);
+  const hasContent = fromBuffer.some((line) => line && line.trim().length > 0);
+  if (hasContent || terminalPopoutState.tailLines.length === 0) {
+    return fromBuffer;
+  }
+
+  return terminalPopoutState.tailLines.slice(-lineCount);
+}
+
+function renderTerminalPopoutFrame() {
+  if (!terminalPopoutState.context || !terminalPopoutState.canvas) {
+    return;
+  }
+
+  const { canvas, context } = terminalPopoutState;
+  const width = canvas.width;
+  const height = canvas.height;
+  const headerHeight = Math.max(54, Math.round(height * 0.08));
+  const paddingX = Math.max(14, Math.round(width * 0.03));
+  const paddingBottom = Math.max(12, Math.round(height * 0.02));
+  const maxLines = Math.max(14, Math.min(56, Number(term.rows) || 30));
+  const lines = getTerminalSnapshotLines(maxLines);
+
+  context.fillStyle = '#0a1220';
+  context.fillRect(0, 0, width, height);
+
+  context.fillStyle = '#142239';
+  context.fillRect(0, 0, width, headerHeight);
+
+  context.fillStyle = '#d97a41';
+  context.fillRect(0, headerHeight - 2, width, 2);
+
+  // Visible activity beacon so the stream doesn't look blank in PiP.
+  const pulseOn = (Math.floor(Date.now() / 600) % 2) === 0;
+  context.fillStyle = pulseOn ? '#50dd92' : '#2f6b4d';
+  context.beginPath();
+  context.arc(paddingX + 8, Math.round(headerHeight / 2), 5, 0, Math.PI * 2);
+  context.fill();
+
+  context.textAlign = 'left';
+  context.textBaseline = 'middle';
+  context.fillStyle = '#f0f4ff';
+  context.font = `600 ${Math.max(15, Math.round(width * 0.03))}px "JetBrains Mono", "Fira Code", Menlo, monospace`;
+  context.fillText(`  Console • ${getActiveSessionName()}`, paddingX + 12, headerHeight / 2);
+
+  const timestampLabel = new Date().toLocaleTimeString();
+  context.textAlign = 'right';
+  context.fillStyle = '#9ca4b3';
+  context.font = `500 ${Math.max(11, Math.round(width * 0.019))}px "JetBrains Mono", "Fira Code", Menlo, monospace`;
+  context.fillText(timestampLabel, width - paddingX, headerHeight / 2);
+
+  context.textAlign = 'left';
+  context.textBaseline = 'alphabetic';
+
+  const availableHeight = height - headerHeight - paddingBottom;
+  const lineHeight = Math.max(15, Math.floor(availableHeight / maxLines));
+  const fontSize = Math.max(12, Math.min(20, lineHeight - 3));
+  const maxChars = Math.max(26, Math.floor((width - (paddingX * 2)) / (fontSize * 0.62)));
+
+  context.fillStyle = '#d9e0ec';
+  context.font = `${fontSize}px "JetBrains Mono", "Fira Code", Menlo, monospace`;
+
+  let y = headerHeight + fontSize + 4;
+  const visibleLines = lines.length > 0 ? lines : ['(waiting for terminal output...)'];
+
+  for (const rawLine of visibleLines.slice(-maxLines)) {
+    let lineText = rawLine || '';
+    if (lineText.length > maxChars) {
+      lineText = `${lineText.slice(0, Math.max(0, maxChars - 1))}\u2026`;
+    }
+    context.fillText(lineText, paddingX, y);
+    y += lineHeight;
+    if (y > height - 4) {
+      break;
+    }
+  }
+}
+
+function ensureTerminalPopoutMedia() {
+  if (!terminalPopoutVideoElement) {
+    throw new Error('Popout host is not available on this page.');
+  }
+
+  if (!terminalPopoutState.canvas) {
+    const canvas = document.createElement('canvas');
+    // Portrait feed so iOS PiP opens as a tall window.
+    canvas.width = 720;
+    canvas.height = 1280;
+    terminalPopoutState.canvas = canvas;
+    terminalPopoutState.context = canvas.getContext('2d', { alpha: false });
+  }
+
+  if (!terminalPopoutState.context || !terminalPopoutState.canvas) {
+    throw new Error('Could not initialize popout video rendering.');
+  }
+
+  if (!terminalPopoutState.stream) {
+    if (typeof terminalPopoutState.canvas.captureStream !== 'function') {
+      throw new Error('Canvas streaming is not supported in this browser.');
+    }
+    terminalPopoutState.stream = terminalPopoutState.canvas.captureStream(8);
+    terminalPopoutVideoElement.srcObject = terminalPopoutState.stream;
+    terminalPopoutVideoElement.width = terminalPopoutState.canvas.width;
+    terminalPopoutVideoElement.height = terminalPopoutState.canvas.height;
+  }
+}
+
+function stopTerminalPopoutRenderLoop() {
+  if (terminalPopoutState.renderTimer !== null) {
+    clearInterval(terminalPopoutState.renderTimer);
+    terminalPopoutState.renderTimer = null;
+  }
+}
+
+function releaseTerminalPopoutMedia() {
+  stopTerminalPopoutRenderLoop();
+  if (terminalPopoutState.stream) {
+    for (const track of terminalPopoutState.stream.getTracks()) {
+      track.stop();
+    }
+    terminalPopoutState.stream = null;
+  }
+
+  if (terminalPopoutVideoElement) {
+    terminalPopoutVideoElement.pause();
+    terminalPopoutVideoElement.srcObject = null;
+  }
+}
+
+function ensureTerminalPopoutRenderLoop() {
+  if (terminalPopoutState.renderTimer !== null) {
+    return;
+  }
+  terminalPopoutState.renderTimer = setInterval(() => {
+    if (state.terminalPopoutActive || terminalPopoutState.stream) {
+      renderTerminalPopoutFrame();
+    }
+  }, 180);
+}
+
+function primeTerminalPopoutMedia() {
+  if (!terminalPopoutVideoElement) {
+    return;
+  }
+
+  try {
+    ensureTerminalPopoutMedia();
+    ensureTerminalPopoutRenderLoop();
+    renderTerminalPopoutFrame();
+    const playResult = terminalPopoutVideoElement.play();
+    if (playResult && typeof playResult.then === 'function') {
+      playResult.catch(() => {
+        // Ignored: autoplay priming can be blocked until a gesture on some devices.
+      });
+    }
+  } catch (_error) {
+    // Best effort only; regular popout flow handles hard failures.
+  }
+}
+
+function isTerminalPopoutModeActive() {
+  if (!terminalPopoutVideoElement) {
+    return false;
+  }
+
+  if (document.pictureInPictureElement === terminalPopoutVideoElement) {
+    return true;
+  }
+
+  if (typeof terminalPopoutVideoElement.webkitPresentationMode === 'string') {
+    return terminalPopoutVideoElement.webkitPresentationMode === 'picture-in-picture';
+  }
+
+  return false;
+}
+
+function applyTerminalPopoutClosedState(options = {}) {
+  const suppressHint = options.suppressHint === true;
+  const preserveMedia = options.preserveMedia === true;
+  state.terminalPopoutActive = false;
+  stopTerminalPopoutRenderLoop();
+  if (preserveMedia) {
+    ensureTerminalPopoutRenderLoop();
+    primeTerminalPopoutMedia();
+  } else {
+    releaseTerminalPopoutMedia();
+  }
+  updatePopoutToggleButton();
+  if (!suppressHint) {
+    setHint('Terminal popout closed.');
+  }
+}
+
+async function startTerminalPopout() {
+  ensureTerminalPopoutMedia();
+  renderTerminalPopoutFrame();
+  ensureTerminalPopoutRenderLoop();
+
+  const playResult = terminalPopoutVideoElement.play();
+  let pipRequest = null;
+  let entered = false;
+
+  // Important: request PiP in the same user-activation task (before any await).
+  if (
+    document.pictureInPictureEnabled
+    && typeof terminalPopoutVideoElement.requestPictureInPicture === 'function'
+  ) {
+    pipRequest = terminalPopoutVideoElement.requestPictureInPicture();
+  } else if (
+    typeof terminalPopoutVideoElement.webkitSupportsPresentationMode === 'function'
+    && typeof terminalPopoutVideoElement.webkitSetPresentationMode === 'function'
+    && terminalPopoutVideoElement.webkitSupportsPresentationMode('picture-in-picture')
+  ) {
+    terminalPopoutVideoElement.webkitSetPresentationMode('picture-in-picture');
+    entered = terminalPopoutVideoElement.webkitPresentationMode === 'picture-in-picture';
+  }
+
+  if (pipRequest && typeof pipRequest.then === 'function') {
+    await pipRequest;
+    entered = true;
+  }
+
+  if (playResult && typeof playResult.then === 'function') {
+    try {
+      await playResult;
+    } catch (_error) {
+      // PiP may still succeed even if play() resolves later/with restrictions.
+    }
+  }
+
+  if (!entered && !isTerminalPopoutModeActive()) {
+    throw new Error('Picture-in-Picture is not supported here.');
+  }
+
+  state.terminalPopoutActive = true;
+  updatePopoutToggleButton();
+  setHint('Terminal popout started in Picture-in-Picture (read-only).');
+}
+
+async function stopTerminalPopout(options = {}) {
+  const suppressHint = options.suppressHint === true;
+  if (!terminalPopoutVideoElement) {
+    applyTerminalPopoutClosedState({ suppressHint });
+    return;
+  }
+
+  if (document.pictureInPictureElement === terminalPopoutVideoElement && typeof document.exitPictureInPicture === 'function') {
+    await document.exitPictureInPicture();
+    if (!isTerminalPopoutModeActive()) {
+      applyTerminalPopoutClosedState({ suppressHint, preserveMedia: true });
+    }
+    return;
+  }
+
+  if (
+    typeof terminalPopoutVideoElement.webkitPresentationMode === 'string'
+    && terminalPopoutVideoElement.webkitPresentationMode === 'picture-in-picture'
+    && typeof terminalPopoutVideoElement.webkitSetPresentationMode === 'function'
+  ) {
+    terminalPopoutVideoElement.webkitSetPresentationMode('inline');
+    if (!isTerminalPopoutModeActive()) {
+      applyTerminalPopoutClosedState({ suppressHint, preserveMedia: true });
+    }
+    return;
+  }
+
+  applyTerminalPopoutClosedState({ suppressHint, preserveMedia: true });
+}
+
+async function toggleTerminalPopout() {
+  try {
+    if (state.terminalPopoutActive || isTerminalPopoutModeActive()) {
+      await stopTerminalPopout();
+      return;
+    }
+
+    await startTerminalPopout();
+  } catch (error) {
+    const message = error && error.message ? error.message : 'Unknown error';
+    const notReady = /not ready to enter the picture-in-picture mode/i.test(message);
+    if (notReady) {
+      primeTerminalPopoutMedia();
+      applyTerminalPopoutClosedState({ suppressHint: true, preserveMedia: true });
+      setHint('Popout is warming up. Tap Popout again in a second.');
+      return;
+    }
+
+    applyTerminalPopoutClosedState({ suppressHint: true, preserveMedia: true });
+    setHint(`Could not start terminal popout: ${message}`);
+  }
+}
+
 function syncTerminalLayout() {
   if (state.activeView !== 'console') {
     return;
@@ -206,10 +597,17 @@ function scheduleTerminalLayoutSync(delayMs = 90) {
 function resetTerminalViewport() {
   term.clear();
   term.reset();
+  terminalPopoutState.tailLines = [];
+  terminalPopoutState.tailPartial = '';
+  if (state.terminalPopoutActive) {
+    renderTerminalPopoutFrame();
+  }
 }
 
 updateFullscreenViewportHeight();
 updateFullscreenToggleButton();
+updatePopoutToggleButton();
+primeTerminalPopoutMedia();
 
 function decodeSocketFrame(frameData) {
   if (typeof frameData === 'string') {
@@ -1097,7 +1495,11 @@ function connectSocket() {
       return;
     }
 
+    appendTerminalPopoutText(text);
     term.write(text);
+    if (state.terminalPopoutActive) {
+      renderTerminalPopoutFrame();
+    }
   });
 
   socket.addEventListener('close', (event) => {
@@ -2074,6 +2476,31 @@ term.onData((data) => {
   sendTerminalInput(data);
 });
 
+if (terminalPopoutVideoElement) {
+  terminalPopoutVideoElement.addEventListener('enterpictureinpicture', () => {
+    state.terminalPopoutActive = true;
+    ensureTerminalPopoutRenderLoop();
+    renderTerminalPopoutFrame();
+    updatePopoutToggleButton();
+  });
+
+  terminalPopoutVideoElement.addEventListener('leavepictureinpicture', () => {
+    applyTerminalPopoutClosedState({ preserveMedia: true });
+  });
+
+  terminalPopoutVideoElement.addEventListener('webkitpresentationmodechanged', () => {
+    if (terminalPopoutVideoElement.webkitPresentationMode === 'picture-in-picture') {
+      state.terminalPopoutActive = true;
+      ensureTerminalPopoutRenderLoop();
+      renderTerminalPopoutFrame();
+      updatePopoutToggleButton();
+      return;
+    }
+
+    applyTerminalPopoutClosedState({ preserveMedia: true });
+  });
+}
+
 window.addEventListener('resize', () => {
   const nextWidth = window.innerWidth;
   const nextHeight = window.innerHeight;
@@ -2085,6 +2512,9 @@ window.addEventListener('resize', () => {
 
   if (state.terminalFullscreen) {
     updateFullscreenViewportHeight();
+  }
+  if (state.terminalPopoutActive) {
+    renderTerminalPopoutFrame();
   }
 
   if (isLikelyIOS && deltaWidth < 2 && deltaHeight < 2 && !state.terminalFullscreen) {
@@ -2105,6 +2535,9 @@ if (window.visualViewport) {
       if (state.terminalFullscreen) {
         updateFullscreenViewportHeight();
       }
+      if (state.terminalPopoutActive) {
+        renderTerminalPopoutFrame();
+      }
       return;
     }
 
@@ -2112,6 +2545,9 @@ if (window.visualViewport) {
     viewportResizeState.height = nextHeight;
     if (state.terminalFullscreen) {
       updateFullscreenViewportHeight();
+    }
+    if (state.terminalPopoutActive) {
+      renderTerminalPopoutFrame();
     }
     scheduleTerminalLayoutSync(45);
   };
@@ -2174,6 +2610,12 @@ viewPillMetricsElement.addEventListener('click', () => {
 if (terminalFullscreenToggleElement) {
   terminalFullscreenToggleElement.addEventListener('click', () => {
     setTerminalFullscreen(!state.terminalFullscreen);
+  });
+}
+
+if (terminalPopoutToggleElement) {
+  terminalPopoutToggleElement.addEventListener('click', async () => {
+    await toggleTerminalPopout();
   });
 }
 
@@ -2269,6 +2711,7 @@ window.addEventListener('beforeunload', () => {
     clearInterval(state.codexRefreshTimer);
     state.codexRefreshTimer = null;
   }
+  applyTerminalPopoutClosedState({ suppressHint: true });
   clearServerScrollQueue();
   if (scrollSliderState.tickRafId !== null) {
     cancelAnimationFrame(scrollSliderState.tickRafId);

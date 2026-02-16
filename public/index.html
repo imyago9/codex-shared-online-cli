@@ -57,6 +57,15 @@
             >
               Fullscreen
             </button>
+            <button
+              id="terminal-popout-toggle"
+              class="terminal-popout-btn"
+              type="button"
+              aria-pressed="false"
+              aria-label="Start terminal popout"
+            >
+              Popout
+            </button>
           </div>
         </div>
         <div id="hint" class="hint">Tap or click inside the terminal to focus. Session input is shared per selected session.</div>
@@ -170,6 +179,15 @@
       </section>
     </main>
   </div>
+  <video
+    id="terminal-popout-video"
+    class="terminal-popout-video"
+    autoplay
+    muted
+    playsinline
+    webkit-playsinline="true"
+    aria-hidden="true"
+  ></video>
 
   <script src="/vendor/xterm/xterm.js"></script>
   <script src="/vendor/xterm-addon-fit/xterm-addon-fit.js"></script>

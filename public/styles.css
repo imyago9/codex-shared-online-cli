@@ -239,7 +239,8 @@ body {
   box-shadow: 0 8px 16px rgba(0, 0, 0, 0.32);
 }
 
-.terminal-fullscreen-btn {
+.terminal-fullscreen-btn,
+.terminal-popout-btn {
   height: 34px;
   min-height: 34px;
   border-radius: 14px;
@@ -255,18 +256,33 @@ body {
   white-space: nowrap;
 }
 
-.terminal-fullscreen-btn:hover:not(:disabled) {
+.terminal-fullscreen-btn:hover:not(:disabled),
+.terminal-popout-btn:hover:not(:disabled) {
   border-color: rgba(0, 0, 0, 0.3);
 }
 
-.terminal-fullscreen-btn:focus-visible {
+.terminal-fullscreen-btn:focus-visible,
+.terminal-popout-btn:focus-visible {
   outline: 2px solid rgba(217, 122, 65, 0.65);
   outline-offset: 1px;
 }
 
-.terminal-fullscreen-btn[aria-pressed="true"] {
+.terminal-fullscreen-btn[aria-pressed="true"],
+.terminal-popout-btn[aria-pressed="true"] {
   background: rgba(239, 219, 202, 0.95);
   border-color: rgba(97, 64, 36, 0.35);
+}
+
+.terminal-popout-video {
+  position: fixed;
+  right: 8px;
+  bottom: 8px;
+  width: 90px;
+  height: 160px;
+  opacity: 0.01;
+  pointer-events: none;
+  z-index: 0;
+  object-fit: cover;
 }
 
 .terminal-shell .xterm {
@@ -785,7 +801,8 @@ body.terminal-fullscreen-active .terminal-shell {
     min-height: 32px;
   }
 
-  .terminal-fullscreen-btn {
+  .terminal-fullscreen-btn,
+  .terminal-popout-btn {
     height: 32px;
     min-height: 32px;
     padding: 0 10px;
