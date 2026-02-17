@@ -284,12 +284,16 @@ class RemoteClient {
       quality: toSafeInteger(options.quality, this.jpegQuality, 20, 95)
     });
 
-    return new WebSocket(wsUrl);
+    return new WebSocket(wsUrl, {
+      perMessageDeflate: false
+    });
   }
 
   openInputSocket() {
     const wsUrl = this.buildSidecarWsUrl('/input');
-    return new WebSocket(wsUrl);
+    return new WebSocket(wsUrl, {
+      perMessageDeflate: false
+    });
   }
 
   close() {

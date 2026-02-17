@@ -100,6 +100,15 @@ function parseRequestQuery(req) {
   }
 }
 
+function getRequestPath(req) {
+  try {
+    const parsed = new URL(req.url, 'http://localhost');
+    return parsed.pathname;
+  } catch (_error) {
+    return '';
+  }
+}
+
 function clampNormalized(value) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) {
@@ -735,7 +744,7 @@ app.get('/health', (_req, res) => {
 
 const server = http.createServer(app);
 
-const streamWss = new WebSocketServer({ server, path: '/stream' });
+const streamWss = new WebSocketServer({ noServer: true });
 streamWss.on('connection', (socket, req) => {
   const query = parseRequestQuery(req);
   socket.requestedFps = clampInteger(parseInteger(query.get('fps'), config.streamFps), 1, 20);
@@ -766,7 +775,7 @@ streamWss.on('connection', (socket, req) => {
   });
 });
 
-const inputWss = new WebSocketServer({ server, path: '/input' });
+const inputWss = new WebSocketServer({ noServer: true });
 inputWss.on('connection', (socket) => {
   if (inputController.available !== true) {
     if (isWsOpen(socket)) {
@@ -839,6 +848,30 @@ inputWss.on('connection', (socket) => {
       message: error.message
     });
   });
+});
+
+server.on('upgrade', (req, socket, head) => {
+  const pathname = getRequestPath(req);
+
+  if (pathname === '/stream') {
+    streamWss.handleUpgrade(req, socket, head, (clientSocket) => {
+      streamWss.emit('connection', clientSocket, req);
+    });
+    return;
+  }
+
+  if (pathname === '/input') {
+    inputWss.handleUpgrade(req, socket, head, (clientSocket) => {
+      inputWss.emit('connection', clientSocket, req);
+    });
+    return;
+  }
+
+  try {
+    socket.destroy();
+  } catch (_error) {
+    // Ignore socket teardown races.
+  }
 });
 
 server.listen(config.port, config.host, () => {
