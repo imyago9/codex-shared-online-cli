@@ -13,7 +13,7 @@ A localhost-first web console for WSL with a session-management scaffold suitabl
   - Duplicate session ids across stores are deduped before serving API results
   - Metrics now expose `metricsQuality` (`complete|partial|estimated`) and both `activeDurationMs` + `elapsedDurationMs`
 - Session-scoped WebSocket streaming (`/ws?sessionId=...`)
-- Optional remote desktop sidecar integration (`Remote` view + split mode in Console)
+- Optional remote desktop sidecar integration (`Remote` tab, decoupled from Console)
   - Browser stream via proxied WS (`/ws/remote`) and short-lived backend tokens
   - View-only by default, with explicit control enable toggle
   - Touch controls for iOS (tap/long-press/drag/two-finger wheel)
@@ -107,8 +107,9 @@ npm start
 ### 3) Use the new `Remote` tab
 - `View only`: stream only, no input execution
 - `Control enabled`: mouse/touch/keyboard routed to desktop
-- `Keyboard` toggle ensures keystrokes go to either terminal or remote desktop, never both
-- `Show Split`: optional stream panel above the terminal in Console view
+- `Keyboard Route` toggle ensures keystrokes go to either terminal or remote desktop, never both
+- `Open Keyboard` button (mobile-friendly) explicitly summons software keyboard for remote typing
+- `Fullscreen` + zoom/pan/minimap controls make widescreen desktops usable from phones
 
 If the sidecar is offline or input automation is unavailable, the UI degrades to view-only/offline states and the terminal remains fully usable.
 

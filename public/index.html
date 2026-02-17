@@ -28,6 +28,7 @@
       <div class="view-switch" role="tablist" aria-label="View picker">
         <button id="view-pill-console" class="view-pill active" type="button" role="tab" aria-selected="true">Console</button>
         <button id="view-pill-metrics" class="view-pill" type="button" role="tab" aria-selected="false">Metrics</button>
+        <button id="view-pill-remote" class="view-pill" type="button" role="tab" aria-selected="false">Remote</button>
       </div>
 
       <section id="console-view" class="app-view active" aria-label="Console view">
@@ -177,6 +178,84 @@
           <div id="metrics-list" class="metrics-list"></div>
         </section>
       </section>
+
+      <section id="remote-view" class="app-view" aria-label="Remote desktop view">
+        <section class="remote-panel" aria-label="Remote desktop panel">
+          <div class="remote-head">
+            <div class="remote-title-wrap">
+              <div class="remote-title">Remote Desktop</div>
+              <div id="remote-connection-status" class="remote-indicator disconnected">Checking status...</div>
+            </div>
+            <div class="remote-actions">
+              <label class="remote-field" for="remote-mode-select">
+                <span>Control</span>
+                <select id="remote-mode-select">
+                  <option value="view">View only</option>
+                  <option value="control">Control enabled</option>
+                </select>
+              </label>
+              <label class="remote-field" for="remote-keyboard-route">
+                <span>Keyboard Route</span>
+                <select id="remote-keyboard-route">
+                  <option value="terminal">To terminal</option>
+                  <option value="remote">To remote desktop</option>
+                </select>
+              </label>
+              <button id="remote-open-keyboard" class="control-btn" type="button">Open Keyboard</button>
+              <button id="remote-fullscreen-toggle" class="control-btn" type="button" aria-pressed="false">Fullscreen</button>
+            </div>
+          </div>
+
+          <div class="remote-meta-row">
+            <div id="remote-stream-stats" class="remote-stats">fps: 0.0 | latency: -- ms</div>
+            <div id="remote-capability-status" class="remote-stats">Loading remote capabilities...</div>
+          </div>
+
+          <div id="remote-stage" class="remote-stage" tabindex="0" aria-label="Remote desktop stream panel">
+            <div id="remote-canvas" class="remote-canvas">
+              <img id="remote-stream-image" class="remote-stream-image" alt="Remote desktop stream">
+              <div id="remote-cursor" class="remote-cursor" hidden></div>
+            </div>
+            <div id="remote-overlay" class="remote-overlay">Connecting to remote stream...</div>
+            <div id="remote-nav-overlay" class="remote-nav-overlay">
+              <div class="remote-nav-controls">
+                <button id="remote-zoom-out" class="remote-nav-btn" type="button" aria-label="Zoom out">-</button>
+                <div id="remote-zoom-label" class="remote-zoom-label">1.0x</div>
+                <button id="remote-zoom-in" class="remote-nav-btn" type="button" aria-label="Zoom in">+</button>
+                <button id="remote-pan-toggle" class="remote-nav-btn wide" type="button" aria-pressed="false">Pan</button>
+                <button id="remote-reset-view" class="remote-nav-btn wide" type="button">Center</button>
+              </div>
+              <div class="remote-nav-hint">Use Pan for widescreen navigation. Two-finger vertical drag = wheel.</div>
+            </div>
+            <div id="remote-minimap" class="remote-minimap" hidden aria-hidden="true">
+              <div class="remote-minimap-label">Viewport</div>
+              <div id="remote-minimap-viewport" class="remote-minimap-viewport"></div>
+            </div>
+          </div>
+
+          <div class="remote-dock">
+            <button id="remote-left-click" class="remote-dock-btn" type="button">Left Click</button>
+            <button id="remote-right-click" class="remote-dock-btn" type="button">Right Click</button>
+            <button id="remote-double-click" class="remote-dock-btn" type="button">Double Click</button>
+          </div>
+
+          <div id="remote-keyboard-status" class="remote-help">
+            Keyboard routing is set to terminal. Switch to "To remote desktop" to type remotely.
+          </div>
+          <textarea
+            id="remote-keyboard-input"
+            class="remote-keyboard-input"
+            autocorrect="off"
+            autocapitalize="none"
+            autocomplete="off"
+            spellcheck="false"
+            enterkeyhint="done"
+          ></textarea>
+          <div class="remote-help">
+            Touch controls: tap = left click, long press = right click, drag = move pointer, two-finger vertical drag = wheel.
+          </div>
+        </section>
+      </section>
     </main>
   </div>
   <video
@@ -192,5 +271,6 @@
   <script src="/vendor/xterm/xterm.js"></script>
   <script src="/vendor/xterm-addon-fit/xterm-addon-fit.js"></script>
   <script src="/assets/app.js"></script>
+  <script src="/assets/remote.js"></script>
 </body>
 </html>
