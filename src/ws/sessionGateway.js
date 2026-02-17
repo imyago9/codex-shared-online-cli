@@ -15,7 +15,7 @@ function createSessionGateway(server, sessionManager, options) {
   const heartbeatMs = options.wsHeartbeatMs;
   const authManager = options.authManager;
 
-  const wss = new WebSocketServer({ server, path: '/ws' });
+  const wss = new WebSocketServer({ noServer: true });
 
   function heartbeat() {
     this.isAlive = true;
@@ -103,8 +103,26 @@ function createSessionGateway(server, sessionManager, options) {
     wss.close();
   }
 
+  function handleUpgrade(req, socket, head) {
+    try {
+      const host = req.headers.host || 'localhost';
+      const url = new URL(req.url, `http://${host}`);
+      if (url.pathname !== '/ws') {
+        return false;
+      }
+    } catch (_error) {
+      return false;
+    }
+
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit('connection', ws, req);
+    });
+    return true;
+  }
+
   return {
     wss,
+    handleUpgrade,
     close
   };
 }

@@ -202,7 +202,7 @@ function createRemoteGateway(server, remoteClient, options = {}) {
   const heartbeatMs = toBoundedInteger(options.wsHeartbeatMs, 30_000, 10_000, 120_000);
   const defaults = remoteClient.getDefaults();
 
-  const wss = new WebSocketServer({ server, path: '/ws/remote' });
+  const wss = new WebSocketServer({ noServer: true });
 
   function heartbeat() {
     this.isAlive = true;
@@ -754,8 +754,26 @@ function createRemoteGateway(server, remoteClient, options = {}) {
     wss.close();
   }
 
+  function handleUpgrade(req, socket, head) {
+    try {
+      const host = req.headers.host || 'localhost';
+      const url = new URL(req.url, `http://${host}`);
+      if (url.pathname !== '/ws/remote') {
+        return false;
+      }
+    } catch (_error) {
+      return false;
+    }
+
+    wss.handleUpgrade(req, socket, head, (clientSocket) => {
+      wss.emit('connection', clientSocket, req);
+    });
+    return true;
+  }
+
   return {
     wss,
+    handleUpgrade,
     close
   };
 }

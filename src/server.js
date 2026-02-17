@@ -118,6 +118,27 @@ function startServer() {
     authManager
   });
 
+  server.on('upgrade', (req, socket, head) => {
+    try {
+      if (remoteGateway.handleUpgrade(req, socket, head)) {
+        return;
+      }
+      if (sessionGateway.handleUpgrade(req, socket, head)) {
+        return;
+      }
+    } catch (error) {
+      logger.warn('WebSocket upgrade routing failed', {
+        message: error && error.message ? error.message : 'upgrade-routing-error'
+      });
+    }
+
+    try {
+      socket.destroy();
+    } catch (_error) {
+      // Ignore socket teardown races.
+    }
+  });
+
   server.listen(config.port, config.host, () => {
     logger.info('WSL terminal server listening', {
       url: `http://${config.host}:${config.port}`,
