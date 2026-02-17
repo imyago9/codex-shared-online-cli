@@ -194,13 +194,6 @@
                   <option value="control">Control enabled</option>
                 </select>
               </label>
-              <label class="remote-field" for="remote-keyboard-route">
-                <span>Keyboard Route</span>
-                <select id="remote-keyboard-route">
-                  <option value="terminal">To terminal</option>
-                  <option value="remote">To remote desktop</option>
-                </select>
-              </label>
               <button id="remote-open-keyboard" class="control-btn" type="button">Open Keyboard</button>
               <button id="remote-fullscreen-toggle" class="control-btn" type="button" aria-pressed="false">Fullscreen</button>
             </div>
@@ -240,7 +233,7 @@
           </div>
 
           <div id="remote-keyboard-status" class="remote-help">
-            Keyboard routing is set to terminal. Switch to "To remote desktop" to type remotely.
+            Keyboard is available when control mode is enabled and connected.
           </div>
           <textarea
             id="remote-keyboard-input"

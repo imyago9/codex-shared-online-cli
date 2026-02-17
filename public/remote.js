@@ -7,7 +7,6 @@
     metricsView: document.getElementById('metrics-view'),
     remoteView: document.getElementById('remote-view'),
     modeSelect: document.getElementById('remote-mode-select'),
-    keyboardRouteSelect: document.getElementById('remote-keyboard-route'),
     openKeyboardButton: document.getElementById('remote-open-keyboard'),
     fullscreenButton: document.getElementById('remote-fullscreen-toggle'),
     streamStats: document.getElementById('remote-stream-stats'),
@@ -57,12 +56,10 @@
     controlAllowed: false,
     desiredMode: normalizeMode(elements.modeSelect ? elements.modeSelect.value : 'view'),
     effectiveMode: 'view',
-    keyboardRoute: elements.keyboardRouteSelect
-      ? (elements.keyboardRouteSelect.value === 'remote' ? 'remote' : 'terminal')
-      : 'terminal',
     hasFrame: false,
     frameFps: 0,
     frameLatencyMs: null,
+    simulatedFullscreen: false,
     display: {
       desktopWidth: 1280,
       desktopHeight: 720,
@@ -113,10 +110,6 @@
 
   function normalizeMode(value) {
     return value === 'control' ? 'control' : 'view';
-  }
-
-  function normalizeKeyboardRoute(value) {
-    return value === 'remote' ? 'remote' : 'terminal';
   }
 
   function isRemoteViewActive() {
@@ -190,22 +183,17 @@
       return;
     }
 
-    if (state.keyboardRoute !== 'remote') {
-      elements.keyboardStatus.textContent = 'Keyboard routing is set to terminal.';
-      return;
-    }
-
     if (state.effectiveMode !== 'control' || state.controlAllowed !== true) {
       elements.keyboardStatus.textContent = 'Switch control mode to "Control enabled" before typing remotely.';
       return;
     }
 
     if (!isWsOpen()) {
-      elements.keyboardStatus.textContent = 'Keyboard route is remote, waiting for websocket connection.';
+      elements.keyboardStatus.textContent = 'Waiting for websocket connection before typing remotely.';
       return;
     }
 
-    elements.keyboardStatus.textContent = 'Keyboard route is remote. Use "Open Keyboard" on mobile.';
+    elements.keyboardStatus.textContent = 'Remote keyboard is ready. Use "Open Keyboard" on mobile.';
   }
 
   function updateModeUi() {
@@ -222,24 +210,12 @@
       elements.modeSelect.disabled = state.enabled !== true;
     }
 
-    if (elements.keyboardRouteSelect) {
-      if (state.effectiveMode !== 'control' || state.controlAllowed !== true) {
-        state.keyboardRoute = 'terminal';
-      }
-      elements.keyboardRouteSelect.value = normalizeKeyboardRoute(state.keyboardRoute);
-      const remoteOption = Array.from(elements.keyboardRouteSelect.options || []).find((opt) => opt.value === 'remote');
-      if (remoteOption) {
-        remoteOption.disabled = !(state.effectiveMode === 'control' && state.controlAllowed === true);
-      }
-      elements.keyboardRouteSelect.disabled = state.enabled !== true;
-    }
-
     if (elements.openKeyboardButton) {
       elements.openKeyboardButton.disabled = !(
-        state.keyboardRoute === 'remote' &&
         state.effectiveMode === 'control' &&
         state.controlAllowed === true &&
-        state.enabled === true
+        state.enabled === true &&
+        isWsOpen()
       );
     }
 
@@ -984,6 +960,7 @@
   function deactivateRemoteView(nextView) {
     state.activeView = nextView;
     applyViewPills(nextView);
+    exitSimulatedFullscreen();
     stopStatusPolling();
     disconnectRemoteSocket({ manual: true, preserveFrame: true });
     if (elements.keyboardInput) {
@@ -993,6 +970,10 @@
 
   function setPanMode(enabled) {
     state.panMode = enabled === true;
+    if (!state.panMode) {
+      state.panGesture.active = false;
+      state.panGesture.pointerId = null;
+    }
     if (elements.panToggleButton) {
       elements.panToggleButton.setAttribute('aria-pressed', state.panMode ? 'true' : 'false');
       elements.panToggleButton.textContent = state.panMode ? 'Pan On' : 'Pan';
@@ -1000,14 +981,47 @@
     updateCapabilityText();
   }
 
+  function isNativeFullscreenActive() {
+    const fullscreenElement = document.fullscreenElement || document.webkitFullscreenElement;
+    return fullscreenElement === elements.stage;
+  }
+
+  function isFullscreenActive() {
+    return isNativeFullscreenActive() || state.simulatedFullscreen === true;
+  }
+
+  function enterSimulatedFullscreen() {
+    state.simulatedFullscreen = true;
+    document.body.classList.add('remote-simulated-fullscreen');
+    recomputeViewport();
+  }
+
+  function exitSimulatedFullscreen() {
+    if (!state.simulatedFullscreen) {
+      return;
+    }
+    state.simulatedFullscreen = false;
+    document.body.classList.remove('remote-simulated-fullscreen');
+    recomputeViewport();
+  }
+
   function updateFullscreenButton() {
     if (!elements.fullscreenButton) {
       return;
     }
-    const fullscreenElement = document.fullscreenElement || document.webkitFullscreenElement;
-    const isFullscreen = fullscreenElement === elements.stage;
+    const isFullscreen = isFullscreenActive();
     elements.fullscreenButton.textContent = isFullscreen ? 'Exit Fullscreen' : 'Fullscreen';
     elements.fullscreenButton.setAttribute('aria-pressed', isFullscreen ? 'true' : 'false');
+  }
+
+  function isEventFromStageControl(target) {
+    if (!target || typeof target.closest !== 'function') {
+      return false;
+    }
+    return Boolean(
+      target.closest('.remote-nav-overlay') ||
+      target.closest('.remote-minimap')
+    );
   }
 
   function moveViewportFromMinimapClient(clientX, clientY) {
@@ -1059,16 +1073,11 @@
     });
   }
 
-  function setKeyboardRoute(nextRoute) {
-    state.keyboardRoute = normalizeKeyboardRoute(nextRoute);
-    if (state.keyboardRoute === 'remote' && (state.effectiveMode !== 'control' || state.controlAllowed !== true)) {
-      state.keyboardRoute = 'terminal';
-    }
-    updateModeUi();
-  }
-
   function bindPointerAndTouchHandlers() {
     elements.stage.addEventListener('contextmenu', (event) => {
+      if (isEventFromStageControl(event.target)) {
+        return;
+      }
       if (!isControlActive() || state.panMode) {
         return;
       }
@@ -1082,6 +1091,9 @@
     });
 
     elements.stage.addEventListener('wheel', (event) => {
+      if (isEventFromStageControl(event.target)) {
+        return;
+      }
       if (!isControlActive() || state.panMode) {
         return;
       }
@@ -1095,6 +1107,9 @@
     }, { passive: false });
 
     elements.stage.addEventListener('pointerdown', (event) => {
+      if (isEventFromStageControl(event.target)) {
+        return;
+      }
       if (event.pointerType === 'mouse') {
         if (state.panMode && event.button === 0) {
           state.panGesture.active = true;
@@ -1119,6 +1134,9 @@
     });
 
     elements.stage.addEventListener('pointermove', (event) => {
+      if (isEventFromStageControl(event.target)) {
+        return;
+      }
       if (event.pointerType !== 'mouse') {
         return;
       }
@@ -1161,6 +1179,10 @@
     };
 
     elements.stage.addEventListener('pointerup', (event) => {
+      if (isEventFromStageControl(event.target)) {
+        releasePanPointer(event);
+        return;
+      }
       releasePanPointer(event);
       if (event.pointerType !== 'mouse' || state.panMode || !isControlActive()) {
         return;
@@ -1179,6 +1201,9 @@
     elements.stage.addEventListener('lostpointercapture', releasePanPointer);
 
     elements.stage.addEventListener('touchstart', (event) => {
+      if (isEventFromStageControl(event.target)) {
+        return;
+      }
       if (!isControlActive() && !state.panMode) {
         return;
       }
@@ -1236,6 +1261,9 @@
     }, { passive: false });
 
     elements.stage.addEventListener('touchmove', (event) => {
+      if (isEventFromStageControl(event.target)) {
+        return;
+      }
       if (state.panMode && state.panGesture.active && event.touches.length === 1) {
         const touch = event.touches[0];
         const deltaX = touch.clientX - state.panGesture.lastX;
@@ -1293,6 +1321,13 @@
     }, { passive: false });
 
     elements.stage.addEventListener('touchend', (event) => {
+      if (isEventFromStageControl(event.target)) {
+        if (event.touches.length === 0) {
+          state.panGesture.active = false;
+          state.panGesture.pointerId = null;
+        }
+        return;
+      }
       if (state.panMode && state.panGesture.active) {
         if (event.touches.length === 0) {
           state.panGesture.active = false;
@@ -1347,7 +1382,7 @@
     }
 
     elements.keyboardInput.addEventListener('input', () => {
-      if (state.keyboardRoute !== 'remote' || !isControlActive()) {
+      if (!isControlActive()) {
         elements.keyboardInput.value = '';
         return;
       }
@@ -1360,7 +1395,7 @@
     });
 
     elements.keyboardInput.addEventListener('keydown', (event) => {
-      if (state.keyboardRoute !== 'remote' || !isControlActive()) {
+      if (!isControlActive()) {
         return;
       }
       const printable = typeof event.key === 'string' && event.key.length === 1 && !event.ctrlKey && !event.metaKey && !event.altKey;
@@ -1371,7 +1406,17 @@
     });
 
     document.addEventListener('keydown', (event) => {
-      if (!isRemoteViewActive() || state.keyboardRoute !== 'remote' || !isControlActive()) {
+      if (!isRemoteViewActive()) {
+        return;
+      }
+
+      if (event.key === 'Escape' && state.simulatedFullscreen === true) {
+        exitSimulatedFullscreen();
+        updateFullscreenButton();
+        return;
+      }
+
+      if (!isControlActive()) {
         return;
       }
 
@@ -1422,15 +1467,9 @@
       });
     }
 
-    if (elements.keyboardRouteSelect) {
-      elements.keyboardRouteSelect.addEventListener('change', () => {
-        setKeyboardRoute(elements.keyboardRouteSelect.value || 'terminal');
-      });
-    }
-
     if (elements.openKeyboardButton && elements.keyboardInput) {
       elements.openKeyboardButton.addEventListener('click', () => {
-        if (state.keyboardRoute !== 'remote' || !isControlActive()) {
+        if (!isControlActive()) {
           updateKeyboardStatus();
           return;
         }
@@ -1440,28 +1479,55 @@
 
     if (elements.fullscreenButton) {
       elements.fullscreenButton.addEventListener('click', async () => {
-        const fullscreenElement = document.fullscreenElement || document.webkitFullscreenElement;
-        if (fullscreenElement === elements.stage) {
-          if (document.exitFullscreen) {
-            await document.exitFullscreen();
-          } else if (document.webkitExitFullscreen) {
-            document.webkitExitFullscreen();
+        if (isFullscreenActive()) {
+          if (isNativeFullscreenActive()) {
+            if (document.exitFullscreen) {
+              await document.exitFullscreen();
+            } else if (document.webkitExitFullscreen) {
+              document.webkitExitFullscreen();
+            }
+          } else {
+            exitSimulatedFullscreen();
           }
           updateFullscreenButton();
           return;
         }
 
-        if (elements.stage.requestFullscreen) {
-          await elements.stage.requestFullscreen();
-        } else if (elements.stage.webkitRequestFullscreen) {
-          elements.stage.webkitRequestFullscreen();
+        let enteredNative = false;
+        try {
+          if (elements.stage.requestFullscreen) {
+            await elements.stage.requestFullscreen();
+            enteredNative = true;
+          } else if (elements.stage.webkitRequestFullscreen) {
+            elements.stage.webkitRequestFullscreen();
+            enteredNative = true;
+          }
+        } catch (_error) {
+          enteredNative = false;
         }
+
+        if (!enteredNative) {
+          enterSimulatedFullscreen();
+        }
+
         updateFullscreenButton();
       });
     }
 
-    document.addEventListener('fullscreenchange', updateFullscreenButton);
-    document.addEventListener('webkitfullscreenchange', updateFullscreenButton);
+    document.addEventListener('fullscreenchange', () => {
+      if (!isNativeFullscreenActive()) {
+        exitSimulatedFullscreen();
+      }
+      updateFullscreenButton();
+      recomputeViewport();
+    });
+    document.addEventListener('webkitfullscreenchange', () => {
+      if (!isNativeFullscreenActive()) {
+        exitSimulatedFullscreen();
+      }
+      updateFullscreenButton();
+      recomputeViewport();
+    });
 
     if (elements.zoomOutButton) {
       elements.zoomOutButton.addEventListener('click', () => {
@@ -1555,6 +1621,7 @@
     window.addEventListener('beforeunload', () => {
       stopStatusPolling();
       clearReconnectTimer();
+      exitSimulatedFullscreen();
       disconnectRemoteSocket({ manual: true, preserveFrame: false });
       clearLongPressTimer();
       if (state.pointer.hideCursorTimer) {

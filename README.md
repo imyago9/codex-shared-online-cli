@@ -107,7 +107,6 @@ npm start
 ### 3) Use the new `Remote` tab
 - `View only`: stream only, no input execution
 - `Control enabled`: mouse/touch/keyboard routed to desktop
-- `Keyboard Route` toggle ensures keystrokes go to either terminal or remote desktop, never both
 - `Open Keyboard` button (mobile-friendly) explicitly summons software keyboard for remote typing
 - `Fullscreen` + zoom/pan/minimap controls make widescreen desktops usable from phones
 
