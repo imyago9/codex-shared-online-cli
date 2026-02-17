@@ -2,8 +2,16 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b0d11">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Online CLI">
   <title>Local Codex WSL Console</title>
+  <link rel="manifest" href="/assets/manifest.webmanifest">
+  <link rel="icon" type="image/svg+xml" href="/assets/pwa-icon.svg">
+  <link rel="apple-touch-icon" href="/assets/pwa-icon.svg">
   <link rel="stylesheet" href="/vendor/xterm-css/xterm.css">
   <link rel="stylesheet" href="/assets/styles.css">
 </head>
@@ -204,32 +212,103 @@
             <div id="remote-capability-status" class="remote-stats">Loading remote capabilities...</div>
           </div>
 
+          <div id="remote-standalone-hint" class="remote-standalone-hint" hidden>
+            <div class="remote-standalone-title">True iOS fullscreen needs Home Screen mode.</div>
+            <div class="remote-standalone-copy">
+              On iPhone: Share button -> Add to Home Screen -> open this app icon.
+            </div>
+            <button id="remote-standalone-dismiss" class="remote-standalone-dismiss" type="button">Dismiss</button>
+          </div>
+
           <div id="remote-stage" class="remote-stage" tabindex="0" aria-label="Remote desktop stream panel">
             <div id="remote-canvas" class="remote-canvas">
               <img id="remote-stream-image" class="remote-stream-image" alt="Remote desktop stream">
-              <div id="remote-cursor" class="remote-cursor" hidden></div>
             </div>
             <div id="remote-overlay" class="remote-overlay">Connecting to remote stream...</div>
-            <div id="remote-nav-overlay" class="remote-nav-overlay">
-              <div class="remote-nav-controls">
+            <div id="remote-cursor-indicator" class="remote-cursor-indicator" hidden aria-hidden="true"></div>
+            <div id="remote-drive-overlay" class="remote-drive-overlay" aria-label="Remote drive controls">
+              <button
+                id="remote-drive-handle"
+                class="remote-drive-handle"
+                type="button"
+                aria-label="Move joystick controls"
+                title="Move joystick controls"
+              >
+                Drag
+              </button>
+              <div id="remote-joystick-pad" class="remote-joystick-pad" aria-label="Move pointer joystick">
+                <div id="remote-joystick-knob" class="remote-joystick-knob"></div>
+              </div>
+              <div class="remote-drive-buttons">
+                <button id="remote-joystick-left-click" class="remote-drive-btn" type="button">Left Click</button>
+                <button id="remote-joystick-right-click" class="remote-drive-btn" type="button">Right Click</button>
+              </div>
+              <button id="remote-control-launcher" class="remote-control-launcher" type="button" aria-expanded="true">
+                Controls
+              </button>
+            </div>
+            <div id="remote-control-overlay" class="remote-control-overlay">
+              <div class="remote-control-head">
+                <div class="remote-control-title">Quick Controls</div>
+                <button id="remote-control-collapse" class="remote-overlay-btn remote-overlay-btn-compact" type="button">Hide</button>
+              </div>
+              <div class="remote-control-row">
                 <button id="remote-zoom-out" class="remote-nav-btn" type="button" aria-label="Zoom out">-</button>
                 <div id="remote-zoom-label" class="remote-zoom-label">1.0x</div>
                 <button id="remote-zoom-in" class="remote-nav-btn" type="button" aria-label="Zoom in">+</button>
                 <button id="remote-pan-toggle" class="remote-nav-btn wide" type="button" aria-pressed="false">Pan</button>
                 <button id="remote-reset-view" class="remote-nav-btn wide" type="button">Center</button>
               </div>
-              <div class="remote-nav-hint">Use Pan for widescreen navigation. Two-finger vertical drag = wheel.</div>
+              <div class="remote-control-row remote-sensitivity-row">
+                <label class="remote-sensitivity-label" for="remote-joystick-sensitivity">Sensitivity</label>
+                <input
+                  id="remote-joystick-sensitivity"
+                  class="remote-sensitivity-slider"
+                  type="range"
+                  min="30"
+                  max="180"
+                  step="5"
+                  value="100"
+                >
+                <div id="remote-joystick-sensitivity-value" class="remote-sensitivity-value">100%</div>
+              </div>
+              <div class="remote-control-row">
+                <button id="remote-overlay-left-click" class="remote-overlay-btn" type="button">Left</button>
+                <button id="remote-overlay-right-click" class="remote-overlay-btn" type="button">Right</button>
+                <button id="remote-overlay-double-click" class="remote-overlay-btn" type="button">Double</button>
+                <button id="remote-overlay-wheel-up" class="remote-overlay-btn" type="button">Wheel +</button>
+                <button id="remote-overlay-wheel-down" class="remote-overlay-btn" type="button">Wheel -</button>
+              </div>
+              <div class="remote-control-row">
+                <button id="remote-overlay-esc" class="remote-overlay-btn" type="button">Esc</button>
+                <button id="remote-overlay-tab" class="remote-overlay-btn" type="button">Tab</button>
+                <button id="remote-overlay-enter" class="remote-overlay-btn" type="button">Enter</button>
+                <button id="remote-overlay-backspace" class="remote-overlay-btn" type="button">Bksp</button>
+                <button id="remote-overlay-space" class="remote-overlay-btn" type="button">Space</button>
+                <button id="remote-overlay-open-keyboard" class="remote-overlay-btn" type="button">Keyboard</button>
+                <button id="remote-overlay-fullscreen-toggle" class="remote-overlay-btn" type="button">Fullscreen</button>
+              </div>
+              <div class="remote-control-row remote-dpad-row">
+                <div class="remote-dpad">
+                  <button id="remote-overlay-arrow-up" class="remote-overlay-btn dpad" type="button" aria-label="Arrow up">Up</button>
+                  <button id="remote-overlay-arrow-left" class="remote-overlay-btn dpad" type="button" aria-label="Arrow left">Left</button>
+                  <button id="remote-overlay-arrow-down" class="remote-overlay-btn dpad" type="button" aria-label="Arrow down">Down</button>
+                  <button id="remote-overlay-arrow-right" class="remote-overlay-btn dpad" type="button" aria-label="Arrow right">Right</button>
+                </div>
+              </div>
+              <div class="remote-control-row">
+                <button id="remote-overlay-alt-tab" class="remote-overlay-btn" type="button">Alt+Tab</button>
+                <button id="remote-overlay-win-tab" class="remote-overlay-btn" type="button">Win+Tab</button>
+                <button id="remote-overlay-win-d" class="remote-overlay-btn" type="button">Win+D</button>
+                <button id="remote-overlay-task-manager" class="remote-overlay-btn" type="button">Ctrl+Shift+Esc</button>
+                <button id="remote-overlay-copy" class="remote-overlay-btn" type="button">Ctrl+C</button>
+                <button id="remote-overlay-paste" class="remote-overlay-btn" type="button">Ctrl+V</button>
+              </div>
             </div>
             <div id="remote-minimap" class="remote-minimap" hidden aria-hidden="true">
               <div class="remote-minimap-label">Viewport</div>
               <div id="remote-minimap-viewport" class="remote-minimap-viewport"></div>
             </div>
-          </div>
-
-          <div class="remote-dock">
-            <button id="remote-left-click" class="remote-dock-btn" type="button">Left Click</button>
-            <button id="remote-right-click" class="remote-dock-btn" type="button">Right Click</button>
-            <button id="remote-double-click" class="remote-dock-btn" type="button">Double Click</button>
           </div>
 
           <div id="remote-keyboard-status" class="remote-help">
@@ -245,7 +324,7 @@
             enterkeyhint="done"
           ></textarea>
           <div class="remote-help">
-            Touch controls: tap = left click, long press = right click, drag = move pointer, two-finger vertical drag = wheel.
+            Use the joystick for pointer movement. Left/Right click buttons are always visible; open Quick Controls for keyboard shortcuts and pan/center tools.
           </div>
         </section>
       </section>

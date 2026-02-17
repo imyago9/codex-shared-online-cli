@@ -9,14 +9,28 @@
     modeSelect: document.getElementById('remote-mode-select'),
     openKeyboardButton: document.getElementById('remote-open-keyboard'),
     fullscreenButton: document.getElementById('remote-fullscreen-toggle'),
+    overlayFullscreenButton: document.getElementById('remote-overlay-fullscreen-toggle'),
     streamStats: document.getElementById('remote-stream-stats'),
     capabilityStatus: document.getElementById('remote-capability-status'),
     connectionStatus: document.getElementById('remote-connection-status'),
     stage: document.getElementById('remote-stage'),
     canvas: document.getElementById('remote-canvas'),
+    controlOverlay: document.getElementById('remote-control-overlay'),
+    controlLauncherButton: document.getElementById('remote-control-launcher'),
+    controlCollapseButton: document.getElementById('remote-control-collapse'),
+    driveOverlay: document.getElementById('remote-drive-overlay'),
+    driveHandle: document.getElementById('remote-drive-handle'),
+    joystickPad: document.getElementById('remote-joystick-pad'),
+    joystickKnob: document.getElementById('remote-joystick-knob'),
+    joystickLeftButton: document.getElementById('remote-joystick-left-click'),
+    joystickRightButton: document.getElementById('remote-joystick-right-click'),
+    joystickSensitivityInput: document.getElementById('remote-joystick-sensitivity'),
+    joystickSensitivityValue: document.getElementById('remote-joystick-sensitivity-value'),
     streamImage: document.getElementById('remote-stream-image'),
     overlay: document.getElementById('remote-overlay'),
-    cursor: document.getElementById('remote-cursor'),
+    cursorIndicator: document.getElementById('remote-cursor-indicator'),
+    standaloneHint: document.getElementById('remote-standalone-hint'),
+    standaloneDismissButton: document.getElementById('remote-standalone-dismiss'),
     zoomOutButton: document.getElementById('remote-zoom-out'),
     zoomInButton: document.getElementById('remote-zoom-in'),
     zoomLabel: document.getElementById('remote-zoom-label'),
@@ -24,9 +38,27 @@
     resetViewButton: document.getElementById('remote-reset-view'),
     minimap: document.getElementById('remote-minimap'),
     minimapViewport: document.getElementById('remote-minimap-viewport'),
-    leftClickButton: document.getElementById('remote-left-click'),
-    rightClickButton: document.getElementById('remote-right-click'),
-    doubleClickButton: document.getElementById('remote-double-click'),
+    overlayLeftClickButton: document.getElementById('remote-overlay-left-click'),
+    overlayRightClickButton: document.getElementById('remote-overlay-right-click'),
+    overlayDoubleClickButton: document.getElementById('remote-overlay-double-click'),
+    overlayWheelUpButton: document.getElementById('remote-overlay-wheel-up'),
+    overlayWheelDownButton: document.getElementById('remote-overlay-wheel-down'),
+    overlayEscButton: document.getElementById('remote-overlay-esc'),
+    overlayTabButton: document.getElementById('remote-overlay-tab'),
+    overlayEnterButton: document.getElementById('remote-overlay-enter'),
+    overlayBackspaceButton: document.getElementById('remote-overlay-backspace'),
+    overlaySpaceButton: document.getElementById('remote-overlay-space'),
+    overlayOpenKeyboardButton: document.getElementById('remote-overlay-open-keyboard'),
+    overlayArrowUpButton: document.getElementById('remote-overlay-arrow-up'),
+    overlayArrowDownButton: document.getElementById('remote-overlay-arrow-down'),
+    overlayArrowLeftButton: document.getElementById('remote-overlay-arrow-left'),
+    overlayArrowRightButton: document.getElementById('remote-overlay-arrow-right'),
+    overlayAltTabButton: document.getElementById('remote-overlay-alt-tab'),
+    overlayWinTabButton: document.getElementById('remote-overlay-win-tab'),
+    overlayWinDButton: document.getElementById('remote-overlay-win-d'),
+    overlayTaskManagerButton: document.getElementById('remote-overlay-task-manager'),
+    overlayCopyButton: document.getElementById('remote-overlay-copy'),
+    overlayPasteButton: document.getElementById('remote-overlay-paste'),
     keyboardStatus: document.getElementById('remote-keyboard-status'),
     keyboardInput: document.getElementById('remote-keyboard-input')
   };
@@ -53,9 +85,11 @@
     enabled: false,
     sidecarReachable: false,
     inputAvailable: false,
+    sidecarInputReason: null,
     controlAllowed: false,
     desiredMode: normalizeMode(elements.modeSelect ? elements.modeSelect.value : 'view'),
     effectiveMode: 'view',
+    lastControlUpgradeAttemptAt: 0,
     hasFrame: false,
     frameFps: 0,
     frameLatencyMs: null,
@@ -77,30 +111,53 @@
       stageHeight: 0
     },
     panMode: false,
+    quickControls: {
+      expanded: true
+    },
+    driveOverlay: {
+      x: null,
+      y: null,
+      dragging: false,
+      dragPointerId: null,
+      dragOffsetX: 0,
+      dragOffsetY: 0
+    },
     pointer: {
       lastNormalizedX: 0.5,
       lastNormalizedY: 0.5,
-      lastMoveSentAt: 0,
-      hideCursorTimer: null
+      lastMoveSentAt: 0
     },
-    touch: {
-      active: false,
-      touchId: null,
-      startX: 0,
-      startY: 0,
-      lastX: 0,
-      lastY: 0,
-      moved: false,
-      longPressTimer: null,
-      longPressTriggered: false,
-      twoFingerActive: false,
-      twoFingerLastY: 0
+    cursor: {
+      normalizedX: 0.5,
+      normalizedY: 0.5,
+      visible: false,
+      hideTimer: null,
+      lastRemoteAt: 0
     },
     panGesture: {
       active: false,
       pointerId: null,
       lastX: 0,
       lastY: 0
+    },
+    joystick: {
+      active: false,
+      pointerId: null,
+      centerX: 0,
+      centerY: 0,
+      radius: 1,
+      vectorX: 0,
+      vectorY: 0,
+      moveTimer: null,
+      lastTickAt: 0,
+      baseSpeedPerSec: 0.72,
+      sensitivityPercent: 100,
+      maxSpeedPerSec: 0.72
+    },
+    pwa: {
+      isIos: false,
+      isStandalone: false,
+      hintDismissed: false
     }
   };
 
@@ -110,6 +167,98 @@
 
   function normalizeMode(value) {
     return value === 'control' ? 'control' : 'view';
+  }
+
+  function detectIosDevice() {
+    const userAgent = (window.navigator && window.navigator.userAgent) || '';
+    const platform = (window.navigator && window.navigator.platform) || '';
+    const maxTouchPoints = Number(window.navigator && window.navigator.maxTouchPoints) || 0;
+    const iosUserAgent = /iphone|ipad|ipod/i.test(userAgent);
+    const ipadDesktopClass = platform === 'MacIntel' && maxTouchPoints > 1;
+    return iosUserAgent || ipadDesktopClass;
+  }
+
+  function detectStandaloneDisplayMode() {
+    const displayModeStandalone = typeof window.matchMedia === 'function'
+      ? window.matchMedia('(display-mode: standalone)').matches
+      : false;
+    const navigatorStandalone = Boolean(window.navigator && window.navigator.standalone === true);
+    return displayModeStandalone || navigatorStandalone;
+  }
+
+  function getStandaloneHintStorageKey() {
+    return 'online-cli-remote-standalone-hint-dismissed-v1';
+  }
+
+  function getQuickControlsCollapsedStorageKey() {
+    return 'online-cli-remote-controls-collapsed-v1';
+  }
+
+  function getJoystickSensitivityStorageKey() {
+    return 'online-cli-remote-joystick-sensitivity-v1';
+  }
+
+  function getDriveOverlayPositionStorageKey() {
+    return 'online-cli-remote-drive-overlay-position-v1';
+  }
+
+  function safeReadLocalStorage(key) {
+    try {
+      return window.localStorage.getItem(key);
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function safeWriteLocalStorage(key, value) {
+    try {
+      window.localStorage.setItem(key, value);
+    } catch (_error) {
+      // Ignore storage failures in private mode.
+    }
+  }
+
+  function safeReadJsonStorage(key) {
+    const raw = safeReadLocalStorage(key);
+    if (!raw) {
+      return null;
+    }
+    try {
+      return JSON.parse(raw);
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function updateStandaloneBodyClass() {
+    document.body.classList.toggle('pwa-standalone', state.pwa.isStandalone === true);
+  }
+
+  function shouldShowStandaloneHint() {
+    return state.pwa.isIos === true && state.pwa.isStandalone !== true && state.pwa.hintDismissed !== true;
+  }
+
+  function setStandaloneHintVisible(visible, options) {
+    if (!elements.standaloneHint) {
+      return;
+    }
+    const opts = options || {};
+    const shouldShow = visible === true && (
+      opts.force === true
+        ? (state.pwa.isIos === true && state.pwa.isStandalone !== true)
+        : shouldShowStandaloneHint()
+    );
+    elements.standaloneHint.hidden = !shouldShow;
+  }
+
+  function refreshStandaloneState() {
+    const previousStandaloneState = state.pwa.isStandalone;
+    state.pwa.isStandalone = detectStandaloneDisplayMode();
+    if (previousStandaloneState !== state.pwa.isStandalone && state.pwa.isStandalone) {
+      setStandaloneHintVisible(false);
+    }
+    updateStandaloneBodyClass();
+    updateFullscreenButton();
   }
 
   function isRemoteViewActive() {
@@ -127,6 +276,32 @@
       state.controlAllowed === true &&
       isWsOpen()
     );
+  }
+
+  function getQuickControlButtons() {
+    return [
+      elements.overlayLeftClickButton,
+      elements.overlayRightClickButton,
+      elements.overlayDoubleClickButton,
+      elements.overlayWheelUpButton,
+      elements.overlayWheelDownButton,
+      elements.overlayEscButton,
+      elements.overlayTabButton,
+      elements.overlayEnterButton,
+      elements.overlayBackspaceButton,
+      elements.overlaySpaceButton,
+      elements.overlayOpenKeyboardButton,
+      elements.overlayArrowUpButton,
+      elements.overlayArrowDownButton,
+      elements.overlayArrowLeftButton,
+      elements.overlayArrowRightButton,
+      elements.overlayAltTabButton,
+      elements.overlayWinTabButton,
+      elements.overlayWinDButton,
+      elements.overlayTaskManagerButton,
+      elements.overlayCopyButton,
+      elements.overlayPasteButton
+    ].filter(Boolean);
   }
 
   function setConnectionState(text, kind) {
@@ -173,7 +348,12 @@
       return;
     }
 
-    const inputLabel = state.inputAvailable === true ? 'control available' : 'view-only (input unavailable)';
+    const inputReason = state.inputAvailable === true
+      ? ''
+      : (state.sidecarInputReason ? ` (${state.sidecarInputReason})` : '');
+    const inputLabel = state.inputAvailable === true
+      ? 'control available'
+      : `view-only${inputReason}`;
     const panLabel = state.panMode ? 'pan mode on' : 'pan mode off';
     elements.capabilityStatus.textContent = `mode: ${state.effectiveMode} | ${inputLabel} | ${panLabel}`;
   }
@@ -219,13 +399,112 @@
       );
     }
 
-    const controlsEnabled = state.enabled === true && state.sidecarReachable === true;
-    if (elements.leftClickButton) elements.leftClickButton.disabled = !controlsEnabled;
-    if (elements.rightClickButton) elements.rightClickButton.disabled = !controlsEnabled;
-    if (elements.doubleClickButton) elements.doubleClickButton.disabled = !controlsEnabled;
+    const controlsEnabled = isControlActive();
+    for (const button of getQuickControlButtons()) {
+      button.disabled = !controlsEnabled;
+    }
+    if (elements.joystickPad) {
+      elements.joystickPad.classList.toggle('disabled', !controlsEnabled);
+    }
+    if (elements.joystickLeftButton) {
+      elements.joystickLeftButton.disabled = !controlsEnabled;
+    }
+    if (elements.joystickRightButton) {
+      elements.joystickRightButton.disabled = !controlsEnabled;
+    }
+    if (!controlsEnabled) {
+      state.joystick.active = false;
+      state.joystick.pointerId = null;
+      state.joystick.vectorX = 0;
+      state.joystick.vectorY = 0;
+      state.joystick.lastTickAt = 0;
+      stopJoystickLoop();
+      resetJoystickKnob();
+    }
 
     updateKeyboardStatus();
     updateCapabilityText();
+    updateFullscreenButton();
+  }
+
+  function persistQuickControlsCollapsedState() {
+    safeWriteLocalStorage(
+      getQuickControlsCollapsedStorageKey(),
+      state.quickControls.expanded ? '0' : '1'
+    );
+  }
+
+  function setJoystickSensitivityPercent(nextPercent, shouldPersist = true) {
+    const numeric = Number(nextPercent);
+    const normalizedPercent = clamp(Math.round(Number.isFinite(numeric) ? numeric : 100), 30, 180);
+    const speed = state.joystick.baseSpeedPerSec * (normalizedPercent / 100);
+    state.joystick.sensitivityPercent = normalizedPercent;
+    state.joystick.maxSpeedPerSec = Number(speed.toFixed(4));
+
+    if (elements.joystickSensitivityInput) {
+      elements.joystickSensitivityInput.value = String(normalizedPercent);
+    }
+    if (elements.joystickSensitivityValue) {
+      elements.joystickSensitivityValue.textContent = `${normalizedPercent}%`;
+    }
+
+    if (shouldPersist) {
+      safeWriteLocalStorage(getJoystickSensitivityStorageKey(), String(normalizedPercent));
+    }
+  }
+
+  function setQuickControlsExpanded(expanded, shouldPersist = true) {
+    state.quickControls.expanded = expanded === true;
+
+    if (elements.controlOverlay) {
+      elements.controlOverlay.hidden = !state.quickControls.expanded;
+      elements.controlOverlay.style.display = state.quickControls.expanded ? '' : 'none';
+      elements.controlOverlay.setAttribute('aria-hidden', state.quickControls.expanded ? 'false' : 'true');
+    }
+    if (elements.controlLauncherButton) {
+      elements.controlLauncherButton.hidden = false;
+      elements.controlLauncherButton.style.display = '';
+      elements.controlLauncherButton.setAttribute('aria-expanded', state.quickControls.expanded ? 'true' : 'false');
+      elements.controlLauncherButton.textContent = state.quickControls.expanded ? 'Hide Controls' : 'Controls';
+    }
+    if (elements.controlCollapseButton) {
+      elements.controlCollapseButton.textContent = state.quickControls.expanded ? 'Hide' : 'Show';
+    }
+
+    if (shouldPersist) {
+      persistQuickControlsCollapsedState();
+    }
+  }
+
+  function maybeReconnectForControlUpgrade(reason) {
+    if (!isRemoteViewActive()) {
+      return;
+    }
+
+    if (state.enabled !== true || state.sidecarReachable !== true) {
+      return;
+    }
+
+    if (state.desiredMode !== 'control' || state.inputAvailable !== true || state.controlAllowed === true) {
+      return;
+    }
+
+    const now = Date.now();
+    if ((now - state.lastControlUpgradeAttemptAt) < 1800) {
+      return;
+    }
+    state.lastControlUpgradeAttemptAt = now;
+
+    if (!state.hasFrame) {
+      setOverlayText('Reconnecting to enable control mode...');
+    }
+
+    disconnectRemoteSocket({ manual: true, preserveFrame: true });
+    ensureRemoteSocket().catch(() => {});
+
+    if (reason) {
+      updateCapabilityText();
+    }
   }
 
   function revokeFrameUrl() {
@@ -239,6 +518,9 @@
   function setFrameVisibility(hasFrame) {
     state.hasFrame = hasFrame === true;
     elements.stage.classList.toggle('has-frame', state.hasFrame);
+    if (!state.hasFrame) {
+      hideRemoteCursor();
+    }
   }
 
   function resetFrame() {
@@ -263,6 +545,146 @@
 
   function getStageRect() {
     return elements.stage.getBoundingClientRect();
+  }
+
+  function getDriveOverlayDimensions() {
+    if (!elements.driveOverlay) {
+      return { width: 220, height: 146 };
+    }
+    const width = Math.max(90, Math.round(elements.driveOverlay.offsetWidth || 220));
+    const height = Math.max(72, Math.round(elements.driveOverlay.offsetHeight || 146));
+    return { width, height };
+  }
+
+  function clampDriveOverlayPosition(nextX, nextY) {
+    const stageRect = getStageRect();
+    const stageWidth = Math.max(1, Math.round(stageRect.width));
+    const stageHeight = Math.max(1, Math.round(stageRect.height));
+    const overlaySize = getDriveOverlayDimensions();
+    const margin = 8;
+    return {
+      x: clamp(Number(nextX) || 0, margin, Math.max(margin, stageWidth - overlaySize.width - margin)),
+      y: clamp(Number(nextY) || 0, margin, Math.max(margin, stageHeight - overlaySize.height - margin))
+    };
+  }
+
+  function applyDriveOverlayPosition(nextX, nextY, shouldPersist = true) {
+    if (!elements.driveOverlay) {
+      return;
+    }
+    const clamped = clampDriveOverlayPosition(nextX, nextY);
+    state.driveOverlay.x = clamped.x;
+    state.driveOverlay.y = clamped.y;
+    elements.driveOverlay.style.left = `${clamped.x}px`;
+    elements.driveOverlay.style.top = `${clamped.y}px`;
+    elements.driveOverlay.style.right = 'auto';
+    elements.driveOverlay.style.bottom = 'auto';
+
+    if (shouldPersist) {
+      safeWriteLocalStorage(getDriveOverlayPositionStorageKey(), JSON.stringify(clamped));
+    }
+  }
+
+  function ensureDriveOverlayPosition() {
+    if (!elements.driveOverlay) {
+      return;
+    }
+
+    const stageRect = getStageRect();
+    const rawStageWidth = Math.round(stageRect.width);
+    const rawStageHeight = Math.round(stageRect.height);
+    if (!Number.isFinite(rawStageWidth) || !Number.isFinite(rawStageHeight) || rawStageWidth < 120 || rawStageHeight < 120) {
+      return;
+    }
+
+    if (Number.isFinite(state.driveOverlay.x) && Number.isFinite(state.driveOverlay.y)) {
+      applyDriveOverlayPosition(state.driveOverlay.x, state.driveOverlay.y, false);
+      return;
+    }
+
+    const stageWidth = rawStageWidth;
+    const stageHeight = rawStageHeight;
+    const overlaySize = getDriveOverlayDimensions();
+    const fallbackX = 10;
+    const fallbackY = Math.max(8, stageHeight - overlaySize.height - 10);
+    const defaultX = Number.isFinite(state.driveOverlay.x) ? state.driveOverlay.x : fallbackX;
+    const defaultY = Number.isFinite(state.driveOverlay.y) ? state.driveOverlay.y : fallbackY;
+    applyDriveOverlayPosition(defaultX, defaultY, false);
+  }
+
+  function beginDriveOverlayDrag(event) {
+    if (
+      !elements.driveOverlay
+      || !elements.driveHandle
+      || !event
+      || event.button !== 0
+    ) {
+      return;
+    }
+
+    const overlayRect = elements.driveOverlay.getBoundingClientRect();
+    state.driveOverlay.dragging = true;
+    state.driveOverlay.dragPointerId = event.pointerId;
+    state.driveOverlay.dragOffsetX = event.clientX - overlayRect.left;
+    state.driveOverlay.dragOffsetY = event.clientY - overlayRect.top;
+    elements.driveOverlay.classList.add('dragging');
+
+    if (typeof elements.driveHandle.setPointerCapture === 'function') {
+      try {
+        elements.driveHandle.setPointerCapture(event.pointerId);
+      } catch (_error) {
+        // Ignore pointer capture races.
+      }
+    }
+
+    event.preventDefault();
+  }
+
+  function moveDriveOverlayDrag(event) {
+    if (
+      !state.driveOverlay.dragging
+      || state.driveOverlay.dragPointerId !== event.pointerId
+    ) {
+      return;
+    }
+
+    const stageRect = getStageRect();
+    const localLeft = event.clientX - stageRect.left - state.driveOverlay.dragOffsetX;
+    const localTop = event.clientY - stageRect.top - state.driveOverlay.dragOffsetY;
+    applyDriveOverlayPosition(localLeft, localTop, false);
+    event.preventDefault();
+  }
+
+  function endDriveOverlayDrag(event) {
+    if (
+      !state.driveOverlay.dragging
+      || !event
+      || state.driveOverlay.dragPointerId !== event.pointerId
+    ) {
+      return;
+    }
+
+    if (elements.driveHandle && typeof elements.driveHandle.releasePointerCapture === 'function') {
+      try {
+        elements.driveHandle.releasePointerCapture(event.pointerId);
+      } catch (_error) {
+        // Ignore pointer release races.
+      }
+    }
+
+    state.driveOverlay.dragging = false;
+    state.driveOverlay.dragPointerId = null;
+    state.driveOverlay.dragOffsetX = 0;
+    state.driveOverlay.dragOffsetY = 0;
+    if (elements.driveOverlay) {
+      elements.driveOverlay.classList.remove('dragging');
+    }
+
+    if (Number.isFinite(state.driveOverlay.x) && Number.isFinite(state.driveOverlay.y)) {
+      applyDriveOverlayPosition(state.driveOverlay.x, state.driveOverlay.y, true);
+    }
+
+    event.preventDefault();
   }
 
   function clampPan() {
@@ -309,7 +731,27 @@
     }
 
     updateMinimap();
-    paintCursor();
+    renderRemoteCursor();
+    ensureDriveOverlayPosition();
+  }
+
+  function scheduleViewportRecompute() {
+    recomputeViewport();
+    if (typeof window.requestAnimationFrame === 'function') {
+      window.requestAnimationFrame(() => {
+        recomputeViewport();
+        window.requestAnimationFrame(() => {
+          recomputeViewport();
+        });
+      });
+      return;
+    }
+    setTimeout(() => {
+      recomputeViewport();
+    }, 40);
+    setTimeout(() => {
+      recomputeViewport();
+    }, 120);
   }
 
   function updateMinimap() {
@@ -396,36 +838,69 @@
     recomputeViewport();
   }
 
-  function hideCursorSoon() {
-    if (state.pointer.hideCursorTimer) {
-      clearTimeout(state.pointer.hideCursorTimer);
-    }
-    state.pointer.hideCursorTimer = setTimeout(() => {
-      elements.stage.classList.add('cursor-hidden');
-    }, 2500);
-  }
-
-  function paintCursor() {
-    if (!elements.cursor || !Number.isFinite(state.pointer.lastNormalizedX) || !Number.isFinite(state.pointer.lastNormalizedY)) {
+  function clearCursorHideTimer() {
+    if (!state.cursor.hideTimer) {
       return;
     }
+    clearTimeout(state.cursor.hideTimer);
+    state.cursor.hideTimer = null;
+  }
 
-    const desktopX = state.pointer.lastNormalizedX * state.display.desktopWidth;
-    const desktopY = state.pointer.lastNormalizedY * state.display.desktopHeight;
-    const stageX = state.display.drawLeft + (desktopX * state.display.drawScale);
-    const stageY = state.display.drawTop + (desktopY * state.display.drawScale);
+  function setCursorIndicatorVisible(visible) {
+    state.cursor.visible = visible === true;
+    if (!elements.cursorIndicator) {
+      return;
+    }
+    elements.cursorIndicator.hidden = !state.cursor.visible;
+  }
 
-    elements.cursor.style.left = `${stageX}px`;
-    elements.cursor.style.top = `${stageY}px`;
-    elements.cursor.hidden = false;
-    elements.stage.classList.remove('cursor-hidden');
-    hideCursorSoon();
+  function renderRemoteCursor() {
+    if (!elements.cursorIndicator || state.cursor.visible !== true) {
+      return;
+    }
+    const drawX = state.display.drawLeft + (state.cursor.normalizedX * state.display.desktopWidth * state.display.drawScale);
+    const drawY = state.display.drawTop + (state.cursor.normalizedY * state.display.desktopHeight * state.display.drawScale);
+    elements.cursorIndicator.style.left = `${Math.round(drawX)}px`;
+    elements.cursorIndicator.style.top = `${Math.round(drawY)}px`;
+  }
+
+  function hideRemoteCursor() {
+    clearCursorHideTimer();
+    setCursorIndicatorVisible(false);
+  }
+
+  function setRemoteCursorNormalized(normalizedX, normalizedY, options = {}) {
+    state.cursor.normalizedX = clamp(normalizedX, 0, 1);
+    state.cursor.normalizedY = clamp(normalizedY, 0, 1);
+    if (options.source === 'remote') {
+      state.cursor.lastRemoteAt = Date.now();
+      state.pointer.lastNormalizedX = state.cursor.normalizedX;
+      state.pointer.lastNormalizedY = state.cursor.normalizedY;
+    }
+    setCursorIndicatorVisible(true);
+    renderRemoteCursor();
+
+    const autoHideMs = Number.isFinite(options.autoHideMs) ? Number(options.autoHideMs) : 0;
+    clearCursorHideTimer();
+    if (autoHideMs > 0) {
+      state.cursor.hideTimer = setTimeout(() => {
+        state.cursor.hideTimer = null;
+        setCursorIndicatorVisible(false);
+      }, autoHideMs);
+    }
   }
 
   function setPointerNormalized(normalizedX, normalizedY) {
     state.pointer.lastNormalizedX = clamp(normalizedX, 0, 1);
     state.pointer.lastNormalizedY = clamp(normalizedY, 0, 1);
-    paintCursor();
+
+    // Prefer host cursor telemetry when available; local updates keep it visible as fallback.
+    if ((Date.now() - state.cursor.lastRemoteAt) > 260) {
+      setRemoteCursorNormalized(state.pointer.lastNormalizedX, state.pointer.lastNormalizedY, {
+        source: 'local',
+        autoHideMs: 900
+      });
+    }
   }
 
   function normalizedFromClient(clientX, clientY) {
@@ -539,6 +1014,44 @@
     });
   }
 
+  function sendQuickKeyPress(key, code, modifiers) {
+    return sendInputEvent({
+      type: 'key',
+      action: 'press',
+      key: typeof key === 'string' ? key.slice(0, 64) : '',
+      code: typeof code === 'string' ? code.slice(0, 64) : '',
+      modifiers: {
+        alt: Boolean(modifiers && modifiers.alt === true),
+        ctrl: Boolean(modifiers && modifiers.ctrl === true),
+        meta: Boolean(modifiers && modifiers.meta === true),
+        shift: Boolean(modifiers && modifiers.shift === true)
+      }
+    });
+  }
+
+  function sendDoubleLeftClick(normalized) {
+    const first = sendMouseClick('left', normalized);
+    if (!first) {
+      return false;
+    }
+    setTimeout(() => {
+      sendMouseClick('left', normalized);
+    }, 70);
+    return true;
+  }
+
+  function focusRemoteKeyboard() {
+    if (!elements.keyboardInput) {
+      return false;
+    }
+    if (!isControlActive()) {
+      updateKeyboardStatus();
+      return false;
+    }
+    elements.keyboardInput.focus();
+    return true;
+  }
+
   function sendPointerMove(normalized) {
     const now = Date.now();
     if ((now - state.pointer.lastMoveSentAt) < 12) {
@@ -553,10 +1066,11 @@
   }
 
   function sendMouseClick(button, normalized) {
-    const target = normalized || {
-      x: state.pointer.lastNormalizedX,
-      y: state.pointer.lastNormalizedY
-    };
+    const hasFreshRemoteCursor = (Date.now() - state.cursor.lastRemoteAt) <= 450;
+    const fallbackTarget = hasFreshRemoteCursor
+      ? { x: state.cursor.normalizedX, y: state.cursor.normalizedY }
+      : { x: state.pointer.lastNormalizedX, y: state.pointer.lastNormalizedY };
+    const target = normalized || fallbackTarget;
     return sendInputEvent({
       type: 'mouse_button',
       button,
@@ -580,21 +1094,139 @@
     });
   }
 
-  function clearLongPressTimer() {
-    if (state.touch.longPressTimer) {
-      clearTimeout(state.touch.longPressTimer);
-      state.touch.longPressTimer = null;
+  function resetJoystickKnob() {
+    if (!elements.joystickKnob) {
+      return;
     }
+    elements.joystickKnob.style.transform = 'translate(-50%, -50%)';
   }
 
-  function resetTouchState() {
-    clearLongPressTimer();
-    state.touch.active = false;
-    state.touch.touchId = null;
-    state.touch.moved = false;
-    state.touch.longPressTriggered = false;
-    state.touch.twoFingerActive = false;
-    state.touch.twoFingerLastY = 0;
+  function setJoystickVectorFromClient(clientX, clientY) {
+    if (!elements.joystickPad || !elements.joystickKnob) {
+      return;
+    }
+
+    const rect = elements.joystickPad.getBoundingClientRect();
+    const localX = clientX - rect.left;
+    const localY = clientY - rect.top;
+    const radius = Math.max(1, state.joystick.radius);
+    const rawDx = localX - state.joystick.centerX;
+    const rawDy = localY - state.joystick.centerY;
+    const distance = Math.hypot(rawDx, rawDy);
+    const limitedScale = distance > radius ? (radius / distance) : 1;
+    const dx = rawDx * limitedScale;
+    const dy = rawDy * limitedScale;
+
+    state.joystick.vectorX = clamp(dx / radius, -1, 1);
+    state.joystick.vectorY = clamp(dy / radius, -1, 1);
+    elements.joystickKnob.style.transform = `translate(calc(-50% + ${Math.round(dx)}px), calc(-50% + ${Math.round(dy)}px))`;
+  }
+
+  function stopJoystickLoop() {
+    if (!state.joystick.moveTimer) {
+      return;
+    }
+    clearInterval(state.joystick.moveTimer);
+    state.joystick.moveTimer = null;
+  }
+
+  function tickJoystickMove() {
+    if (!state.joystick.active || !isControlActive()) {
+      return;
+    }
+
+    const now = Date.now();
+    if (!state.joystick.lastTickAt) {
+      state.joystick.lastTickAt = now;
+      return;
+    }
+    const deltaSec = clamp((now - state.joystick.lastTickAt) / 1000, 0, 0.05);
+    state.joystick.lastTickAt = now;
+
+    const vx = state.joystick.vectorX;
+    const vy = state.joystick.vectorY;
+    if (Math.abs(vx) < 0.02 && Math.abs(vy) < 0.02) {
+      return;
+    }
+
+    const nextX = clamp(state.pointer.lastNormalizedX + (vx * state.joystick.maxSpeedPerSec * deltaSec), 0, 1);
+    const nextY = clamp(state.pointer.lastNormalizedY + (vy * state.joystick.maxSpeedPerSec * deltaSec), 0, 1);
+    if (Math.abs(nextX - state.pointer.lastNormalizedX) < 0.0002 && Math.abs(nextY - state.pointer.lastNormalizedY) < 0.0002) {
+      return;
+    }
+
+    setPointerNormalized(nextX, nextY);
+    sendPointerMove({ x: nextX, y: nextY });
+  }
+
+  function startJoystickLoop() {
+    if (state.joystick.moveTimer) {
+      return;
+    }
+    state.joystick.lastTickAt = Date.now();
+    state.joystick.moveTimer = setInterval(() => {
+      tickJoystickMove();
+    }, 16);
+  }
+
+  function beginJoystickControl(event) {
+    if (!elements.joystickPad || !event || event.button !== 0) {
+      return;
+    }
+    if (!isControlActive()) {
+      return;
+    }
+
+    const rect = elements.joystickPad.getBoundingClientRect();
+    state.joystick.active = true;
+    state.joystick.pointerId = event.pointerId;
+    state.joystick.centerX = rect.width / 2;
+    state.joystick.centerY = rect.height / 2;
+    state.joystick.radius = Math.max(24, Math.min(rect.width, rect.height) * 0.42);
+    state.joystick.lastTickAt = Date.now();
+
+    if (typeof elements.joystickPad.setPointerCapture === 'function') {
+      try {
+        elements.joystickPad.setPointerCapture(event.pointerId);
+      } catch (_error) {
+        // Ignore pointer capture races.
+      }
+    }
+
+    setJoystickVectorFromClient(event.clientX, event.clientY);
+    startJoystickLoop();
+    event.preventDefault();
+  }
+
+  function moveJoystickControl(event) {
+    if (!state.joystick.active || state.joystick.pointerId !== event.pointerId) {
+      return;
+    }
+    setJoystickVectorFromClient(event.clientX, event.clientY);
+    event.preventDefault();
+  }
+
+  function endJoystickControl(event) {
+    if (!state.joystick.active || state.joystick.pointerId !== event.pointerId) {
+      return;
+    }
+
+    if (elements.joystickPad && typeof elements.joystickPad.releasePointerCapture === 'function') {
+      try {
+        elements.joystickPad.releasePointerCapture(event.pointerId);
+      } catch (_error) {
+        // Ignore pointer release races.
+      }
+    }
+
+    state.joystick.active = false;
+    state.joystick.pointerId = null;
+    state.joystick.vectorX = 0;
+    state.joystick.vectorY = 0;
+    state.joystick.lastTickAt = 0;
+    stopJoystickLoop();
+    resetJoystickKnob();
+    event.preventDefault();
   }
 
   function handleRemoteControlEnvelope(message) {
@@ -606,6 +1238,9 @@
       state.controlAllowed = message.controlAllowed === true;
       state.effectiveMode = normalizeMode(message.mode);
       updateModeUi();
+      if (state.desiredMode === 'control' && state.effectiveMode !== 'control' && state.inputAvailable === true) {
+        maybeReconnectForControlUpgrade('remote-ready');
+      }
       return;
     }
 
@@ -613,6 +1248,13 @@
       state.controlAllowed = message.controlAllowed === true;
       state.effectiveMode = normalizeMode(message.mode);
       updateModeUi();
+      if (state.desiredMode === 'control' && state.effectiveMode !== 'control') {
+        if (message.reason === 'control-unavailable' && state.inputAvailable === true) {
+          maybeReconnectForControlUpgrade('mode-rejected');
+        } else if (typeof message.reason === 'string' && message.reason) {
+          setOverlayText(`Control mode unavailable (${message.reason}).`);
+        }
+      }
       return;
     }
 
@@ -653,6 +1295,16 @@
     if (message.type === 'remote-input-backpressure') {
       if (elements.capabilityStatus) {
         elements.capabilityStatus.textContent = 'Input queue saturated, reducing send rate.';
+      }
+      return;
+    }
+
+    if (message.type === 'remote-cursor') {
+      if (Number.isFinite(Number(message.x)) && Number.isFinite(Number(message.y))) {
+        setRemoteCursorNormalized(Number(message.x), Number(message.y), {
+          source: 'remote',
+          autoHideMs: 1800
+        });
       }
       return;
     }
@@ -712,6 +1364,7 @@
     const opts = options || {};
     state.manualDisconnect = opts.manual === true;
     clearReconnectTimer();
+    hideRemoteCursor();
     state.wsGeneration += 1;
 
     if (state.ws && (state.ws.readyState === WebSocket.OPEN || state.ws.readyState === WebSocket.CONNECTING)) {
@@ -734,9 +1387,13 @@
     const query = force ? '?force=1' : '';
     try {
       const status = await requestJson(`/api/remote/status${query}`);
+      const previousInputAvailable = state.inputAvailable;
       state.enabled = status && status.enabled === true;
       state.sidecarReachable = Boolean(status && status.sidecar && status.sidecar.reachable === true);
       state.inputAvailable = Boolean(status && status.sidecar && status.sidecar.inputAvailable === true);
+      state.sidecarInputReason = status && status.sidecar && status.sidecar.reason
+        ? String(status.sidecar.reason)
+        : null;
 
       const defaultMode = normalizeMode(status ? status.defaultMode : 'view');
       if (state.desiredMode !== 'control') {
@@ -766,6 +1423,8 @@
         if (!state.hasFrame) {
           setOverlayText('Ready to connect.');
         }
+      } else if (state.inputAvailable === true && previousInputAvailable !== true) {
+        maybeReconnectForControlUpgrade('input-upgraded');
       }
       updateModeUi();
       return true;
@@ -773,6 +1432,7 @@
       state.enabled = false;
       state.sidecarReachable = false;
       state.inputAvailable = false;
+      state.sidecarInputReason = error && error.message ? error.message : null;
       updateModeUi();
       setConnectionState('Status unavailable', 'disconnected');
       setOverlayText(`Remote status failed: ${error.message}`);
@@ -948,8 +1608,10 @@
 
   function activateRemoteView() {
     state.activeView = 'remote';
+    refreshStandaloneState();
     applyViewPills('remote');
     recomputeViewport();
+    setStandaloneHintVisible(true);
     refreshRemoteStatus(true).then(() => {
       ensureRemoteSocket().catch(() => {});
     }).catch(() => {});
@@ -960,6 +1622,7 @@
   function deactivateRemoteView(nextView) {
     state.activeView = nextView;
     applyViewPills(nextView);
+    setStandaloneHintVisible(false);
     exitSimulatedFullscreen();
     stopStatusPolling();
     disconnectRemoteSocket({ manual: true, preserveFrame: true });
@@ -993,7 +1656,11 @@
   function enterSimulatedFullscreen() {
     state.simulatedFullscreen = true;
     document.body.classList.add('remote-simulated-fullscreen');
-    recomputeViewport();
+    if (state.display.zoom <= state.display.minZoom + 0.001) {
+      state.display.panX = 0;
+      state.display.panY = 0;
+    }
+    scheduleViewportRecompute();
   }
 
   function exitSimulatedFullscreen() {
@@ -1002,16 +1669,24 @@
     }
     state.simulatedFullscreen = false;
     document.body.classList.remove('remote-simulated-fullscreen');
-    recomputeViewport();
+    scheduleViewportRecompute();
   }
 
   function updateFullscreenButton() {
-    if (!elements.fullscreenButton) {
-      return;
-    }
     const isFullscreen = isFullscreenActive();
-    elements.fullscreenButton.textContent = isFullscreen ? 'Exit Fullscreen' : 'Fullscreen';
-    elements.fullscreenButton.setAttribute('aria-pressed', isFullscreen ? 'true' : 'false');
+    const buttonLabel = (!isFullscreen && state.pwa.isIos === true && state.pwa.isStandalone !== true)
+      ? 'Home Screen Fullscreen'
+      : (isFullscreen ? 'Exit Fullscreen' : 'Fullscreen');
+
+    if (elements.fullscreenButton) {
+      elements.fullscreenButton.textContent = buttonLabel;
+      elements.fullscreenButton.setAttribute('aria-pressed', isFullscreen ? 'true' : 'false');
+    }
+    if (elements.overlayFullscreenButton) {
+      elements.overlayFullscreenButton.textContent = isFullscreen ? 'Exit Fullscreen' : 'Fullscreen';
+      elements.overlayFullscreenButton.setAttribute('aria-pressed', isFullscreen ? 'true' : 'false');
+      elements.overlayFullscreenButton.disabled = state.enabled !== true;
+    }
   }
 
   function isEventFromStageControl(target) {
@@ -1019,7 +1694,9 @@
       return false;
     }
     return Boolean(
-      target.closest('.remote-nav-overlay') ||
+      target.closest('.remote-drive-overlay') ||
+      target.closest('.remote-control-overlay') ||
+      target.closest('.remote-control-launcher') ||
       target.closest('.remote-minimap')
     );
   }
@@ -1062,6 +1739,11 @@
     state.desiredMode = normalized;
     updateModeUi();
 
+    if (normalized === 'control' && state.inputAvailable === true && state.controlAllowed !== true) {
+      maybeReconnectForControlUpgrade('mode-switch');
+      return;
+    }
+
     if (!isWsOpen()) {
       ensureRemoteSocket().catch(() => {});
       return;
@@ -1071,6 +1753,54 @@
       type: 'set-mode',
       mode: normalized
     });
+  }
+
+  async function toggleFullscreenMode() {
+    refreshStandaloneState();
+
+    if (
+      !isFullscreenActive()
+      && state.pwa.isIos === true
+      && state.pwa.isStandalone !== true
+    ) {
+      setStandaloneHintVisible(true, { force: true });
+      setOverlayText('For stable iOS fullscreen, install to Home Screen and launch from the app icon.');
+      return;
+    }
+
+    if (isFullscreenActive()) {
+      if (isNativeFullscreenActive()) {
+        if (document.exitFullscreen) {
+          await document.exitFullscreen();
+        } else if (document.webkitExitFullscreen) {
+          document.webkitExitFullscreen();
+        }
+      } else {
+        exitSimulatedFullscreen();
+      }
+      updateFullscreenButton();
+      return;
+    }
+
+    let enteredNative = false;
+    try {
+      const shouldUseNativeFullscreen = state.pwa.isIos !== true;
+      if (shouldUseNativeFullscreen && elements.stage.requestFullscreen) {
+        await elements.stage.requestFullscreen();
+        enteredNative = true;
+      } else if (shouldUseNativeFullscreen && elements.stage.webkitRequestFullscreen) {
+        elements.stage.webkitRequestFullscreen();
+        enteredNative = true;
+      }
+    } catch (_error) {
+      enteredNative = false;
+    }
+
+    if (!enteredNative) {
+      enterSimulatedFullscreen();
+    }
+
+    updateFullscreenButton();
   }
 
   function bindPointerAndTouchHandlers() {
@@ -1199,181 +1929,6 @@
     });
     elements.stage.addEventListener('pointercancel', releasePanPointer);
     elements.stage.addEventListener('lostpointercapture', releasePanPointer);
-
-    elements.stage.addEventListener('touchstart', (event) => {
-      if (isEventFromStageControl(event.target)) {
-        return;
-      }
-      if (!isControlActive() && !state.panMode) {
-        return;
-      }
-
-      if (state.panMode && event.touches.length === 1) {
-        const touch = event.touches[0];
-        state.panGesture.active = true;
-        state.panGesture.lastX = touch.clientX;
-        state.panGesture.lastY = touch.clientY;
-        event.preventDefault();
-        return;
-      }
-
-      if (event.touches.length === 2) {
-        clearLongPressTimer();
-        state.touch.twoFingerActive = true;
-        state.touch.active = false;
-        state.touch.touchId = null;
-        state.touch.twoFingerLastY = (event.touches[0].clientY + event.touches[1].clientY) / 2;
-        event.preventDefault();
-        return;
-      }
-
-      if (!isControlActive() || event.touches.length !== 1) {
-        return;
-      }
-
-      const touch = event.touches[0];
-      state.touch.active = true;
-      state.touch.touchId = touch.identifier;
-      state.touch.startX = touch.clientX;
-      state.touch.startY = touch.clientY;
-      state.touch.lastX = touch.clientX;
-      state.touch.lastY = touch.clientY;
-      state.touch.moved = false;
-      state.touch.longPressTriggered = false;
-
-      clearLongPressTimer();
-      state.touch.longPressTimer = setTimeout(() => {
-        if (!state.touch.active || state.touch.moved || state.touch.twoFingerActive || !isControlActive()) {
-          return;
-        }
-        const normalized = normalizedFromClient(state.touch.lastX, state.touch.lastY);
-        if (!normalized) {
-          return;
-        }
-        setPointerNormalized(normalized.x, normalized.y);
-        const sent = sendMouseClick('right', normalized);
-        if (sent) {
-          state.touch.longPressTriggered = true;
-        }
-      }, 460);
-
-      event.preventDefault();
-    }, { passive: false });
-
-    elements.stage.addEventListener('touchmove', (event) => {
-      if (isEventFromStageControl(event.target)) {
-        return;
-      }
-      if (state.panMode && state.panGesture.active && event.touches.length === 1) {
-        const touch = event.touches[0];
-        const deltaX = touch.clientX - state.panGesture.lastX;
-        const deltaY = touch.clientY - state.panGesture.lastY;
-        state.panGesture.lastX = touch.clientX;
-        state.panGesture.lastY = touch.clientY;
-        panBy(deltaX, deltaY);
-        event.preventDefault();
-        return;
-      }
-
-      if (!isControlActive()) {
-        return;
-      }
-
-      if (state.touch.twoFingerActive && event.touches.length === 2) {
-        const averageY = (event.touches[0].clientY + event.touches[1].clientY) / 2;
-        const deltaY = averageY - state.touch.twoFingerLastY;
-        state.touch.twoFingerLastY = averageY;
-        if (Math.abs(deltaY) > 0.8) {
-          const normalized = normalizedFromClient(event.touches[0].clientX, averageY);
-          if (normalized) {
-            setPointerNormalized(normalized.x, normalized.y);
-            sendMouseWheel(deltaY * 18, normalized);
-          }
-        }
-        event.preventDefault();
-        return;
-      }
-
-      if (!state.touch.active || event.touches.length !== 1) {
-        return;
-      }
-
-      const touch = Array.from(event.touches).find((item) => item.identifier === state.touch.touchId);
-      if (!touch) {
-        return;
-      }
-
-      state.touch.lastX = touch.clientX;
-      state.touch.lastY = touch.clientY;
-      const movedX = Math.abs(state.touch.lastX - state.touch.startX);
-      const movedY = Math.abs(state.touch.lastY - state.touch.startY);
-      if (movedX > 6 || movedY > 6) {
-        state.touch.moved = true;
-        clearLongPressTimer();
-        const normalized = normalizedFromClient(touch.clientX, touch.clientY);
-        if (normalized) {
-          setPointerNormalized(normalized.x, normalized.y);
-          sendPointerMove(normalized);
-        }
-      }
-
-      event.preventDefault();
-    }, { passive: false });
-
-    elements.stage.addEventListener('touchend', (event) => {
-      if (isEventFromStageControl(event.target)) {
-        if (event.touches.length === 0) {
-          state.panGesture.active = false;
-          state.panGesture.pointerId = null;
-        }
-        return;
-      }
-      if (state.panMode && state.panGesture.active) {
-        if (event.touches.length === 0) {
-          state.panGesture.active = false;
-        }
-        event.preventDefault();
-        return;
-      }
-
-      if (!isControlActive()) {
-        resetTouchState();
-        return;
-      }
-
-      if (state.touch.twoFingerActive) {
-        if (event.touches.length < 2) {
-          state.touch.twoFingerActive = false;
-        }
-        event.preventDefault();
-        return;
-      }
-
-      if (!state.touch.active) {
-        return;
-      }
-
-      const endedTouch = Array.from(event.changedTouches || []).find((item) => item.identifier === state.touch.touchId);
-      if (!endedTouch) {
-        return;
-      }
-
-      clearLongPressTimer();
-      if (!state.touch.moved && !state.touch.longPressTriggered) {
-        const normalized = normalizedFromClient(endedTouch.clientX, endedTouch.clientY);
-        if (normalized) {
-          setPointerNormalized(normalized.x, normalized.y);
-          sendMouseClick('left', normalized);
-        }
-      }
-      resetTouchState();
-      event.preventDefault();
-    }, { passive: false });
-
-    elements.stage.addEventListener('touchcancel', () => {
-      resetTouchState();
-      state.panGesture.active = false;
-    });
   }
 
   function bindKeyboardHandlers() {
@@ -1467,50 +2022,48 @@
       });
     }
 
+    if (elements.controlCollapseButton) {
+      const collapseQuickControls = (event) => {
+        if (event) {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+        setQuickControlsExpanded(false);
+      };
+      elements.controlCollapseButton.addEventListener('click', collapseQuickControls);
+      elements.controlCollapseButton.addEventListener('pointerup', collapseQuickControls);
+    }
+
+    if (elements.controlLauncherButton) {
+      elements.controlLauncherButton.addEventListener('click', (event) => {
+        event.preventDefault();
+        setQuickControlsExpanded(!state.quickControls.expanded);
+      });
+    }
+
     if (elements.openKeyboardButton && elements.keyboardInput) {
       elements.openKeyboardButton.addEventListener('click', () => {
-        if (!isControlActive()) {
-          updateKeyboardStatus();
-          return;
-        }
-        elements.keyboardInput.focus();
+        focusRemoteKeyboard();
       });
     }
 
     if (elements.fullscreenButton) {
-      elements.fullscreenButton.addEventListener('click', async () => {
-        if (isFullscreenActive()) {
-          if (isNativeFullscreenActive()) {
-            if (document.exitFullscreen) {
-              await document.exitFullscreen();
-            } else if (document.webkitExitFullscreen) {
-              document.webkitExitFullscreen();
-            }
-          } else {
-            exitSimulatedFullscreen();
-          }
-          updateFullscreenButton();
-          return;
-        }
+      elements.fullscreenButton.addEventListener('click', () => {
+        toggleFullscreenMode().catch(() => {});
+      });
+    }
 
-        let enteredNative = false;
-        try {
-          if (elements.stage.requestFullscreen) {
-            await elements.stage.requestFullscreen();
-            enteredNative = true;
-          } else if (elements.stage.webkitRequestFullscreen) {
-            elements.stage.webkitRequestFullscreen();
-            enteredNative = true;
-          }
-        } catch (_error) {
-          enteredNative = false;
-        }
+    if (elements.overlayFullscreenButton) {
+      elements.overlayFullscreenButton.addEventListener('click', () => {
+        toggleFullscreenMode().catch(() => {});
+      });
+    }
 
-        if (!enteredNative) {
-          enterSimulatedFullscreen();
-        }
-
-        updateFullscreenButton();
+    if (elements.standaloneDismissButton) {
+      elements.standaloneDismissButton.addEventListener('click', () => {
+        state.pwa.hintDismissed = true;
+        safeWriteLocalStorage(getStandaloneHintStorageKey(), '1');
+        setStandaloneHintVisible(false);
       });
     }
 
@@ -1519,14 +2072,42 @@
         exitSimulatedFullscreen();
       }
       updateFullscreenButton();
-      recomputeViewport();
+      scheduleViewportRecompute();
     });
     document.addEventListener('webkitfullscreenchange', () => {
       if (!isNativeFullscreenActive()) {
         exitSimulatedFullscreen();
       }
       updateFullscreenButton();
-      recomputeViewport();
+      scheduleViewportRecompute();
+    });
+
+    if (typeof window.matchMedia === 'function') {
+      const standaloneMedia = window.matchMedia('(display-mode: standalone)');
+      if (standaloneMedia && typeof standaloneMedia.addEventListener === 'function') {
+        standaloneMedia.addEventListener('change', () => {
+          refreshStandaloneState();
+          if (isRemoteViewActive()) {
+            setStandaloneHintVisible(true);
+          }
+        });
+      }
+    }
+
+    window.addEventListener('pageshow', () => {
+      refreshStandaloneState();
+      if (isRemoteViewActive()) {
+        setStandaloneHintVisible(true);
+      }
+    });
+
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) {
+        refreshStandaloneState();
+        if (isRemoteViewActive()) {
+          setStandaloneHintVisible(true);
+        }
+      }
     });
 
     if (elements.zoomOutButton) {
@@ -1547,6 +2128,14 @@
     if (elements.panToggleButton) {
       elements.panToggleButton.addEventListener('click', () => {
         setPanMode(!state.panMode);
+      });
+    }
+    if (elements.joystickSensitivityInput) {
+      elements.joystickSensitivityInput.addEventListener('input', () => {
+        setJoystickSensitivityPercent(elements.joystickSensitivityInput.value, true);
+      });
+      elements.joystickSensitivityInput.addEventListener('change', () => {
+        setJoystickSensitivityPercent(elements.joystickSensitivityInput.value, true);
       });
     }
 
@@ -1577,22 +2166,166 @@
       }, { passive: false });
     }
 
-    if (elements.leftClickButton) {
-      elements.leftClickButton.addEventListener('click', () => {
+    if (elements.joystickLeftButton) {
+      elements.joystickLeftButton.addEventListener('click', () => {
         sendMouseClick('left');
       });
     }
-    if (elements.rightClickButton) {
-      elements.rightClickButton.addEventListener('click', () => {
+    if (elements.joystickRightButton) {
+      elements.joystickRightButton.addEventListener('click', () => {
         sendMouseClick('right');
       });
     }
-    if (elements.doubleClickButton) {
-      elements.doubleClickButton.addEventListener('click', () => {
+    if (elements.driveHandle) {
+      elements.driveHandle.addEventListener('pointerdown', (event) => {
+        beginDriveOverlayDrag(event);
+      });
+      elements.driveHandle.addEventListener('pointermove', (event) => {
+        moveDriveOverlayDrag(event);
+      });
+      elements.driveHandle.addEventListener('pointerup', (event) => {
+        endDriveOverlayDrag(event);
+      });
+      elements.driveHandle.addEventListener('pointercancel', (event) => {
+        endDriveOverlayDrag(event);
+      });
+      elements.driveHandle.addEventListener('lostpointercapture', () => {
+        state.driveOverlay.dragging = false;
+        state.driveOverlay.dragPointerId = null;
+        state.driveOverlay.dragOffsetX = 0;
+        state.driveOverlay.dragOffsetY = 0;
+        if (elements.driveOverlay) {
+          elements.driveOverlay.classList.remove('dragging');
+        }
+      });
+    }
+    if (elements.joystickPad) {
+      elements.joystickPad.addEventListener('pointerdown', (event) => {
+        beginJoystickControl(event);
+      });
+      elements.joystickPad.addEventListener('pointermove', (event) => {
+        moveJoystickControl(event);
+      });
+      elements.joystickPad.addEventListener('pointerup', (event) => {
+        endJoystickControl(event);
+      });
+      elements.joystickPad.addEventListener('pointercancel', (event) => {
+        endJoystickControl(event);
+      });
+      elements.joystickPad.addEventListener('lostpointercapture', () => {
+        state.joystick.active = false;
+        state.joystick.pointerId = null;
+        state.joystick.vectorX = 0;
+        state.joystick.vectorY = 0;
+        state.joystick.lastTickAt = 0;
+        stopJoystickLoop();
+        resetJoystickKnob();
+      });
+    }
+
+    if (elements.overlayLeftClickButton) {
+      elements.overlayLeftClickButton.addEventListener('click', () => {
         sendMouseClick('left');
-        setTimeout(() => {
-          sendMouseClick('left');
-        }, 70);
+      });
+    }
+    if (elements.overlayRightClickButton) {
+      elements.overlayRightClickButton.addEventListener('click', () => {
+        sendMouseClick('right');
+      });
+    }
+    if (elements.overlayDoubleClickButton) {
+      elements.overlayDoubleClickButton.addEventListener('click', () => {
+        sendDoubleLeftClick();
+      });
+    }
+    if (elements.overlayWheelUpButton) {
+      elements.overlayWheelUpButton.addEventListener('click', () => {
+        sendMouseWheel(-180);
+      });
+    }
+    if (elements.overlayWheelDownButton) {
+      elements.overlayWheelDownButton.addEventListener('click', () => {
+        sendMouseWheel(180);
+      });
+    }
+    if (elements.overlayEscButton) {
+      elements.overlayEscButton.addEventListener('click', () => {
+        sendQuickKeyPress('Escape', 'Escape');
+      });
+    }
+    if (elements.overlayTabButton) {
+      elements.overlayTabButton.addEventListener('click', () => {
+        sendQuickKeyPress('Tab', 'Tab');
+      });
+    }
+    if (elements.overlayEnterButton) {
+      elements.overlayEnterButton.addEventListener('click', () => {
+        sendQuickKeyPress('Enter', 'Enter');
+      });
+    }
+    if (elements.overlayBackspaceButton) {
+      elements.overlayBackspaceButton.addEventListener('click', () => {
+        sendQuickKeyPress('Backspace', 'Backspace');
+      });
+    }
+    if (elements.overlaySpaceButton) {
+      elements.overlaySpaceButton.addEventListener('click', () => {
+        sendQuickKeyPress(' ', 'Space');
+      });
+    }
+    if (elements.overlayOpenKeyboardButton) {
+      elements.overlayOpenKeyboardButton.addEventListener('click', () => {
+        focusRemoteKeyboard();
+      });
+    }
+    if (elements.overlayArrowUpButton) {
+      elements.overlayArrowUpButton.addEventListener('click', () => {
+        sendQuickKeyPress('ArrowUp', 'ArrowUp');
+      });
+    }
+    if (elements.overlayArrowDownButton) {
+      elements.overlayArrowDownButton.addEventListener('click', () => {
+        sendQuickKeyPress('ArrowDown', 'ArrowDown');
+      });
+    }
+    if (elements.overlayArrowLeftButton) {
+      elements.overlayArrowLeftButton.addEventListener('click', () => {
+        sendQuickKeyPress('ArrowLeft', 'ArrowLeft');
+      });
+    }
+    if (elements.overlayArrowRightButton) {
+      elements.overlayArrowRightButton.addEventListener('click', () => {
+        sendQuickKeyPress('ArrowRight', 'ArrowRight');
+      });
+    }
+    if (elements.overlayAltTabButton) {
+      elements.overlayAltTabButton.addEventListener('click', () => {
+        sendQuickKeyPress('Tab', 'Tab', { alt: true });
+      });
+    }
+    if (elements.overlayWinTabButton) {
+      elements.overlayWinTabButton.addEventListener('click', () => {
+        sendQuickKeyPress('Tab', 'Tab', { meta: true });
+      });
+    }
+    if (elements.overlayWinDButton) {
+      elements.overlayWinDButton.addEventListener('click', () => {
+        sendQuickKeyPress('d', 'KeyD', { meta: true });
+      });
+    }
+    if (elements.overlayTaskManagerButton) {
+      elements.overlayTaskManagerButton.addEventListener('click', () => {
+        sendQuickKeyPress('Escape', 'Escape', { ctrl: true, shift: true });
+      });
+    }
+    if (elements.overlayCopyButton) {
+      elements.overlayCopyButton.addEventListener('click', () => {
+        sendQuickKeyPress('c', 'KeyC', { ctrl: true });
+      });
+    }
+    if (elements.overlayPasteButton) {
+      elements.overlayPasteButton.addEventListener('click', () => {
+        sendQuickKeyPress('v', 'KeyV', { ctrl: true });
       });
     }
 
@@ -1605,12 +2338,16 @@
     });
 
     window.addEventListener('resize', () => {
-      recomputeViewport();
+      scheduleViewportRecompute();
+    });
+
+    window.addEventListener('orientationchange', () => {
+      scheduleViewportRecompute();
     });
 
     if (window.visualViewport) {
       const onViewportChange = () => {
-        recomputeViewport();
+        scheduleViewportRecompute();
       };
       window.visualViewport.addEventListener('resize', onViewportChange);
       window.visualViewport.addEventListener('scroll', onViewportChange);
@@ -1623,20 +2360,39 @@
       clearReconnectTimer();
       exitSimulatedFullscreen();
       disconnectRemoteSocket({ manual: true, preserveFrame: false });
-      clearLongPressTimer();
-      if (state.pointer.hideCursorTimer) {
-        clearTimeout(state.pointer.hideCursorTimer);
-        state.pointer.hideCursorTimer = null;
-      }
+      state.driveOverlay.dragging = false;
+      state.driveOverlay.dragPointerId = null;
+      stopJoystickLoop();
+      resetJoystickKnob();
     });
   }
 
   function initializeRemoteUi() {
+    state.pwa.isIos = detectIosDevice();
+    state.pwa.hintDismissed = safeReadLocalStorage(getStandaloneHintStorageKey()) === '1';
+    state.quickControls.expanded = safeReadLocalStorage(getQuickControlsCollapsedStorageKey()) !== '1';
+    const storedSensitivity = Number.parseInt(safeReadLocalStorage(getJoystickSensitivityStorageKey()), 10);
+    if (Number.isFinite(storedSensitivity)) {
+      state.joystick.sensitivityPercent = storedSensitivity;
+    }
+    const storedDriveOverlayPos = safeReadJsonStorage(getDriveOverlayPositionStorageKey());
+    if (storedDriveOverlayPos && typeof storedDriveOverlayPos === 'object') {
+      if (Number.isFinite(Number(storedDriveOverlayPos.x))) {
+        state.driveOverlay.x = Number(storedDriveOverlayPos.x);
+      }
+      if (Number.isFinite(Number(storedDriveOverlayPos.y))) {
+        state.driveOverlay.y = Number(storedDriveOverlayPos.y);
+      }
+    }
+    refreshStandaloneState();
+    setStandaloneHintVisible(false);
     updateStatsText();
+    setJoystickSensitivityPercent(state.joystick.sensitivityPercent, false);
     updateModeUi();
     setConnectionState('Checking status...', 'warn');
     setOverlayText('Open the Remote tab to start desktop streaming.');
     recomputeViewport();
+    setQuickControlsExpanded(state.quickControls.expanded, false);
     bindUiEvents();
     bindPointerAndTouchHandlers();
     bindKeyboardHandlers();

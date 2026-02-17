@@ -328,16 +328,18 @@ function createRemoteGateway(server, remoteClient, options = {}) {
       const requested = normalizeMode(nextMode, context.mode);
       const previous = context.mode;
       let effectiveMode = requested;
+      let modeReason = reason || null;
 
       if (requested === 'control' && !context.controlAllowed) {
         effectiveMode = 'view';
+        modeReason = 'control-unavailable';
       }
 
       context.mode = effectiveMode;
       sendControl('remote-mode', {
         mode: context.mode,
         controlAllowed: context.controlAllowed,
-        reason: reason || null
+        reason: modeReason
       });
 
       if (previous !== context.mode && logger) {
@@ -348,7 +350,7 @@ function createRemoteGateway(server, remoteClient, options = {}) {
           ...connectionMeta,
           previousMode: previous,
           mode: context.mode,
-          reason: reason || null
+          reason: modeReason
         });
       }
 
@@ -580,6 +582,21 @@ function createRemoteGateway(server, remoteClient, options = {}) {
             frameBytes: Number(payload.frameBytes) || 0,
             captureTs: Number(payload.captureTs) || null,
             captureLatencyMs: Number(payload.captureLatencyMs) || null
+          });
+          return;
+        }
+
+        if (payload.type === 'cursor') {
+          const normalizedX = clampNormalized(payload.x);
+          const normalizedY = clampNormalized(payload.y);
+          if (normalizedX === null || normalizedY === null) {
+            return;
+          }
+
+          sendControl('remote-cursor', {
+            x: normalizedX,
+            y: normalizedY,
+            at: Number(payload.at) || Date.now()
           });
           return;
         }

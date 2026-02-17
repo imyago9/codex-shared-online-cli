@@ -28,7 +28,9 @@ Default bind: `127.0.0.1:3390`
 
 ## Input automation fallback
 Input automation uses optional dependency `@nut-tree-fork/nut-js`.
-If it is not installed or fails to load, the sidecar starts in **view-only mode**:
+On Windows, if it is not installed or fails to load, the sidecar automatically falls back to a built-in PowerShell input controller.
+
+If both `nut-js` and the PowerShell fallback are unavailable, the sidecar starts in **view-only mode**:
 - `/stream` remains available
 - `/input` returns a clear unavailable error
 - `/health` reports `input.available=false` with a reason

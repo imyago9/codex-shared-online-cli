@@ -109,6 +109,13 @@ npm start
 - `Control enabled`: mouse/touch/keyboard routed to desktop
 - `Open Keyboard` button (mobile-friendly) explicitly summons software keyboard for remote typing
 - `Fullscreen` + zoom/pan/minimap controls make widescreen desktops usable from phones
+- Quick Controls overlay now includes:
+  - collapsible/draggable launcher when hidden
+  - one-tap shortcut buttons (mouse, arrows, common desktop chords)
+  - `Touch Mouse On/Off` toggle for touch-to-mouse behavior
+- iOS true fullscreen path:
+  - If opened in Safari tab, the fullscreen button shows Home Screen install guidance
+  - Use `Share -> Add to Home Screen`, then launch the app icon for stable standalone fullscreen with touch controls
 
 If the sidecar is offline or input automation is unavailable, the UI degrades to view-only/offline states and the terminal remains fully usable.
 
