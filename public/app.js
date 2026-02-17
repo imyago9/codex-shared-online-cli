@@ -561,6 +561,17 @@ async function toggleTerminalPopout() {
       return;
     }
 
+    const pipUnsupported = /picture-in-picture is not supported here/i.test(message)
+      || /does not support the picture-in-picture mode/i.test(message);
+    const standaloneDisplayMode = typeof window.matchMedia === 'function'
+      ? window.matchMedia('(display-mode: standalone)').matches
+      : Boolean(window.navigator && window.navigator.standalone === true);
+    if (pipUnsupported && standaloneDisplayMode) {
+      applyTerminalPopoutClosedState({ suppressHint: true, preserveMedia: true });
+      setHint('Terminal popout is unavailable in Home Screen mode on this iOS device.');
+      return;
+    }
+
     applyTerminalPopoutClosedState({ suppressHint: true, preserveMedia: true });
     setHint(`Could not start terminal popout: ${message}`);
   }
