@@ -13,6 +13,10 @@ A localhost-first web console for WSL with a session-management scaffold suitabl
   - Duplicate session ids across stores are deduped before serving API results
   - Metrics now expose `metricsQuality` (`complete|partial|estimated`) and both `activeDurationMs` + `elapsedDurationMs`
 - Session-scoped WebSocket streaming (`/ws?sessionId=...`)
+- Optional remote desktop sidecar integration (`Remote` view + split mode in Console)
+  - Browser stream via proxied WS (`/ws/remote`) and short-lived backend tokens
+  - View-only by default, with explicit control enable toggle
+  - Touch controls for iOS (tap/long-press/drag/two-finger wheel)
 - Idle session cleanup + max session guardrails
 - Graceful shutdown persistence:
   - Server shutdown detaches web clients but keeps tmux sessions alive
@@ -81,6 +85,33 @@ AUTH_PASSWORD=your-strong-password
 
 After restart, unauthenticated users are redirected to `/login`, and both REST + WebSocket traffic require auth.
 
+## Remote Desktop MVP (Windows sidecar)
+Remote desktop is disabled by default and does not affect terminal behavior until enabled.
+
+### 1) Enable backend proxy support
+Set in `.env`:
+```bash
+REMOTE_ENABLED=true
+REMOTE_AGENT_URL=http://127.0.0.1:3390
+REMOTE_DEFAULT_MODE=view
+```
+
+### 2) Run the Windows sidecar
+From Windows PowerShell:
+```powershell
+cd remote-agent
+npm install
+npm start
+```
+
+### 3) Use the new `Remote` tab
+- `View only`: stream only, no input execution
+- `Control enabled`: mouse/touch/keyboard routed to desktop
+- `Keyboard` toggle ensures keystrokes go to either terminal or remote desktop, never both
+- `Show Split`: optional stream panel above the terminal in Console view
+
+If the sidecar is offline or input automation is unavailable, the UI degrades to view-only/offline states and the terminal remains fully usable.
+
 ## Minimal Shared Setup (Desktop + iPhone + Local Terminal)
 1. Start server in WSL:
 ```bash
@@ -96,6 +127,15 @@ HOST=0.0.0.0 npm start
 - Use `New` to create separate sessions (for example Session A/B/C).
 - In each desktop terminal, run the selected session's `Copy Attach Cmd`.
 - On iPhone, choose the matching session in the picker to mirror that same console.
+
+## Private Remote Access Over Tailscale
+- Setup guide: `docs/tailscale-setup.md`
+- Windows helper script: `scripts/tailscale-serve.ps1`
+
+Quick command example:
+```powershell
+tailscale serve --bg 3000
+```
 
 ## Troubleshooting
 - If startup fails with `@lydell/node-pty ... could not find the binary package`, reinstall dependencies in the same environment where you run the server (for example inside WSL):
@@ -118,6 +158,10 @@ npm install
   - Optional query param: `resumable=1|0`
 - `GET /api/codex/sessions/:codexSessionId`
 - `POST /api/codex/sessions/:codexSessionId/resume`
+- `GET /api/remote/status`
+- `GET /api/remote/capabilities`
+- `POST /api/remote/token`
+- `WS /ws/remote?token=...`
 
 ## Environment options
 - `HOST` (default: `127.0.0.1`)
@@ -127,6 +171,14 @@ npm install
 - `AUTH_COOKIE_NAME` (default: `online_cli_auth`)
 - `AUTH_SESSION_TTL_MS` (default: `43200000` / 12 hours)
 - `AUTH_COOKIE_SECURE` (default: `false`; set `true` when serving via HTTPS)
+- `REMOTE_ENABLED` (default: `false`; enables backend remote proxy + UI tab)
+- `REMOTE_AGENT_URL` (default: `http://127.0.0.1:3390`)
+- `REMOTE_DEFAULT_MODE` (`view|control`, default: `view`)
+- `REMOTE_STREAM_FPS` (default: `8`)
+- `REMOTE_JPEG_QUALITY` (default: `55`)
+- `REMOTE_INPUT_RATE_LIMIT_PER_SEC` (default: `120`)
+- `REMOTE_INPUT_MAX_QUEUE` (default: `300`)
+- `REMOTE_TOKEN_TTL_MS` (default: `60000`)
 - `MAX_SESSIONS` (default: `24`)
 - `SESSION_IDLE_TIMEOUT_MS` (default: `2700000`)
 - `SESSION_SWEEP_INTERVAL_MS` (default: `60000`)
@@ -154,8 +206,14 @@ npm install
 - `src/config.js`: runtime config parsing
 - `src/auth/authManager.js`: password auth session manager (cookie-based)
 - `src/http/authRoutes.js`: login/status/logout endpoints
+- `src/http/remoteRoutes.js`: remote status/capability/token endpoints
 - `src/sessions/`: tmux-backed session runtime and manager
 - `src/codex/codexSessionIndex.js`: parses local Codex JSONL sessions and metrics
 - `src/ws/sessionGateway.js`: WebSocket routing and heartbeats
+- `src/ws/remoteGateway.js`: authenticated remote stream/control websocket proxy
+- `src/remote/remoteClient.js`: sidecar health/token/connection helper
 - `src/http/sessionRoutes.js`: session API
 - `public/`: browser app and styles
+- `remote-agent/`: Windows host sidecar service (desktop capture + input automation)
+- `docs/tailscale-setup.md`: private tailnet access guide
+- `scripts/tailscale-serve.ps1`: Windows helper to configure `tailscale serve`

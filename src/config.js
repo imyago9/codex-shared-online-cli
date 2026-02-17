@@ -43,11 +43,27 @@ function parseInteger(rawValue, fallback) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function clampInteger(value, min, max) {
+  if (!Number.isFinite(value)) {
+    return min;
+  }
+
+  return Math.max(min, Math.min(max, Math.trunc(value)));
+}
+
 function parseBoolean(rawValue, fallback) {
   if (rawValue == null || rawValue === '') return fallback;
   const normalized = String(rawValue).trim().toLowerCase();
   if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
   if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+  return fallback;
+}
+
+function parseRemoteMode(rawValue, fallback) {
+  const normalized = typeof rawValue === 'string' ? rawValue.trim().toLowerCase() : '';
+  if (normalized === 'view' || normalized === 'control') {
+    return normalized;
+  }
   return fallback;
 }
 
@@ -108,6 +124,15 @@ const config = {
   authCookieName: process.env.AUTH_COOKIE_NAME || 'online_cli_auth',
   authSessionTtlMs: Math.max(parseInteger(process.env.AUTH_SESSION_TTL_MS, 12 * 60 * 60 * 1000), 60_000),
   authCookieSecure: parseBoolean(process.env.AUTH_COOKIE_SECURE, false),
+  remoteEnabled: parseBoolean(process.env.REMOTE_ENABLED, false),
+  remoteAgentUrl: process.env.REMOTE_AGENT_URL || 'http://127.0.0.1:3390',
+  remoteDefaultMode: parseRemoteMode(process.env.REMOTE_DEFAULT_MODE, 'view'),
+  remoteStreamFps: clampInteger(parseInteger(process.env.REMOTE_STREAM_FPS, 8), 1, 20),
+  remoteJpegQuality: clampInteger(parseInteger(process.env.REMOTE_JPEG_QUALITY, 55), 20, 95),
+  remoteInputRateLimitPerSec: clampInteger(parseInteger(process.env.REMOTE_INPUT_RATE_LIMIT_PER_SEC, 120), 10, 600),
+  remoteInputMaxQueue: clampInteger(parseInteger(process.env.REMOTE_INPUT_MAX_QUEUE, 300), 20, 2_000),
+  remoteTokenTtlMs: clampInteger(parseInteger(process.env.REMOTE_TOKEN_TTL_MS, 60_000), 5_000, 10 * 60 * 1000),
+  remoteHealthTimeoutMs: clampInteger(parseInteger(process.env.REMOTE_HEALTH_TIMEOUT_MS, 2_500), 500, 10_000),
   sessionStateFile: process.env.SESSION_STATE_FILE
     ? path.resolve(process.env.SESSION_STATE_FILE)
     : path.join(process.cwd(), '.online-cli', 'sessions-state.json'),

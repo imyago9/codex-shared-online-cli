@@ -8,7 +8,10 @@ const { SessionManager } = require('./sessions/sessionManager');
 const { createAuthManager } = require('./auth/authManager');
 const { createAuthRoutes } = require('./http/authRoutes');
 const { createSessionRoutes } = require('./http/sessionRoutes');
+const { createRemoteRoutes } = require('./http/remoteRoutes');
+const { createRemoteClient } = require('./remote/remoteClient');
 const { createSessionGateway } = require('./ws/sessionGateway');
+const { createRemoteGateway } = require('./ws/remoteGateway');
 const { CodexSessionIndex } = require('./codex/codexSessionIndex');
 
 function startServer() {
@@ -29,6 +32,19 @@ function startServer() {
     logger
   });
   authManager.logAuthEnabled();
+
+  const remoteClient = createRemoteClient({
+    enabled: config.remoteEnabled,
+    agentUrl: config.remoteAgentUrl,
+    defaultMode: config.remoteDefaultMode,
+    streamFps: config.remoteStreamFps,
+    jpegQuality: config.remoteJpegQuality,
+    inputRateLimitPerSec: config.remoteInputRateLimitPerSec,
+    inputMaxQueue: config.remoteInputMaxQueue,
+    tokenTtlMs: config.remoteTokenTtlMs,
+    healthTimeoutMs: config.remoteHealthTimeoutMs,
+    logger
+  });
 
   app.use('/assets', express.static(publicDir));
   app.use('/vendor/xterm', express.static(path.join(__dirname, '..', 'node_modules', 'xterm', 'lib')));
@@ -75,6 +91,7 @@ function startServer() {
   });
 
   app.use('/api', authManager.requireApiAuth());
+  app.use('/api', createRemoteRoutes(remoteClient, { logger }));
   app.use('/api', createSessionRoutes(sessionManager, codexSessionIndex));
 
   app.use((error, _req, res, _next) => {
@@ -91,6 +108,11 @@ function startServer() {
 
   const server = http.createServer(app);
   const sessionGateway = createSessionGateway(server, sessionManager, {
+    logger,
+    wsHeartbeatMs: config.wsHeartbeatMs,
+    authManager
+  });
+  const remoteGateway = createRemoteGateway(server, remoteClient, {
     logger,
     wsHeartbeatMs: config.wsHeartbeatMs,
     authManager
@@ -112,6 +134,8 @@ function startServer() {
     logger.info('Shutting down server', { signal });
 
     sessionGateway.close();
+    remoteGateway.close();
+    remoteClient.close();
     authManager.close();
     sessionManager.stop({
       persistState: true,
