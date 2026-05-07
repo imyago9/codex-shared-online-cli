@@ -24,8 +24,8 @@ Default bind: `127.0.0.1:3390`
 ## Environment
 - `REMOTE_AGENT_HOST` (default: `127.0.0.1`)
 - `REMOTE_AGENT_PORT` (default: `3390`)
-- `REMOTE_STREAM_FPS` (default: `8`)
-- `REMOTE_JPEG_QUALITY` (default: `55`)
+- `REMOTE_STREAM_FPS` (default: `10`)
+- `REMOTE_JPEG_QUALITY` (default: `62`)
 - `REMOTE_INPUT_ENABLED` (default: `true`)
 
 ## Input automation fallback

@@ -38,22 +38,22 @@ private struct TerminalSurface: View {
     var body: some View {
         GeometryReader { proxy in
             ZStack(alignment: .topLeading) {
-                TerminalTextSurface(
-                    text: renderedText,
-                    font: font,
-                    autoScroll: autoScroll,
-                    onTap: { focusToken += 1 }
-                )
-
                 TerminalInputCapture(
                     focusToken: $focusToken,
                     dismissKeyboardToken: $dismissKeyboardToken,
                     keyboardVisible: $keyboardVisible,
                     onInput: onInput
                 )
-                    .frame(width: 1, height: 1)
-                    .opacity(0.01)
+                    .frame(width: max(44, proxy.size.width), height: max(44, proxy.size.height))
+                    .opacity(0.001)
                     .accessibilityHidden(true)
+
+                TerminalTextSurface(
+                    text: renderedText,
+                    font: font,
+                    autoScroll: autoScroll,
+                    onTap: { focusToken += 1 }
+                )
             }
             .contentShape(Rectangle())
             .onAppear {
@@ -255,22 +255,39 @@ struct TerminalInputCapture: UIViewRepresentable {
         }
     }
 
-    final class InputView: UIView, UIKeyInput {
+    final class InputView: UITextView {
         var onInput: ((String) -> Void)?
         var onActiveChanged: ((Bool) -> Void)?
         var lastFocusToken = 0
         var lastDismissKeyboardToken = 0
-        var hasText: Bool { true }
-        var keyboardType: UIKeyboardType = .asciiCapable
-        var autocapitalizationType: UITextAutocapitalizationType = .none
-        var autocorrectionType: UITextAutocorrectionType = .no
-        var smartDashesType: UITextSmartDashesType = .no
-        var smartQuotesType: UITextSmartQuotesType = .no
-        var spellCheckingType: UITextSpellCheckingType = .no
+
+        init() {
+            super.init(frame: .zero, textContainer: nil)
+            backgroundColor = .clear
+            textColor = .clear
+            tintColor = .clear
+            isOpaque = false
+            isScrollEnabled = false
+            isEditable = true
+            isSelectable = true
+            keyboardType = .asciiCapable
+            autocapitalizationType = .none
+            autocorrectionType = .no
+            smartDashesType = .no
+            smartQuotesType = .no
+            spellCheckingType = .no
+            textContentType = .none
+        }
+
+        required init?(coder: NSCoder) {
+            nil
+        }
 
         override var canBecomeFirstResponder: Bool { true }
+        override var hasText: Bool { true }
         override var inputAccessoryView: UIView? {
-            nil
+            get { nil }
+            set {}
         }
 
         override func becomeFirstResponder() -> Bool {
@@ -289,13 +306,15 @@ struct TerminalInputCapture: UIViewRepresentable {
             return didResign
         }
 
-        func insertText(_ text: String) {
+        override func insertText(_ text: String) {
             let normalized = text.replacingOccurrences(of: "\n", with: "\r")
             onInput?(normalized)
+            self.text = ""
         }
 
-        func deleteBackward() {
+        override func deleteBackward() {
             onInput?(TerminalKey.backspace.sequence)
+            text = ""
         }
 
         override var keyCommands: [UIKeyCommand]? {

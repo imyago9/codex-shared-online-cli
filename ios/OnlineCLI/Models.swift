@@ -109,26 +109,26 @@ enum RemoteStreamProfile: String, Codable, CaseIterable, Identifiable {
     var fps: Int {
         switch self {
         case .economy:
-            return 4
+            return 5
         case .balanced:
-            return 8
+            return 10
         case .fluid:
-            return 14
+            return 20
         case .sharp:
-            return 8
+            return 12
         }
     }
 
     var jpegQuality: Int {
         switch self {
         case .economy:
-            return 42
+            return 46
         case .balanced:
-            return 58
+            return 62
         case .fluid:
-            return 58
+            return 64
         case .sharp:
-            return 78
+            return 86
         }
     }
 }
@@ -229,7 +229,50 @@ struct RemoteCapabilities: Codable {
     let streamPresets: [RemoteStreamPresetDescriptor]
     let actions: [RemoteActionDescriptor]
     let display: RemoteDisplayInfo?
+    let monitors: [RemoteMonitorDescriptor]?
     let gateway: RemoteGatewayStatus?
+}
+
+struct RemoteMonitorDescriptor: Codable, Identifiable, Hashable {
+    let rawId: String?
+    let name: String?
+    let primary: Bool?
+    let left: Int
+    let top: Int
+    let width: Int
+    let height: Int
+
+    enum CodingKeys: String, CodingKey {
+        case rawId = "id"
+        case name
+        case primary
+        case left
+        case top
+        case width
+        case height
+    }
+
+    var id: String {
+        if let rawId, !rawId.isEmpty {
+            return rawId
+        }
+        return "\(left):\(top):\(width):\(height)"
+    }
+
+    var displayName: String {
+        if let name, !name.isEmpty {
+            return name
+        }
+        return primary == true ? "Primary" : "Monitor"
+    }
+
+    var resolutionText: String {
+        "\(width)x\(height)"
+    }
+
+    var positionText: String {
+        "x \(left), y \(top)"
+    }
 }
 
 struct RemoteStreamPresetDescriptor: Codable, Identifiable, Hashable {
@@ -283,6 +326,7 @@ struct RemoteSidecarHealth: Codable {
     let input: RemoteSidecarInputHealth?
     let cursor: RemoteSidecarCursorHealth?
     let display: RemoteDisplayInfo?
+    let displays: [RemoteMonitorDescriptor]?
     let platform: String?
 }
 
@@ -319,6 +363,10 @@ struct RemoteDisplayInfo: Codable {
     let scaleX: Double?
     let scaleY: Double?
     let source: String?
+    let captureWidth: Int?
+    let captureHeight: Int?
+    let captureDisplayId: String?
+    let captureDisplayName: String?
 }
 
 struct CodexSessionsResponse: Codable {

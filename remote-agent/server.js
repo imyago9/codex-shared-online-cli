@@ -4,6 +4,13 @@ const express = require('express');
 const screenshotDesktop = require('screenshot-desktop');
 const { WebSocketServer, WebSocket } = require('ws');
 
+let imageComposer = null;
+let imageComposerLoadAttempted = false;
+
+const COMPOSED_FRAME_MAX_PIXELS = 4_000_000;
+const COMPOSED_FRAME_MAX_WIDTH = 4096;
+const COMPOSED_FRAME_MAX_HEIGHT = 2304;
+
 function parseInteger(rawValue, fallback) {
   const parsed = Number.parseInt(rawValue, 10);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -115,6 +122,28 @@ function clampNormalized(value) {
     return null;
   }
   return Math.max(0, Math.min(1, parsed));
+}
+
+function sanitizeMonitorIds(rawValue) {
+  const source = Array.isArray(rawValue)
+    ? rawValue
+    : String(rawValue || '').split(',');
+  const seen = new Set();
+  const ids = [];
+
+  for (const entry of source) {
+    const id = String(entry || '').trim();
+    if (!id || id.toLowerCase() === 'all' || seen.has(id) || id.length > 120) {
+      continue;
+    }
+    seen.add(id);
+    ids.push(id);
+    if (ids.length >= 16) {
+      break;
+    }
+  }
+
+  return ids;
 }
 
 function getInputBounds(displayBounds) {
@@ -275,11 +304,180 @@ function normalizeDisplayDescriptor(rawDisplay) {
   return {
     id: rawDisplay.id ? String(rawDisplay.id) : null,
     name: rawDisplay.name ? String(rawDisplay.name) : null,
+    primary: rawDisplay.primary === true || rawDisplay.isPrimary === true,
     left,
     top,
     width,
     height
   };
+}
+
+function resolveWindowsDisplayCatalog(logger) {
+  if (process.platform !== 'win32') {
+    return [];
+  }
+
+  try {
+    const command = `
+Add-Type -AssemblyName System.Windows.Forms
+$items = @([System.Windows.Forms.Screen]::AllScreens | ForEach-Object {
+  $bounds = $_.Bounds
+  $name = $_.DeviceName
+  if ($_.Primary) { $name = 'Primary' }
+  [PSCustomObject]@{
+    id = $_.DeviceName
+    name = $name
+    primary = $_.Primary
+    left = $bounds.Left
+    top = $bounds.Top
+    width = $bounds.Width
+    height = $bounds.Height
+  }
+})
+ConvertTo-Json -Compress -Depth 4 -InputObject $items
+`;
+
+    const raw = childProcess.execFileSync('powershell', ['-NoProfile', '-Command', command], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    const parsed = JSON.parse(String(raw || '[]').trim() || '[]');
+    const entries = (Array.isArray(parsed) ? parsed : [parsed])
+      .map((entry) => normalizeDisplayDescriptor(entry))
+      .filter((entry) => entry !== null);
+
+    return entries;
+  } catch (error) {
+    logger.warn('Failed to resolve Windows monitor layout', {
+      message: error && error.message ? error.message : 'monitor-layout-failed'
+    });
+    return [];
+  }
+}
+
+function computeDisplayUnion(displays) {
+  const entries = Array.isArray(displays)
+    ? displays.map((entry) => normalizeDisplayDescriptor(entry)).filter((entry) => entry !== null)
+    : [];
+  if (entries.length === 0) {
+    return null;
+  }
+
+  const left = Math.min(...entries.map((entry) => entry.left));
+  const top = Math.min(...entries.map((entry) => entry.top));
+  const right = Math.max(...entries.map((entry) => entry.left + entry.width));
+  const bottom = Math.max(...entries.map((entry) => entry.top + entry.height));
+
+  return {
+    left,
+    top,
+    width: Math.max(1, right - left),
+    height: Math.max(1, bottom - top)
+  };
+}
+
+function mergeDisplayCatalog(captureDisplays, windowsDisplays) {
+  const normalizedCapture = Array.isArray(captureDisplays)
+    ? captureDisplays.map((entry) => normalizeDisplayDescriptor(entry)).filter((entry) => entry !== null)
+    : [];
+  const normalizedWindows = Array.isArray(windowsDisplays)
+    ? windowsDisplays.map((entry) => normalizeDisplayDescriptor(entry)).filter((entry) => entry !== null)
+    : [];
+
+  if (normalizedWindows.length === 0) {
+    return normalizedCapture;
+  }
+
+  return normalizedWindows.map((display, index) => {
+    const captureDisplay = normalizedCapture[index] || null;
+    return {
+      ...display,
+      id: captureDisplay && captureDisplay.id ? captureDisplay.id : display.id,
+      name: display.name || (captureDisplay ? captureDisplay.name : null)
+    };
+  });
+}
+
+function getImageComposer(logger) {
+  if (imageComposer || imageComposerLoadAttempted) {
+    return imageComposer;
+  }
+
+  imageComposerLoadAttempted = true;
+  try {
+    imageComposer = require('jimp');
+  } catch (error) {
+    logger.warn('jimp unavailable, multi-monitor composition disabled', {
+      message: error && error.message ? error.message : 'jimp-not-installed'
+    });
+    imageComposer = null;
+  }
+  return imageComposer;
+}
+
+function createBlankImage(Jimp, width, height, color) {
+  return new Promise((resolve, reject) => {
+    // Jimp's constructor is callback-oriented in the CJS build.
+    // Wrap it once so frame composition can stay async/await driven.
+    new Jimp(width, height, color, (error, image) => {
+      if (error) {
+        reject(error);
+      } else {
+        resolve(image);
+      }
+    });
+  });
+}
+
+function getSelectedCaptureDisplays() {
+  const catalog = getDisplayCatalogSnapshot();
+  if (!Array.isArray(streamState.activeMonitorIds) || streamState.activeMonitorIds.length === 0) {
+    return catalog;
+  }
+
+  const selected = new Set(streamState.activeMonitorIds);
+  const selectedDisplays = catalog.filter((display) => selected.has(display.id));
+  return selectedDisplays.length > 0 ? selectedDisplays : catalog;
+}
+
+function computeComposedFrameScale(bounds) {
+  const width = Math.max(1, Number(bounds && bounds.width) || 1);
+  const height = Math.max(1, Number(bounds && bounds.height) || 1);
+  return Math.min(
+    1,
+    COMPOSED_FRAME_MAX_WIDTH / width,
+    COMPOSED_FRAME_MAX_HEIGHT / height,
+    Math.sqrt(COMPOSED_FRAME_MAX_PIXELS / Math.max(1, width * height))
+  );
+}
+
+async function composeDisplayFrames(displayFrames, bounds) {
+  const Jimp = getImageComposer(logger);
+  if (!Jimp) {
+    throw new Error('multi-monitor-composer-unavailable');
+  }
+
+  const outputScale = computeComposedFrameScale(bounds);
+  const width = clampInteger(Math.round(bounds.width * outputScale), 1, 16_384);
+  const height = clampInteger(Math.round(bounds.height * outputScale), 1, 16_384);
+  const canvas = await createBlankImage(Jimp, width, height, 0x000000FF);
+
+  for (const frame of displayFrames) {
+    const image = await Jimp.read(frame.buffer);
+    const targetWidth = clampInteger(Math.round(frame.display.width * outputScale), 1, 16_384);
+    const targetHeight = clampInteger(Math.round(frame.display.height * outputScale), 1, 16_384);
+    if (image.bitmap.width !== targetWidth || image.bitmap.height !== targetHeight) {
+      image.resize(targetWidth, targetHeight);
+    }
+    canvas.composite(
+      image,
+      Math.round((frame.display.left - bounds.left) * outputScale),
+      Math.round((frame.display.top - bounds.top) * outputScale)
+    );
+  }
+
+  canvas.quality(clampInteger(streamState.activeQuality, 20, 95));
+  return canvas.getBufferAsync(Jimp.MIME_JPEG);
 }
 
 function chooseDisplayForFrame(frameWidth, frameHeight, displays) {
@@ -433,14 +631,26 @@ function calibrateDisplayBoundsToFrame(displayBounds, frameWidth, frameHeight, a
     32_768
   );
 
-  const ratioX = normalizedFrameWidth / Math.max(1, virtualWidth);
-  const ratioY = normalizedFrameHeight / Math.max(1, virtualHeight);
-  const ratioDelta = Math.abs(ratioX - ratioY);
-  const needsScaleCalibration = Math.abs(ratioX - 1) > 0.02 || Math.abs(ratioY - 1) > 0.02;
-  const canScaleVirtualUniformly = ratioDelta <= 0.035;
   const baseSource = typeof displayBounds.baseSource === 'string' && displayBounds.baseSource
     ? displayBounds.baseSource
     : 'display-bounds';
+  const displayUnion = computeDisplayUnion(availableDisplays);
+  const hasDisplayUnion = displayUnion && Array.isArray(availableDisplays) && availableDisplays.length > 1;
+  const unionLeft = displayUnion ? displayUnion.left : virtualLeft;
+  const unionTop = displayUnion ? displayUnion.top : virtualTop;
+  const unionWidth = displayUnion ? displayUnion.width : virtualWidth;
+  const unionHeight = displayUnion ? displayUnion.height : virtualHeight;
+  const calibrationLeft = hasDisplayUnion ? unionLeft : virtualLeft;
+  const calibrationTop = hasDisplayUnion ? unionTop : virtualTop;
+  const calibrationWidth = hasDisplayUnion ? unionWidth : virtualWidth;
+  const calibrationHeight = hasDisplayUnion ? unionHeight : virtualHeight;
+  const ratioX = normalizedFrameWidth / Math.max(1, calibrationWidth);
+  const ratioY = normalizedFrameHeight / Math.max(1, calibrationHeight);
+  const ratioDelta = Math.abs(ratioX - ratioY);
+  const needsScaleCalibration = Math.abs(ratioX - 1) > 0.02 || Math.abs(ratioY - 1) > 0.02;
+  const canScaleVirtualUniformly = ratioDelta <= 0.035;
+  const frameMatchesCalibration = Math.abs(normalizedFrameWidth - calibrationWidth) <= 2
+    && Math.abs(normalizedFrameHeight - calibrationHeight) <= 2;
   const matchedDisplay = chooseDisplayForFrame(
     normalizedFrameWidth,
     normalizedFrameHeight,
@@ -448,7 +658,19 @@ function calibrateDisplayBoundsToFrame(displayBounds, frameWidth, frameHeight, a
   );
 
   let next = null;
-  if (matchedDisplay) {
+  if (frameMatchesCalibration && hasDisplayUnion) {
+    next = {
+      left: calibrationLeft,
+      top: calibrationTop,
+      width: calibrationWidth,
+      height: calibrationHeight,
+      scaleX: 1,
+      scaleY: 1,
+      source: baseSource,
+      captureDisplayId: null,
+      captureDisplayName: null
+    };
+  } else if (matchedDisplay) {
     next = {
       left: matchedDisplay.left,
       top: matchedDisplay.top,
@@ -462,10 +684,10 @@ function calibrateDisplayBoundsToFrame(displayBounds, frameWidth, frameHeight, a
     };
   } else if (!needsScaleCalibration) {
     next = {
-      left: virtualLeft,
-      top: virtualTop,
-      width: virtualWidth,
-      height: virtualHeight,
+      left: calibrationLeft,
+      top: calibrationTop,
+      width: calibrationWidth,
+      height: calibrationHeight,
       scaleX: 1,
       scaleY: 1,
       source: baseSource,
@@ -474,10 +696,10 @@ function calibrateDisplayBoundsToFrame(displayBounds, frameWidth, frameHeight, a
     };
   } else if (canScaleVirtualUniformly) {
     next = {
-      left: Math.round(virtualLeft * ratioX),
-      top: Math.round(virtualTop * ratioY),
-      width: normalizedFrameWidth,
-      height: normalizedFrameHeight,
+      left: calibrationLeft,
+      top: calibrationTop,
+      width: calibrationWidth,
+      height: calibrationHeight,
       scaleX: Number(ratioX.toFixed(4)),
       scaleY: Number(ratioY.toFixed(4)),
       source: 'capture-calibrated',
@@ -487,10 +709,10 @@ function calibrateDisplayBoundsToFrame(displayBounds, frameWidth, frameHeight, a
   } else {
     // Non-uniform frame/virtual ratios usually indicate monitor cropping; avoid lossy virtual scaling.
     next = {
-      left: virtualLeft,
-      top: virtualTop,
-      width: virtualWidth,
-      height: virtualHeight,
+      left: calibrationLeft,
+      top: calibrationTop,
+      width: calibrationWidth,
+      height: calibrationHeight,
       scaleX: Number(ratioX.toFixed(4)),
       scaleY: Number(ratioY.toFixed(4)),
       source: 'capture-ambiguous',
@@ -772,6 +994,9 @@ function createUnavailableInputController(reason) {
     reason,
     async handleEvent() {
       return { ok: false, reason };
+    },
+    async releaseAll() {
+      return { ok: false, reason };
     }
   };
 }
@@ -954,6 +1179,55 @@ function createNutInputController(nut, displayBounds, logger) {
     return pickEnumValue(Button, ['LEFT', 'Left', 'left']);
   }
 
+  function uniqueValues(values) {
+    return values.filter((value, index) => value !== null && values.indexOf(value) === index);
+  }
+
+  function resolveAllModifierKeys() {
+    return uniqueValues([
+      pickEnumValue(Key, ['LeftShift', 'ShiftLeft', 'Shift']),
+      pickEnumValue(Key, ['RightShift', 'ShiftRight', 'Shift']),
+      pickEnumValue(Key, ['LeftControl', 'ControlLeft', 'Control']),
+      pickEnumValue(Key, ['RightControl', 'ControlRight', 'Control']),
+      pickEnumValue(Key, ['LeftAlt', 'AltLeft', 'Alt']),
+      pickEnumValue(Key, ['RightAlt', 'AltRight', 'Alt']),
+      pickEnumValue(Key, ['LeftSuper', 'SuperLeft', 'LeftMeta', 'MetaLeft', 'LeftWin', 'WinLeft', 'Meta']),
+      pickEnumValue(Key, ['RightSuper', 'SuperRight', 'RightMeta', 'MetaRight', 'RightWin', 'WinRight', 'Meta'])
+    ]);
+  }
+
+  function resolveAllMouseButtons() {
+    return uniqueValues([
+      resolveButton('left'),
+      resolveButton('right'),
+      resolveButton('middle')
+    ]);
+  }
+
+  async function releaseAllInputState() {
+    const modifierKeys = resolveAllModifierKeys();
+    if (typeof keyboard.releaseKey === 'function') {
+      for (const key of modifierKeys) {
+        try {
+          await keyboard.releaseKey(key);
+        } catch (_error) {
+          // Continue releasing the rest of the state.
+        }
+      }
+    }
+
+    const mouseButtons = resolveAllMouseButtons();
+    if (typeof mouse.releaseButton === 'function') {
+      for (const button of mouseButtons) {
+        try {
+          await mouse.releaseButton(button);
+        } catch (_error) {
+          // Continue releasing the rest of the state.
+        }
+      }
+    }
+  }
+
   function buildPoint(x, y) {
     if (typeof Point === 'function') {
       return new Point(x, y);
@@ -1093,6 +1367,11 @@ function createNutInputController(nut, displayBounds, logger) {
         throw new Error('input-event-missing-type');
       }
 
+      if (type === 'release_all') {
+        await releaseAllInputState();
+        return { ok: true };
+      }
+
       if (type === 'mouse_move') {
         await moveToNormalized(event.x, event.y);
         return { ok: true };
@@ -1126,6 +1405,10 @@ function createNutInputController(nut, displayBounds, logger) {
       }
 
       throw new Error(`unsupported-input-type:${type}`);
+    },
+    async releaseAll() {
+      await releaseAllInputState();
+      return { ok: true };
     }
   };
 }
@@ -1307,9 +1590,16 @@ $MOUSEEVENTF_MIDDLEUP = 0x0040
 $MOUSEEVENTF_WHEEL = 0x0800
 $KEYEVENTF_KEYUP = 0x0002
 $VK_SHIFT = 0x10
+$VK_LSHIFT = 0xA0
+$VK_RSHIFT = 0xA1
 $VK_CONTROL = 0x11
+$VK_LCONTROL = 0xA2
+$VK_RCONTROL = 0xA3
 $VK_MENU = 0x12
+$VK_LMENU = 0xA4
+$VK_RMENU = 0xA5
 $VK_LWIN = 0x5B
+$VK_RWIN = 0x5C
 
 function Invoke-KeyDown([int]$vk) {
   [NativeInput]::keybd_event([byte]$vk, 0, 0, [UIntPtr]::Zero)
@@ -1379,6 +1669,15 @@ function Invoke-MouseWheel([int]$deltaY) {
   [NativeInput]::mouse_event([uint32]$MOUSEEVENTF_WHEEL, 0, 0, [uint32]$deltaY, [UIntPtr]::Zero)
 }
 
+function Invoke-ReleaseInputState() {
+  foreach ($vk in @($VK_SHIFT, $VK_LSHIFT, $VK_RSHIFT, $VK_CONTROL, $VK_LCONTROL, $VK_RCONTROL, $VK_MENU, $VK_LMENU, $VK_RMENU, $VK_LWIN, $VK_RWIN)) {
+    Invoke-KeyUp $vk
+  }
+  [NativeInput]::mouse_event([uint32]$MOUSEEVENTF_LEFTUP, 0, 0, 0, [UIntPtr]::Zero)
+  [NativeInput]::mouse_event([uint32]$MOUSEEVENTF_RIGHTUP, 0, 0, 0, [UIntPtr]::Zero)
+  [NativeInput]::mouse_event([uint32]$MOUSEEVENTF_MIDDLEUP, 0, 0, 0, [UIntPtr]::Zero)
+}
+
 function Invoke-TextInput([string]$base64) {
   if ([string]::IsNullOrWhiteSpace($base64)) { return }
 
@@ -1446,6 +1745,7 @@ function Invoke-TextInput([string]$base64) {
 
   try {
     writePowerShellCommand(bootstrapScript);
+    writePowerShellCommand('Invoke-ReleaseInputState');
   } catch (error) {
     markUnavailable(error && error.message ? error.message : 'powershell-bootstrap-failed');
     if (state.shell && !state.shell.killed) {
@@ -1533,6 +1833,12 @@ function Invoke-TextInput([string]$base64) {
         throw new Error('input-event-missing-type');
       }
 
+      if (type === 'release_all') {
+        flushPendingMove();
+        writePowerShellCommand('Invoke-ReleaseInputState');
+        return { ok: true };
+      }
+
       if (type === 'mouse_move') {
         moveCursor(event, true);
         return { ok: true };
@@ -1596,6 +1902,14 @@ function Invoke-TextInput([string]$base64) {
 
       throw new Error(`unsupported-input-type:${type}`);
     },
+    async releaseAll() {
+      if (!state.available || state.closed) {
+        return { ok: false, reason: state.reason };
+      }
+      flushPendingMove();
+      writePowerShellCommand('Invoke-ReleaseInputState');
+      return { ok: true };
+    },
     close() {
       state.closed = true;
       if (state.moveTimer) {
@@ -1606,6 +1920,7 @@ function Invoke-TextInput([string]$base64) {
 
       if (state.shell && !state.shell.killed) {
         try {
+          state.shell.stdin.write("Invoke-ReleaseInputState\n");
           state.shell.stdin.write("exit\n");
           state.shell.stdin.end();
         } catch (_error) {
@@ -1677,8 +1992,8 @@ function createInputController(config, displayBounds, logger) {
 const config = {
   host: process.env.REMOTE_AGENT_HOST || '127.0.0.1',
   port: clampInteger(parseInteger(process.env.REMOTE_AGENT_PORT, 3390), 1, 65_535),
-  streamFps: clampInteger(parseInteger(process.env.REMOTE_STREAM_FPS, 8), 1, 20),
-  jpegQuality: clampInteger(parseInteger(process.env.REMOTE_JPEG_QUALITY, 55), 20, 95),
+  streamFps: clampInteger(parseInteger(process.env.REMOTE_STREAM_FPS, 10), 1, 20),
+  jpegQuality: clampInteger(parseInteger(process.env.REMOTE_JPEG_QUALITY, 62), 20, 95),
   inputEnabled: parseBoolean(process.env.REMOTE_INPUT_ENABLED, true),
   logLevel: process.env.LOG_LEVEL || 'info'
 };
@@ -1698,6 +2013,7 @@ const streamState = {
   inFlight: false,
   activeFps: config.streamFps,
   activeQuality: config.jpegQuality,
+  activeMonitorIds: [],
   framesInWindow: 0,
   windowStartedAt: Date.now(),
   currentFps: 0,
@@ -1717,6 +2033,49 @@ const captureDisplayCatalog = {
   lastAttemptAt: 0
 };
 
+function createVirtualDisplayDescriptor(bounds) {
+  const left = Number.isFinite(bounds && bounds.virtualLeft)
+    ? Number(bounds.virtualLeft)
+    : (Number.isFinite(bounds && bounds.left) ? Number(bounds.left) : 0);
+  const top = Number.isFinite(bounds && bounds.virtualTop)
+    ? Number(bounds.virtualTop)
+    : (Number.isFinite(bounds && bounds.top) ? Number(bounds.top) : 0);
+  const width = Math.max(1, Number.isFinite(bounds && bounds.virtualWidth)
+    ? Number(bounds.virtualWidth)
+    : (Number.isFinite(bounds && bounds.width) ? Number(bounds.width) : 1920));
+  const height = Math.max(1, Number.isFinite(bounds && bounds.virtualHeight)
+    ? Number(bounds.virtualHeight)
+    : (Number.isFinite(bounds && bounds.height) ? Number(bounds.height) : 1080));
+
+  return {
+    id: 'virtual-desktop',
+    name: 'Virtual desktop',
+    primary: true,
+    left,
+    top,
+    width,
+    height
+  };
+}
+
+function getDisplayCatalogSnapshot() {
+  const entries = captureDisplayCatalog.entries
+    .map((entry) => normalizeDisplayDescriptor(entry))
+    .filter((entry) => entry !== null);
+
+  if (entries.length > 0) {
+    return entries;
+  }
+
+  return [createVirtualDisplayDescriptor(displayBounds)];
+}
+
+const initialWindowsDisplayCatalog = resolveWindowsDisplayCatalog(logger);
+if (initialWindowsDisplayCatalog.length > 0) {
+  captureDisplayCatalog.entries = initialWindowsDisplayCatalog;
+  captureDisplayCatalog.refreshedAt = Date.now();
+}
+
 async function refreshCaptureDisplayCatalog(force = false) {
   if (typeof screenshotDesktop.listDisplays !== 'function') {
     return captureDisplayCatalog.entries;
@@ -1733,15 +2092,12 @@ async function refreshCaptureDisplayCatalog(force = false) {
   captureDisplayCatalog.lastAttemptAt = now;
   const inFlight = screenshotDesktop.listDisplays()
     .then((rawDisplays) => {
-      const normalized = Array.isArray(rawDisplays)
-        ? rawDisplays
-          .map((entry) => normalizeDisplayDescriptor(entry))
-          .filter((entry) => entry !== null)
-        : [];
-      captureDisplayCatalog.entries = normalized;
+      const windowsDisplays = resolveWindowsDisplayCatalog(logger);
+      const nextEntries = mergeDisplayCatalog(rawDisplays, windowsDisplays);
+      captureDisplayCatalog.entries = nextEntries;
       captureDisplayCatalog.refreshedAt = Date.now();
       captureDisplayCatalog.lastError = null;
-      return normalized;
+      return nextEntries;
     })
     .catch((error) => {
       captureDisplayCatalog.lastError = error && error.message ? error.message : 'display-list-failed';
@@ -1794,6 +2150,7 @@ function broadcastStreamControl(payload) {
 function recomputeStreamSettings() {
   let nextFps = config.streamFps;
   let nextQuality = config.jpegQuality;
+  let nextMonitorIds = [];
 
   for (const client of streamState.clients) {
     if (!isWsOpen(client)) {
@@ -1806,16 +2163,87 @@ function recomputeStreamSettings() {
     if (Number.isFinite(client.requestedQuality)) {
       nextQuality = clampInteger(client.requestedQuality, 20, 95);
     }
+    if (Array.isArray(client.requestedMonitorIds) && client.requestedMonitorIds.length > 0) {
+      nextMonitorIds = client.requestedMonitorIds.slice(0, 16);
+    }
   }
 
   const fpsChanged = nextFps !== streamState.activeFps;
   streamState.activeFps = nextFps;
   streamState.activeQuality = nextQuality;
+  streamState.activeMonitorIds = nextMonitorIds;
 
   if (fpsChanged && streamState.timer) {
     clearInterval(streamState.timer);
     streamState.timer = null;
     startStreamLoop();
+  }
+}
+
+async function captureDesktopFrame() {
+  const selectedDisplays = getSelectedCaptureDisplays();
+  const captureOptions = {
+    format: 'jpg',
+    quality: streamState.activeQuality
+  };
+
+  if (selectedDisplays.length === 1 && selectedDisplays[0].id) {
+    captureOptions.screen = selectedDisplays[0].id;
+  }
+
+  if (selectedDisplays.length > 1) {
+    try {
+      const frames = await Promise.all(selectedDisplays.map(async (display) => ({
+        display,
+        buffer: Buffer.from(await screenshotDesktop({
+          format: 'jpg',
+          quality: streamState.activeQuality,
+          screen: display.id
+        }))
+      })));
+      const bounds = computeDisplayUnion(selectedDisplays);
+      if (!bounds) {
+        throw new Error('selected-monitor-bounds-unavailable');
+      }
+      return {
+        buffer: await composeDisplayFrames(frames, bounds),
+        displays: selectedDisplays,
+        bounds,
+        composed: true
+      };
+    } catch (error) {
+      logger.warn('Multi-monitor capture composition failed, falling back to desktop capture', {
+        monitors: selectedDisplays.map((display) => display.id),
+        message: error && error.message ? error.message : 'multi-monitor-capture-failed'
+      });
+    }
+  }
+
+  try {
+    return {
+      buffer: Buffer.from(await screenshotDesktop(captureOptions)),
+      displays: captureOptions.screen ? selectedDisplays : getDisplayCatalogSnapshot(),
+      bounds: captureOptions.screen ? selectedDisplays[0] : null,
+      composed: false
+    };
+  } catch (error) {
+    if (!captureOptions.screen) {
+      throw error;
+    }
+
+    logger.warn('Single-monitor capture failed, falling back to desktop capture', {
+      monitorId: captureOptions.screen,
+      message: error && error.message ? error.message : 'single-monitor-capture-failed'
+    });
+    return {
+      buffer: Buffer.from(await screenshotDesktop({
+        format: 'jpg',
+        quality: streamState.activeQuality
+      })),
+      displays: getDisplayCatalogSnapshot(),
+      bounds: null,
+      composed: false
+    };
   }
 }
 
@@ -1837,19 +2265,19 @@ async function captureAndBroadcastFrame() {
   }
 
   try {
-    const frame = await screenshotDesktop({
-      format: 'jpg',
-      quality: streamState.activeQuality
-    });
+    const frame = await captureDesktopFrame();
 
-    const frameBuffer = Buffer.isBuffer(frame) ? frame : Buffer.from(frame);
+    const frameBuffer = frame.buffer;
     const frameDimensions = parseJpegDimensions(frameBuffer);
     if (frameDimensions) {
+      const calibrationDisplays = Array.isArray(frame.displays) && frame.displays.length > 0
+        ? frame.displays
+        : captureDisplayCatalog.entries;
       const changed = calibrateDisplayBoundsToFrame(
         displayBounds,
         frameDimensions.width,
         frameDimensions.height,
-        captureDisplayCatalog.entries
+        calibrationDisplays.length > 0 ? calibrationDisplays : captureDisplayCatalog.entries
       );
       if (changed) {
         logger.info('Updated display mapping from capture frame', {
@@ -1920,7 +2348,9 @@ async function captureAndBroadcastFrame() {
         frameBytes: streamState.lastFrameBytes,
         captureTs: streamState.lastCaptureTs,
         captureLatencyMs: streamState.lastCaptureLatencyMs,
-        clients: getOpenStreamClientCount()
+        clients: getOpenStreamClientCount(),
+        display: displayBounds,
+        displays: getDisplayCatalogSnapshot()
       });
     }
   } catch (error) {
@@ -1950,7 +2380,7 @@ function startStreamLoop() {
 
   refreshCaptureDisplayCatalog(false).catch(() => {});
 
-  const intervalMs = Math.max(60, Math.round(1000 / streamState.activeFps));
+  const intervalMs = Math.max(50, Math.round(1000 / streamState.activeFps));
   streamState.timer = setInterval(() => {
     captureAndBroadcastFrame().catch(() => {});
   }, intervalMs);
@@ -1972,6 +2402,7 @@ function stopStreamLoopIfIdle() {
 
 app.get('/health', (_req, res) => {
   const cursorSnapshot = cursorTracker.getSnapshot(displayBounds);
+  const displays = getDisplayCatalogSnapshot();
   res.json({
     ok: true,
     timestamp: new Date().toISOString(),
@@ -1996,6 +2427,7 @@ app.get('/health', (_req, res) => {
       snapshot: cursorSnapshot || null
     },
     display: displayBounds,
+    displays,
     platform: process.platform
   });
 });
@@ -2007,6 +2439,7 @@ streamWss.on('connection', (socket, req) => {
   const query = parseRequestQuery(req);
   socket.requestedFps = clampInteger(parseInteger(query.get('fps'), config.streamFps), 1, 20);
   socket.requestedQuality = clampInteger(parseInteger(query.get('quality'), config.jpegQuality), 20, 95);
+  socket.requestedMonitorIds = sanitizeMonitorIds(query.get('monitors'));
 
   streamState.clients.add(socket);
   recomputeStreamSettings();
@@ -2016,7 +2449,9 @@ streamWss.on('connection', (socket, req) => {
     socket.send(JSON.stringify({
       type: 'ready',
       fps: streamState.activeFps,
-      jpegQuality: streamState.activeQuality
+      jpegQuality: streamState.activeQuality,
+      monitors: getDisplayCatalogSnapshot(),
+      monitorIds: socket.requestedMonitorIds
     }));
   }
 
@@ -2053,6 +2488,31 @@ inputWss.on('connection', (socket) => {
   }
 
   let pending = Promise.resolve();
+  let releasedInputState = false;
+
+  function releaseSocketInputState(reason) {
+    if (releasedInputState || inputController.available !== true) {
+      return;
+    }
+    releasedInputState = true;
+    pending = pending
+      .then(async () => {
+        if (typeof inputController.releaseAll === 'function') {
+          await inputController.releaseAll(reason);
+          return;
+        }
+        await inputController.handleEvent({
+          type: 'release_all',
+          reason
+        });
+      })
+      .catch((error) => {
+        logger.warn('Input release-all failed', {
+          reason,
+          message: error && error.message ? error.message : 'release-all-failed'
+        });
+      });
+  }
 
   socket.on('message', (rawValue, isBinary) => {
     if (isBinary) {
@@ -2105,6 +2565,11 @@ inputWss.on('connection', (socket) => {
     logger.warn('Input websocket client error', {
       message: error.message
     });
+    releaseSocketInputState('input-socket-error');
+  });
+
+  socket.on('close', () => {
+    releaseSocketInputState('input-socket-closed');
   });
 });
 
@@ -2141,7 +2606,8 @@ server.listen(config.port, config.host, () => {
     inputReason: inputController.reason,
     cursorAvailable: cursorTracker.available,
     cursorReason: cursorTracker.reason,
-    display: displayBounds
+    display: displayBounds,
+    displays: getDisplayCatalogSnapshot()
   });
 });
 
@@ -2165,6 +2631,8 @@ function shutdown(signal) {
     } catch (_error) {
       // Ignore input controller shutdown races.
     }
+  } else if (inputController && typeof inputController.releaseAll === 'function') {
+    inputController.releaseAll('sidecar-shutdown').catch(() => {});
   }
 
   if (cursorTracker && typeof cursorTracker.close === 'function') {

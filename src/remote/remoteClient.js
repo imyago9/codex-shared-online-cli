@@ -4,29 +4,29 @@ const STREAM_PRESETS = [
   {
     id: 'economy',
     label: 'Economy',
-    fps: 4,
-    jpegQuality: 42,
+    fps: 5,
+    jpegQuality: 46,
     intent: 'Lower bandwidth and calmer battery use'
   },
   {
     id: 'balanced',
     label: 'Balanced',
-    fps: 8,
-    jpegQuality: 58,
+    fps: 10,
+    jpegQuality: 62,
     intent: 'Good default for iPhone remote control'
   },
   {
     id: 'fluid',
     label: 'Fluid',
-    fps: 14,
-    jpegQuality: 58,
+    fps: 20,
+    jpegQuality: 64,
     intent: 'Smoother pointer movement'
   },
   {
     id: 'sharp',
     label: 'Sharp',
-    fps: 8,
-    jpegQuality: 78,
+    fps: 12,
+    jpegQuality: 86,
     intent: 'More readable text and UI detail'
   }
 ];
@@ -84,8 +84,8 @@ class RemoteClient {
     this.logger = options.logger;
     this.agentUrl = normalizeAgentUrl(options.agentUrl);
     this.defaultMode = normalizeMode(options.defaultMode, 'view');
-    this.streamFps = toSafeInteger(options.streamFps, 8, 1, 20);
-    this.jpegQuality = toSafeInteger(options.jpegQuality, 55, 20, 95);
+    this.streamFps = toSafeInteger(options.streamFps, 10, 1, 20);
+    this.jpegQuality = toSafeInteger(options.jpegQuality, 62, 20, 95);
     this.inputRateLimitPerSec = toSafeInteger(options.inputRateLimitPerSec, 120, 10, 600);
     this.inputMaxQueue = toSafeInteger(options.inputMaxQueue, 300, 20, 2_000);
     this.healthTimeoutMs = toSafeInteger(options.healthTimeoutMs, 2_500, 500, 10_000);
@@ -313,6 +313,9 @@ class RemoteClient {
       display: resolvedStatus.sidecar && resolvedStatus.sidecar.health
         ? resolvedStatus.sidecar.health.display || null
         : null,
+      monitors: resolvedStatus.sidecar && resolvedStatus.sidecar.health
+        ? resolvedStatus.sidecar.health.displays || resolvedStatus.sidecar.health.monitors || []
+        : [],
       gateway: this.getGatewaySnapshot()
     };
   }
@@ -320,7 +323,10 @@ class RemoteClient {
   openStreamSocket(options = {}) {
     const wsUrl = this.buildSidecarWsUrl('/stream', {
       fps: toSafeInteger(options.fps, this.streamFps, 1, 20),
-      quality: toSafeInteger(options.quality, this.jpegQuality, 20, 95)
+      quality: toSafeInteger(options.quality, this.jpegQuality, 20, 95),
+      monitors: Array.isArray(options.monitors) && options.monitors.length > 0
+        ? options.monitors.join(',')
+        : null
     });
 
     return new WebSocket(wsUrl, {

@@ -215,6 +215,7 @@ async function configureTailscaleServeProxy(port) {
 function remoteAgentDependenciesInstalled() {
   const requiredModules = [
     path.join(remoteAgentDir, 'node_modules', 'express'),
+    path.join(remoteAgentDir, 'node_modules', 'jimp'),
     path.join(remoteAgentDir, 'node_modules', 'screenshot-desktop'),
     path.join(remoteAgentDir, 'node_modules', 'ws')
   ];

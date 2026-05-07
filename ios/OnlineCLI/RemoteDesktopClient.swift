@@ -35,6 +35,7 @@ final class RemoteDesktopClient {
     var frameBytes = 0
     var desktopSize = CGSize(width: 1280, height: 720)
     var displayInfo: RemoteDisplayInfo?
+    var monitors: [RemoteMonitorDescriptor] = []
     var remoteCursor: CGPoint?
     var lastPointer = CGPoint(x: 0.5, y: 0.5)
     var inputRateLimitPerSec: Int?
@@ -47,6 +48,11 @@ final class RemoteDesktopClient {
     private var receiveTask: Task<Void, Never>?
     private let feedback = UIImpactFeedbackGenerator(style: .light)
     private var currentURL: URL?
+    private let pointerSendInterval: TimeInterval = 1.0 / 120.0
+    private var lastPointerSendAt: TimeInterval = 0
+    private var pendingPointer: CGPoint?
+    private var pointerFlushTask: Task<Void, Never>?
+    private var lastControlPromptAt: TimeInterval = 0
 
     var isConnected: Bool {
         if case .connected = connectionState {
@@ -55,18 +61,27 @@ final class RemoteDesktopClient {
         return false
     }
 
-    func connect(baseURL: URL, desiredMode: RemoteMode, streamProfile: RemoteStreamProfile) {
+    func connect(
+        baseURL: URL,
+        desiredMode: RemoteMode,
+        streamProfile: RemoteStreamProfile,
+        visibleMonitorIds: Set<String> = []
+    ) {
         disconnect()
 
         do {
             let api = OnlineCLIAPI(baseURL: baseURL)
+            var queryItems = [
+                URLQueryItem(name: "mode", value: desiredMode.rawValue),
+                URLQueryItem(name: "fps", value: "\(streamProfile.fps)"),
+                URLQueryItem(name: "quality", value: "\(streamProfile.jpegQuality)")
+            ]
+            if !visibleMonitorIds.isEmpty {
+                queryItems.append(URLQueryItem(name: "monitors", value: visibleMonitorIds.sorted().joined(separator: ",")))
+            }
             let url = try api.webSocketURL(
                 path: "ws/remote",
-                queryItems: [
-                    URLQueryItem(name: "mode", value: desiredMode.rawValue),
-                    URLQueryItem(name: "fps", value: "\(streamProfile.fps)"),
-                    URLQueryItem(name: "quality", value: "\(streamProfile.jpegQuality)")
-                ]
+                queryItems: queryItems
             )
             currentURL = url
             mode = desiredMode
@@ -86,8 +101,12 @@ final class RemoteDesktopClient {
     }
 
     func disconnect() {
+        releaseRemoteInputState()
         receiveTask?.cancel()
         receiveTask = nil
+        pointerFlushTask?.cancel()
+        pointerFlushTask = nil
+        pendingPointer = nil
         webSocketTask?.cancel(with: .goingAway, reason: nil)
         webSocketTask = nil
         if isConnected || connectionState == .connecting {
@@ -96,6 +115,9 @@ final class RemoteDesktopClient {
     }
 
     func setMode(_ nextMode: RemoteMode) {
+        if mode == .control && nextMode != .control {
+            releaseRemoteInputState()
+        }
         mode = nextMode
         sendEnvelope(["type": "set-mode", "mode": nextMode.rawValue])
     }
@@ -109,27 +131,62 @@ final class RemoteDesktopClient {
         ])
     }
 
-    func sendPointerMove(_ point: CGPoint) {
-        let normalized = normalizedPoint(point)
-        lastPointer = normalized
-        sendInput([
-            "type": "mouse_move",
-            "x": normalized.x,
-            "y": normalized.y
+    func setVisibleMonitors(_ monitorIds: Set<String>) {
+        sendEnvelope([
+            "type": "set-monitors",
+            "monitors": monitorIds.sorted()
         ])
     }
 
-    func sendClick(button: String = "left", at point: CGPoint? = nil) {
-        let target = point.map(normalizedPoint) ?? lastPointer
-        lastPointer = target
-        feedback.impactOccurred()
-        sendInput([
-            "type": "mouse_button",
-            "button": button,
-            "action": "click",
-            "x": target.x,
-            "y": target.y
+    func setMonitorLayoutOffsets(_ offsets: [String: CGSize]) {
+        let layout = offsets.compactMap { id, offset -> [String: Any]? in
+            let dx = Int(offset.width.rounded())
+            let dy = Int(offset.height.rounded())
+            guard !id.isEmpty, dx != 0 || dy != 0 else { return nil }
+            return [
+                "id": id,
+                "dx": dx,
+                "dy": dy
+            ]
+        }
+
+        sendEnvelope([
+            "type": "set-monitor-layout",
+            "layout": layout
         ])
+    }
+
+    func sendPointerMove(_ point: CGPoint) {
+        let normalized = normalizedPoint(point)
+        lastPointer = normalized
+        guard canSendInput(reportBlocked: false) else { return }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - lastPointerSendAt >= pointerSendInterval {
+            lastPointerSendAt = now
+            sendPointerMoveEnvelope(normalized)
+        } else {
+            pendingPointer = normalized
+            schedulePointerFlush(after: pointerSendInterval - (now - lastPointerSendAt))
+        }
+    }
+
+    func sendClick(button: String = "left", at point: CGPoint? = nil) {
+        feedback.impactOccurred()
+        sendMouseButton(button: button, action: "click", at: point)
+    }
+
+    func beginDrag(at point: CGPoint) {
+        feedback.impactOccurred()
+        sendMouseButton(button: "left", action: "down", at: point)
+    }
+
+    func updateDrag(to point: CGPoint) {
+        sendPointerMove(point)
+    }
+
+    func endDrag(at point: CGPoint) {
+        sendMouseButton(button: "left", action: "up", at: point)
     }
 
     func sendDoubleClick(at point: CGPoint? = nil) {
@@ -176,6 +233,15 @@ final class RemoteDesktopClient {
 
     func sendAction(_ action: RemoteActionDescriptor) {
         sendKey(action.key, code: action.code, modifiers: action.modifiers ?? [:])
+    }
+
+    func releaseRemoteInputState() {
+        sendEnvelope([
+            "type": "input",
+            "event": [
+                "type": "release_all"
+            ]
+        ])
     }
 
     func sendText(_ text: String) {
@@ -236,6 +302,7 @@ final class RemoteDesktopClient {
             inputRateLimitPerSec = intValue(payload["inputRateLimitPerSec"]) ?? inputRateLimitPerSec
             inputQueueMax = intValue(payload["inputQueueMax"]) ?? inputQueueMax
             displayInfo = decodeObject(RemoteDisplayInfo.self, from: payload["display"]) ?? displayInfo
+            monitors = decodeObject([RemoteMonitorDescriptor].self, from: payload["monitors"]) ?? monitors
             gatewayStatus = decodeObject(RemoteGatewayStatus.self, from: payload["gateway"]) ?? gatewayStatus
             if let stream = payload["stream"] as? [String: Any] {
                 frameFps = doubleValue(stream["fps"]) ?? frameFps
@@ -244,31 +311,37 @@ final class RemoteDesktopClient {
                 mode = nextMode
             }
             connectionState = .connected
-            statusText = controlAllowed ? "Control available" : "View only"
+            setStatusText(controlAllowed ? "Control available" : "View only")
         case "remote-stream-connected":
             connectionState = .connected
-            statusText = "Stream connected"
+            setStatusText("Stream connected")
         case "remote-stream-config":
-            statusText = "Stream tuned to \(streamProfile.title)"
+            monitors = decodeObject([RemoteMonitorDescriptor].self, from: payload["monitors"]) ?? monitors
+            setStatusText("Stream tuned to \(streamProfile.title)")
+        case "remote-monitor-config":
+            monitors = decodeObject([RemoteMonitorDescriptor].self, from: payload["monitors"]) ?? monitors
+            setStatusText("Monitor view updated")
         case "remote-stats":
             frameFps = doubleValue(payload["fps"]) ?? frameFps
             frameBytes = intValue(payload["frameBytes"]) ?? frameBytes
             frameLatencyMs = doubleValue(payload["captureLatencyMs"])
+            displayInfo = decodeObject(RemoteDisplayInfo.self, from: payload["display"]) ?? displayInfo
+            monitors = decodeObject([RemoteMonitorDescriptor].self, from: payload["monitors"]) ?? monitors
         case "remote-cursor":
             if let x = doubleValue(payload["x"]), let y = doubleValue(payload["y"]) {
                 remoteCursor = CGPoint(x: x, y: y)
             }
         case "remote-input-throttled":
-            statusText = "Input throttled"
+            setStatusText("Input throttled")
         case "remote-input-backpressure":
             droppedEvents = intValue(payload["droppedEvents"]) ?? droppedEvents
-            statusText = "Input queue is saturated"
+            setStatusText("Input queue is saturated")
         case "remote-input-error":
-            statusText = payload["message"] as? String ?? "Input error"
+            setStatusText(payload["message"] as? String ?? "Input error")
         case "remote-input-connected":
-            statusText = "Input connected"
+            setStatusText("Input connected")
         case "remote-input-disconnected":
-            statusText = "Input disconnected"
+            setStatusText("Input disconnected")
         case "remote-stream-error":
             connectionState = .failed(payload["message"] as? String ?? "Stream error")
         case "remote-stream-disconnected":
@@ -278,12 +351,75 @@ final class RemoteDesktopClient {
         }
     }
 
-    private func sendInput(_ event: [String: Any]) {
-        guard mode == .control, controlAllowed else {
-            statusText = "Enable control first"
-            return
-        }
+    private func sendInput(_ event: [String: Any], reportBlocked: Bool = true) {
+        guard canSendInput(reportBlocked: reportBlocked) else { return }
         sendEnvelope(["type": "input", "event": event])
+    }
+
+    private func sendMouseButton(button: String, action: String, at point: CGPoint?) {
+        let target = point.map(normalizedPoint) ?? lastPointer
+        lastPointer = target
+        cancelPendingPointerMove()
+        sendInput([
+            "type": "mouse_button",
+            "button": button,
+            "action": action,
+            "x": target.x,
+            "y": target.y
+        ])
+    }
+
+    private func canSendInput(reportBlocked: Bool = true) -> Bool {
+        guard mode == .control, controlAllowed else {
+            if reportBlocked {
+                noteControlRequired()
+            }
+            return false
+        }
+        return true
+    }
+
+    private func sendPointerMoveEnvelope(_ point: CGPoint) {
+        sendInput([
+            "type": "mouse_move",
+            "x": point.x,
+            "y": point.y
+        ], reportBlocked: false)
+    }
+
+    private func schedulePointerFlush(after delay: TimeInterval) {
+        guard pointerFlushTask == nil else { return }
+        let nanoseconds = UInt64(max(0, delay) * 1_000_000_000)
+        pointerFlushTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            self?.flushPendingPointerMove()
+        }
+    }
+
+    private func cancelPendingPointerMove() {
+        pointerFlushTask?.cancel()
+        pointerFlushTask = nil
+        pendingPointer = nil
+    }
+
+    private func flushPendingPointerMove() {
+        pointerFlushTask = nil
+        guard let point = pendingPointer else { return }
+        pendingPointer = nil
+        lastPointerSendAt = ProcessInfo.processInfo.systemUptime
+        sendPointerMoveEnvelope(point)
+    }
+
+    private func noteControlRequired() {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard statusText != "Enable control first" || now - lastControlPromptAt > 0.75 else { return }
+        lastControlPromptAt = now
+        setStatusText("Enable control first")
+    }
+
+    private func setStatusText(_ text: String) {
+        guard statusText != text else { return }
+        statusText = text
     }
 
     private func sendEnvelope(_ payload: [String: Any]) {

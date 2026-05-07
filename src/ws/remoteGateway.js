@@ -44,6 +44,28 @@ function toBoundedInteger(rawValue, fallback, min, max) {
   return Math.max(min, Math.min(max, Math.trunc(parsed)));
 }
 
+function sanitizeMonitorIds(rawValue) {
+  const source = Array.isArray(rawValue)
+    ? rawValue
+    : String(rawValue || '').split(',');
+  const seen = new Set();
+  const ids = [];
+
+  for (const entry of source) {
+    const id = String(entry || '').trim();
+    if (!id || id.toLowerCase() === 'all' || seen.has(id) || id.length > 120) {
+      continue;
+    }
+    seen.add(id);
+    ids.push(id);
+    if (ids.length >= 16) {
+      break;
+    }
+  }
+
+  return ids;
+}
+
 function clampNormalized(value) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) {
@@ -79,6 +101,13 @@ function sanitizeInputEvent(rawValue) {
   const type = typeof rawValue.type === 'string' ? rawValue.type.trim().toLowerCase() : '';
   if (!type) {
     return null;
+  }
+
+  if (type === 'release_all') {
+    return {
+      type,
+      at: Date.now()
+    };
   }
 
   if (type === 'mouse_move') {
@@ -255,13 +284,15 @@ function createRemoteGateway(server, remoteClient, options = {}) {
     const requestedMode = normalizeMode(parseQueryValue(req, 'mode'), defaults.defaultMode);
     const requestedStreamFps = toBoundedInteger(parseQueryValue(req, 'fps'), defaults.streamFps, 1, 20);
     const requestedJpegQuality = toBoundedInteger(parseQueryValue(req, 'quality'), defaults.jpegQuality, 20, 95);
+    const requestedMonitorIds = sanitizeMonitorIds(parseQueryValue(req, 'monitors'));
     const controlAllowed = status.sidecar.inputAvailable === true;
     let connectionSettings = {
       mode: requestedMode === 'control' && controlAllowed ? 'control' : 'view',
       requestedMode,
       controlAllowed,
       streamFps: requestedStreamFps,
-      jpegQuality: requestedJpegQuality
+      jpegQuality: requestedJpegQuality,
+      monitorIds: requestedMonitorIds
     };
 
     const remoteConnectionId = crypto.randomUUID();
@@ -328,6 +359,34 @@ function createRemoteGateway(server, remoteClient, options = {}) {
       }
     }
 
+    function sendInputEventDirect(event) {
+      if (!context.inputSocket || context.inputSocket.readyState !== WebSocket.OPEN) {
+        return false;
+      }
+
+      try {
+        context.inputSocket.send(JSON.stringify({
+          type: 'input',
+          event
+        }));
+        return true;
+      } catch (error) {
+        context.lastInputError = error && error.message ? error.message : 'input-send-failed';
+        return false;
+      }
+    }
+
+    function releaseRemoteInputState(reason) {
+      const event = {
+        type: 'release_all',
+        reason: reason || null,
+        at: Date.now()
+      };
+
+      context.inputQueue.length = 0;
+      sendInputEventDirect(event);
+    }
+
     function cleanupSidecarSockets() {
       const sockets = [context.streamSocket, context.inputSocket];
       context.streamSocket = null;
@@ -352,10 +411,10 @@ function createRemoteGateway(server, remoteClient, options = {}) {
       if (context.closed) {
         return;
       }
+      releaseRemoteInputState('client-disconnected');
       context.closed = true;
 
       clearInputFlushTimer();
-      context.inputQueue.length = 0;
       cleanupSidecarSockets();
       activeContexts.delete(remoteConnectionId);
       publishGatewaySnapshot({
@@ -382,6 +441,10 @@ function createRemoteGateway(server, remoteClient, options = {}) {
       if (requested === 'control' && !context.controlAllowed) {
         effectiveMode = 'view';
         modeReason = 'control-unavailable';
+      }
+
+      if (previous === 'control' && effectiveMode !== 'control') {
+        releaseRemoteInputState(modeReason || 'control-disabled');
       }
 
       context.mode = effectiveMode;
@@ -440,6 +503,44 @@ function createRemoteGateway(server, remoteClient, options = {}) {
       )) {
         try {
           previousStreamSocket.close(1000, 'stream-settings-changed');
+        } catch (_error) {
+          // Ignore close races.
+        }
+      }
+      bindStreamSocket();
+    }
+
+    function applyMonitorSelection(rawMonitorIds, reason) {
+      const monitorIds = sanitizeMonitorIds(rawMonitorIds);
+      const previous = connectionSettings.monitorIds || [];
+      const changed = previous.length !== monitorIds.length
+        || previous.some((id, index) => id !== monitorIds[index]);
+
+      connectionSettings = {
+        ...connectionSettings,
+        monitorIds
+      };
+
+      sendControl('remote-monitor-config', {
+        monitorIds,
+        monitors: status.sidecar && status.sidecar.health
+          ? status.sidecar.health.displays || status.sidecar.health.monitors || []
+          : [],
+        reason: reason || null
+      });
+
+      if (!changed || context.closed) {
+        return;
+      }
+
+      const previousStreamSocket = context.streamSocket;
+      context.streamSocket = null;
+      if (previousStreamSocket && (
+        previousStreamSocket.readyState === WebSocket.OPEN
+        || previousStreamSocket.readyState === WebSocket.CONNECTING
+      )) {
+        try {
+          previousStreamSocket.close(1000, 'monitor-selection-changed');
         } catch (_error) {
           // Ignore close races.
         }
@@ -620,7 +721,8 @@ function createRemoteGateway(server, remoteClient, options = {}) {
     function bindStreamSocket() {
       const streamSocket = remoteClient.openStreamSocket({
         fps: connectionSettings.streamFps,
-        quality: connectionSettings.jpegQuality
+        quality: connectionSettings.jpegQuality,
+        monitors: connectionSettings.monitorIds
       });
       context.streamSocket = streamSocket;
 
@@ -631,7 +733,8 @@ function createRemoteGateway(server, remoteClient, options = {}) {
 
         sendControl('remote-stream-connected', {
           fps: connectionSettings.streamFps,
-          jpegQuality: connectionSettings.jpegQuality
+          jpegQuality: connectionSettings.jpegQuality,
+          monitorIds: connectionSettings.monitorIds
         });
       });
 
@@ -665,6 +768,16 @@ function createRemoteGateway(server, remoteClient, options = {}) {
           return;
         }
 
+        if (payload.type === 'ready') {
+          sendControl('remote-stream-config', {
+            fps: Number(payload.fps) || connectionSettings.streamFps,
+            jpegQuality: Number(payload.jpegQuality) || connectionSettings.jpegQuality,
+            monitors: Array.isArray(payload.monitors) ? payload.monitors : [],
+            monitorIds: Array.isArray(payload.monitorIds) ? payload.monitorIds : connectionSettings.monitorIds
+          });
+          return;
+        }
+
         if (payload.type === 'stats') {
           const frameStats = {
             fps: Number(payload.fps) || 0,
@@ -676,7 +789,9 @@ function createRemoteGateway(server, remoteClient, options = {}) {
           context.lastFrameStats = frameStats;
           publishGatewaySnapshot({ lastFrameStats: frameStats });
           sendControl('remote-stats', {
-            ...frameStats
+            ...frameStats,
+            display: payload.display || null,
+            monitors: Array.isArray(payload.displays) ? payload.displays : []
           });
           return;
         }
@@ -782,6 +897,16 @@ function createRemoteGateway(server, remoteClient, options = {}) {
         return;
       }
 
+      if (rawType === 'set-monitors' || rawType === 'remote:set-monitors') {
+        applyMonitorSelection(payload.monitors || payload.monitorIds, 'client-toggle');
+        return;
+      }
+
+      if (rawType === 'release-all' || rawType === 'remote:release-all') {
+        releaseRemoteInputState('client-request');
+        return;
+      }
+
       if (rawType === 'ping' || rawType === 'remote:ping') {
         sendControl('remote-pong', { ts: Date.now() });
         return;
@@ -841,6 +966,10 @@ function createRemoteGateway(server, remoteClient, options = {}) {
         },
         actions: remoteClient.getRemoteActions(),
         display: status.sidecar && status.sidecar.health ? status.sidecar.health.display || null : null,
+        monitors: status.sidecar && status.sidecar.health
+          ? status.sidecar.health.displays || status.sidecar.health.monitors || []
+          : [],
+        monitorIds: connectionSettings.monitorIds,
         sidecar: {
           reachable: status.sidecar.reachable === true,
           inputAvailable: status.sidecar.inputAvailable === true,
