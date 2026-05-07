@@ -4,7 +4,7 @@ import UIKit
 
 private enum RemoteViewportSettings {
     static let minimumZoom = 1.0
-    static let maximumZoom = 12.0
+    static let maximumZoom = 24.0
     static let zoomStep = 0.5
     static let doubleTapZoom = 2.75
 }
@@ -1355,7 +1355,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         imageView.layer.contentsScale = UIScreen.main.scale
         addSubview(imageView)
 
-        videoLayer.videoGravity = .resizeAspect
+        videoLayer.videoGravity = .resize
         videoLayer.backgroundColor = UIColor.black.cgColor
         videoLayer.isHidden = true
         layer.addSublayer(videoLayer)
@@ -1623,10 +1623,6 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     }
 
     private func streamSourceBounds() -> CGRect {
-        if videoActive, desktopSize.width > 0, desktopSize.height > 0 {
-            return CGRect(origin: .zero, size: desktopSize)
-        }
-
         if let displayInfo {
             let left = displayInfo.left ?? displayInfo.virtualLeft
             let top = displayInfo.top ?? displayInfo.virtualTop

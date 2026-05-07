@@ -66,7 +66,7 @@ function toSafeInteger(rawValue, fallback, min, max) {
 function videoBitrateForQuality(rawQuality, fallbackQuality = 62) {
   const quality = toSafeInteger(rawQuality, fallbackQuality, 20, 95);
   const ratio = (quality - 20) / 75;
-  return toSafeInteger(Math.round(1_200 + ratio * 6_800), 4_000, 500, 50_000);
+  return toSafeInteger(Math.round(8_000 + ratio * 24_000), 20_000, 500, 50_000);
 }
 
 function serializeMonitorLayout(layout) {

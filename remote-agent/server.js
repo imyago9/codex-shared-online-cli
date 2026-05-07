@@ -2090,9 +2090,9 @@ const config = {
   jpegQuality: clampInteger(parseInteger(process.env.REMOTE_JPEG_QUALITY, 62), 20, 95),
   videoEnabled: parseBoolean(process.env.REMOTE_VIDEO_ENABLED, true),
   videoFps: clampInteger(parseInteger(process.env.REMOTE_VIDEO_FPS, 60), 1, 120),
-  videoBitrateKbps: clampInteger(parseInteger(process.env.REMOTE_VIDEO_BITRATE_KBPS, 4_000), 500, 50_000),
-  videoMaxWidth: clampInteger(parseInteger(process.env.REMOTE_VIDEO_MAX_WIDTH, 1920), 640, 7680),
-  videoMaxHeight: clampInteger(parseInteger(process.env.REMOTE_VIDEO_MAX_HEIGHT, 1080), 360, 4320),
+  videoBitrateKbps: clampInteger(parseInteger(process.env.REMOTE_VIDEO_BITRATE_KBPS, 20_000), 500, 50_000),
+  videoMaxWidth: clampInteger(parseInteger(process.env.REMOTE_VIDEO_MAX_WIDTH, 4096), 640, 7680),
+  videoMaxHeight: clampInteger(parseInteger(process.env.REMOTE_VIDEO_MAX_HEIGHT, 2304), 360, 4320),
   videoEncoder: process.env.REMOTE_VIDEO_ENCODER || 'libx264',
   videoFfmpegPath: process.env.REMOTE_VIDEO_FFMPEG_PATH || bundledFfmpegPath || 'ffmpeg',
   inputEnabled: parseBoolean(process.env.REMOTE_INPUT_ENABLED, true),
@@ -2211,16 +2211,18 @@ function mapNormalizedInputThroughMonitorLayout(x, y) {
   if (normalizedX === null || normalizedY === null) {
     return null;
   }
-  if (!Array.isArray(streamState.activeMonitorLayout) || streamState.activeMonitorLayout.length === 0) {
-    return null;
-  }
 
   const physicalDisplays = getSelectedDisplayCatalogSnapshot();
-  if (physicalDisplays.length <= 1) {
+  const hasPhysicalDisplays = physicalDisplays.length > 0;
+  const hasLayout = Array.isArray(streamState.activeMonitorLayout) && streamState.activeMonitorLayout.length > 0;
+  const hasSelection = Array.isArray(streamState.activeMonitorIds) && streamState.activeMonitorIds.length > 0;
+  if (!hasPhysicalDisplays || (!hasLayout && !hasSelection && physicalDisplays.length <= 1)) {
     return null;
   }
 
-  const visualDisplays = applyMonitorLayout(physicalDisplays, streamState.activeMonitorLayout);
+  const visualDisplays = hasLayout
+    ? applyMonitorLayout(physicalDisplays, streamState.activeMonitorLayout)
+    : physicalDisplays;
   const visualBounds = computeDisplayUnion(visualDisplays);
   if (!visualBounds) {
     return null;
@@ -2676,6 +2678,28 @@ function createVideoCapturePlan() {
   };
 }
 
+function createVideoDisplayInfo(plan) {
+  const bounds = plan && plan.bounds ? plan.bounds : createVirtualDisplayDescriptor(displayBounds);
+  const output = plan && plan.output ? plan.output : bounds;
+  return {
+    left: bounds.left,
+    top: bounds.top,
+    width: bounds.width,
+    height: bounds.height,
+    virtualLeft: bounds.left,
+    virtualTop: bounds.top,
+    virtualWidth: bounds.width,
+    virtualHeight: bounds.height,
+    captureWidth: output.width,
+    captureHeight: output.height,
+    captureDisplayId: 'video-capture',
+    captureDisplayName: 'Video capture',
+    scaleX: output.width / Math.max(1, bounds.width),
+    scaleY: output.height / Math.max(1, bounds.height),
+    source: 'h264-gdigrab'
+  };
+}
+
 function buildFfmpegVideoArgs(plan) {
   const fps = clampInteger(videoState.activeFps, 1, 120);
   const bitrateKbps = clampInteger(videoState.activeBitrateKbps, 500, 50_000);
@@ -2708,7 +2732,7 @@ function buildFfmpegVideoArgs(plan) {
       '-preset', 'ultrafast',
       '-tune', 'zerolatency',
       '-profile:v', 'baseline',
-      '-level', '4.2',
+      '-level', '5.2',
       '-refs', '1',
       '-bf', '0',
       '-g', String(keyframeInterval),
@@ -2752,7 +2776,7 @@ function sendVideoReady(socket, plan) {
       captureWidth: plan.bounds.width,
       captureHeight: plan.bounds.height
     },
-    display: displayBounds,
+    display: createVideoDisplayInfo(plan),
     monitors: getDisplayCatalogSnapshot(),
     monitorIds: socket.requestedMonitorIds,
     monitorLayout: socket.requestedMonitorLayout
@@ -2809,7 +2833,7 @@ function broadcastVideoStats() {
     clients: getOpenVideoClientCount(),
     captureTs: Date.now(),
     captureLatencyMs: null,
-    display: displayBounds,
+    display: createVideoDisplayInfo(videoState.activePlan),
     displays: getDisplayCatalogSnapshot()
   });
 }
@@ -3135,7 +3159,7 @@ streamWss.on('connection', (socket, req) => {
 function qualityToVideoBitrateKbps(rawQuality) {
   const quality = clampInteger(parseInteger(rawQuality, config.jpegQuality), 20, 95);
   const ratio = (quality - 20) / 75;
-  return clampInteger(Math.round(1_200 + ratio * 6_800), 500, 50_000);
+  return clampInteger(Math.round(8_000 + ratio * 24_000), 500, 50_000);
 }
 
 const videoWss = new WebSocketServer({ noServer: true });

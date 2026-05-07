@@ -448,6 +448,7 @@ final class RemoteDesktopClient {
                 }
                 streamTransport = transport
             }
+            updateDisplayInfo(decodeObject(RemoteDisplayInfo.self, from: payload["display"]))
             updateMonitors(decodeObject([RemoteMonitorDescriptor].self, from: payload["monitors"]))
             setStatusText(streamTransport == .video ? "Live video stream active" : "JPEG fallback stream active")
         case "remote-monitor-config":

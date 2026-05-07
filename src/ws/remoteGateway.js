@@ -941,6 +941,7 @@ function createRemoteGateway(server, remoteClient, options = {}) {
             video: payload.video || null,
             fps: Number(payload.fps) || connectionSettings.streamFps,
             jpegQuality: Number(payload.jpegQuality) || connectionSettings.jpegQuality,
+            display: payload.display || null,
             monitors: Array.isArray(payload.monitors) ? payload.monitors : [],
             monitorIds: Array.isArray(payload.monitorIds) ? payload.monitorIds : connectionSettings.monitorIds,
             monitorLayout: connectionSettings.monitorLayout
