@@ -861,12 +861,15 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     private final class MonitorLayers {
         let imageLayer = CALayer()
         let videoContainerLayer = CALayer()
-        let videoLayer = AVSampleBufferDisplayLayer()
+        var videoLayer: AVSampleBufferDisplayLayer
         let strokeLayer = CAShapeLayer()
         let labelBackgroundLayer = CAShapeLayer()
         let textLayer = CATextLayer()
+        private let contentsScale: CGFloat
 
         init(contentParent: CALayer, overlayParent: CALayer, contentsScale: CGFloat) {
+            self.contentsScale = contentsScale
+            videoLayer = Self.makeVideoLayer(contentsScale: contentsScale)
             imageLayer.contentsGravity = .resize
             imageLayer.magnificationFilter = .linear
             imageLayer.minificationFilter = .linear
@@ -874,9 +877,6 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
             videoContainerLayer.masksToBounds = true
             videoContainerLayer.contentsScale = contentsScale
             videoContainerLayer.isHidden = true
-            videoLayer.videoGravity = .resize
-            videoLayer.backgroundColor = UIColor.black.cgColor
-            videoLayer.contentsScale = contentsScale
             textLayer.contentsScale = contentsScale
             textLayer.alignmentMode = .center
             textLayer.truncationMode = .end
@@ -895,6 +895,21 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
             strokeLayer.removeFromSuperlayer()
             labelBackgroundLayer.removeFromSuperlayer()
             textLayer.removeFromSuperlayer()
+        }
+
+        func resetVideoLayer() {
+            videoLayer.removeFromSuperlayer()
+            let nextLayer = Self.makeVideoLayer(contentsScale: contentsScale)
+            videoLayer = nextLayer
+            videoContainerLayer.addSublayer(nextLayer)
+        }
+
+        private static func makeVideoLayer(contentsScale: CGFloat) -> AVSampleBufferDisplayLayer {
+            let layer = AVSampleBufferDisplayLayer()
+            layer.videoGravity = .resize
+            layer.backgroundColor = UIColor.black.cgColor
+            layer.contentsScale = contentsScale
+            return layer
         }
     }
 
@@ -1570,8 +1585,12 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
             layers.videoContainerLayer.isHidden = false
             layers.videoContainerLayer.frame = pixelAligned(frame.rect)
             layers.videoLayer.frame = videoLayerFrame(for: frame, sourceBounds: geometry.sourceBounds)
-            if let sampleBuffer {
-                enqueue(copySampleBuffer(sampleBuffer), on: layers.videoLayer)
+            if let sampleBuffer, let copiedSampleBuffer = deepCopySampleBuffer(sampleBuffer) {
+                if layers.videoLayer.sampleBufferRenderer.status == .failed {
+                    layers.resetVideoLayer()
+                    layers.videoLayer.frame = videoLayerFrame(for: frame, sourceBounds: geometry.sourceBounds)
+                }
+                enqueue(copiedSampleBuffer, on: layers.videoLayer)
             }
         }
     }
@@ -1582,19 +1601,94 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
             renderer.flush()
         }
         if !renderer.isReadyForMoreMediaData {
-            renderer.flush()
+            return
         }
         renderer.enqueue(sampleBuffer)
     }
 
-    private func copySampleBuffer(_ sampleBuffer: CMSampleBuffer) -> CMSampleBuffer {
-        var copiedSampleBuffer: CMSampleBuffer?
-        let status = CMSampleBufferCreateCopy(
+    private func deepCopySampleBuffer(_ sampleBuffer: CMSampleBuffer) -> CMSampleBuffer? {
+        guard
+            let sourceBlockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer),
+            let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer)
+        else {
+            return nil
+        }
+
+        let dataLength = CMBlockBufferGetDataLength(sourceBlockBuffer)
+        guard dataLength > 0 else { return nil }
+
+        var copiedData = Data(count: dataLength)
+        let copyStatus = copiedData.withUnsafeMutableBytes { bytes in
+            CMBlockBufferCopyDataBytes(
+                sourceBlockBuffer,
+                atOffset: 0,
+                dataLength: dataLength,
+                destination: bytes.baseAddress!
+            )
+        }
+        guard copyStatus == noErr else { return nil }
+
+        var copiedBlockBuffer: CMBlockBuffer?
+        let blockStatus = CMBlockBufferCreateWithMemoryBlock(
             allocator: kCFAllocatorDefault,
-            sampleBuffer: sampleBuffer,
+            memoryBlock: nil,
+            blockLength: dataLength,
+            blockAllocator: kCFAllocatorDefault,
+            customBlockSource: nil,
+            offsetToData: 0,
+            dataLength: dataLength,
+            flags: 0,
+            blockBufferOut: &copiedBlockBuffer
+        )
+        guard blockStatus == noErr, let copiedBlockBuffer else { return nil }
+
+        let replaceStatus = copiedData.withUnsafeBytes { bytes in
+            CMBlockBufferReplaceDataBytes(
+                with: bytes.baseAddress!,
+                blockBuffer: copiedBlockBuffer,
+                offsetIntoDestination: 0,
+                dataLength: dataLength
+            )
+        }
+        guard replaceStatus == noErr else { return nil }
+
+        var timing = CMSampleTimingInfo()
+        let timingStatus = CMSampleBufferGetSampleTimingInfo(
+            sampleBuffer,
+            at: 0,
+            timingInfoOut: &timing
+        )
+        guard timingStatus == noErr else { return nil }
+
+        var sampleSize = dataLength
+        var copiedSampleBuffer: CMSampleBuffer?
+        let sampleStatus = CMSampleBufferCreateReady(
+            allocator: kCFAllocatorDefault,
+            dataBuffer: copiedBlockBuffer,
+            formatDescription: formatDescription,
+            sampleCount: 1,
+            sampleTimingEntryCount: 1,
+            sampleTimingArray: &timing,
+            sampleSizeEntryCount: 1,
+            sampleSizeArray: &sampleSize,
             sampleBufferOut: &copiedSampleBuffer
         )
-        return status == noErr ? (copiedSampleBuffer ?? sampleBuffer) : sampleBuffer
+        guard sampleStatus == noErr, let copiedSampleBuffer else { return nil }
+        markSampleBufferForImmediateDisplay(copiedSampleBuffer)
+        return copiedSampleBuffer
+    }
+
+    private func markSampleBufferForImmediateDisplay(_ sampleBuffer: CMSampleBuffer) {
+        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: true) else {
+            return
+        }
+        let rawDictionary = CFArrayGetValueAtIndex(attachments, 0)
+        let dictionary = unsafeBitCast(rawDictionary, to: CFMutableDictionary.self)
+        CFDictionarySetValue(
+            dictionary,
+            Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+            Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
+        )
     }
 
     private func updateMonitorOverlay(frames: [RemoteMonitorStageFrame]) {
