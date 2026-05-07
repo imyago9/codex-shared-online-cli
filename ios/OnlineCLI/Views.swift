@@ -1,4 +1,5 @@
 import SwiftUI
+import AVFoundation
 import UIKit
 
 private enum RemoteViewportSettings {
@@ -847,6 +848,9 @@ private struct RemoteStageSurface: UIViewRepresentable {
         client.frameSink = { [weak view] update in
             view?.setFrame(update)
         }
+        client.videoSink = { [weak view] update in
+            view?.setVideoFrame(update)
+        }
         client.cursorSink = { [weak view] point in
             view?.setRemoteCursor(point)
         }
@@ -892,6 +896,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     }
 
     private let imageView = UIView()
+    private let videoLayer = AVSampleBufferDisplayLayer()
     private let placeholderView = UIStackView()
     private let placeholderIcon = UIImageView(image: UIImage(systemName: "display.trianglebadge.exclamationmark"))
     private let placeholderLabel = UILabel()
@@ -900,8 +905,11 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     private let cursorView = UIImageView(image: UIImage(systemName: "cursorarrow"))
 
     private var renderedSequence: UInt64?
+    private var renderedVideoSequence: UInt64?
     private var presentedSequence: UInt64?
+    private var presentedVideoSequence: UInt64?
     private var latestImage: CGImage?
+    private var videoActive = false
     private var desktopSize = CGSize(width: 1280, height: 720)
     private var remoteCursor: CGPoint?
     private var zoomValue = RemoteViewportSettings.minimumZoom
@@ -939,6 +947,9 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     private var initialZoom = RemoteViewportSettings.minimumZoom
     private var initialPinchLocation = CGPoint.zero
     private let dragActivationDistance: CGFloat = 4
+    private var hasRenderableFrame: Bool {
+        latestImage != nil || videoActive
+    }
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -1032,18 +1043,53 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     func setFrame(_ update: RemoteFrameRenderUpdate) {
         guard renderedSequence != update.sequence else { return }
         renderedSequence = update.sequence
+        if update.image != nil, videoActive {
+            videoActive = false
+            flushVideoLayer(removeImage: true)
+            videoLayer.isHidden = true
+        }
         latestImage = update.image
         desktopSize = update.pixelSize
         imageView.layer.contents = update.image
-        placeholderView.isHidden = update.image != nil
-        cursorView.isHidden = update.image == nil || remoteCursor == nil
+        if update.image == nil, !videoActive {
+            flushVideoLayer(removeImage: true)
+            videoLayer.isHidden = true
+        }
+        placeholderView.isHidden = hasRenderableFrame
+        cursorView.isHidden = !hasRenderableFrame || remoteCursor == nil
+        setNeedsLayout()
+    }
+
+    func setVideoFrame(_ update: RemoteVideoRenderUpdate) {
+        guard renderedVideoSequence != update.sequence else { return }
+        renderedVideoSequence = update.sequence
+        guard let sampleBuffer = update.sampleBuffer else {
+            videoActive = false
+            flushVideoLayer(removeImage: true)
+            videoLayer.isHidden = true
+            placeholderView.isHidden = latestImage != nil
+            cursorView.isHidden = latestImage == nil || remoteCursor == nil
+            setNeedsLayout()
+            return
+        }
+
+        latestImage = nil
+        imageView.layer.contents = nil
+        videoActive = true
+        desktopSize = update.pixelSize
+        if videoLayer.sampleBufferRenderer.status == .failed {
+            flushVideoLayer(removeImage: false)
+        }
+        videoLayer.sampleBufferRenderer.enqueue(sampleBuffer)
+        placeholderView.isHidden = true
+        cursorView.isHidden = remoteCursor == nil
         setNeedsLayout()
     }
 
     func setRemoteCursor(_ point: CGPoint?) {
         guard remoteCursor != point else { return }
         remoteCursor = point
-        cursorView.isHidden = latestImage == nil || point == nil
+        cursorView.isHidden = !hasRenderableFrame || point == nil
         setNeedsLayout()
     }
 
@@ -1057,21 +1103,32 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         monitorContentLayer.frame = bounds
         monitorOverlayLayer.frame = bounds
 
-        if let image = latestImage, let geometry = stageGeometry(for: image, panOffset: panOffsetValue, zoom: zoomValue) {
-            imageView.isHidden = geometry.usesMonitorImageLayers
-            monitorContentLayer.isHidden = !geometry.usesMonitorImageLayers
-            if geometry.usesMonitorImageLayers {
-                updateMonitorLayers(geometry: geometry, image: image)
-            } else {
+        if let geometry = stageGeometry(panOffset: panOffsetValue, zoom: zoomValue), hasRenderableFrame {
+            if videoActive {
+                imageView.isHidden = true
+                monitorContentLayer.isHidden = true
                 hideMonitorImageLayers()
-                imageView.layer.contents = image
-                imageView.frame = pixelAligned(geometry.visualFrame)
+                videoLayer.isHidden = false
+                videoLayer.frame = pixelAligned(geometry.visualFrame)
                 updateMonitorOverlay(frames: geometry.monitorFrames)
+            } else if let image = latestImage {
+                videoLayer.isHidden = true
+                imageView.isHidden = geometry.usesMonitorImageLayers
+                monitorContentLayer.isHidden = !geometry.usesMonitorImageLayers
+                if geometry.usesMonitorImageLayers {
+                    updateMonitorLayers(geometry: geometry, image: image)
+                } else {
+                    hideMonitorImageLayers()
+                    imageView.layer.contents = image
+                    imageView.frame = pixelAligned(geometry.visualFrame)
+                    updateMonitorOverlay(frames: geometry.monitorFrames)
+                }
             }
             updateCursor(geometry: geometry)
         } else {
             imageView.isHidden = true
             imageView.layer.contents = nil
+            videoLayer.isHidden = true
             hideMonitorImageLayers()
             monitorContentLayer.isHidden = true
             monitorOverlayLayer.isHidden = true
@@ -1083,6 +1140,9 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         if latestImage != nil, renderedSequence != presentedSequence {
             presentedSequence = renderedSequence
             onFramePresented?((CACurrentMediaTime() - renderStartedAt) * 1_000)
+        } else if videoActive, renderedVideoSequence != presentedVideoSequence {
+            presentedVideoSequence = renderedVideoSequence
+            onFramePresented?((CACurrentMediaTime() - renderStartedAt) * 1_000)
         }
     }
 
@@ -1093,7 +1153,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     }
 
     @objc private func handleDoubleTap(_ recognizer: UITapGestureRecognizer) {
-        guard isUserInteractionEnabled, recognizer.state == .ended, latestImage != nil, gestureMode == .viewport else { return }
+        guard isUserInteractionEnabled, recognizer.state == .ended, hasRenderableFrame, gestureMode == .viewport else { return }
         if zoomValue > 1.01 {
             setViewport(zoom: RemoteViewportSettings.minimumZoom, panOffset: .zero, notify: true)
             return
@@ -1111,7 +1171,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
 
     @objc private func handleLongPress(_ recognizer: UILongPressGestureRecognizer) {
         guard recognizer.state == .began else { return }
-        guard isUserInteractionEnabled, controlMode, gestureMode != .viewport, latestImage != nil else { return }
+        guard isUserInteractionEnabled, controlMode, gestureMode != .viewport, hasRenderableFrame else { return }
 
         let location = recognizer.location(in: self)
         let target = gestureMode == .trackpad
@@ -1128,7 +1188,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     }
 
     @objc private func handleTwoFingerPan(_ recognizer: UIPanGestureRecognizer) {
-        guard isUserInteractionEnabled, latestImage != nil else { return }
+        guard isUserInteractionEnabled, hasRenderableFrame else { return }
 
         switch recognizer.state {
         case .began:
@@ -1151,7 +1211,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     }
 
     @objc private func handlePinch(_ recognizer: UIPinchGestureRecognizer) {
-        guard isUserInteractionEnabled, latestImage != nil else { return }
+        guard isUserInteractionEnabled, hasRenderableFrame else { return }
 
         switch recognizer.state {
         case .began:
@@ -1176,7 +1236,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesBegan(touches, with: event)
-        guard isUserInteractionEnabled, latestImage != nil, trackedTouch == nil else { return }
+        guard isUserInteractionEnabled, hasRenderableFrame, trackedTouch == nil else { return }
         guard activeTouchCount(in: event) == 1, let touch = touches.first else { return }
 
         trackedTouch = touch
@@ -1276,7 +1336,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
             }
         }
         if gestureRecognizer === longPressRecognizer {
-            return controlMode && gestureMode != .viewport && latestImage != nil
+            return controlMode && gestureMode != .viewport && hasRenderableFrame
         }
         return true
     }
@@ -1294,6 +1354,11 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         imageView.layer.minificationFilter = .linear
         imageView.layer.contentsScale = UIScreen.main.scale
         addSubview(imageView)
+
+        videoLayer.videoGravity = .resizeAspect
+        videoLayer.backgroundColor = UIColor.black.cgColor
+        videoLayer.isHidden = true
+        layer.addSublayer(videoLayer)
 
         monitorContentLayer.masksToBounds = false
         layer.addSublayer(monitorContentLayer)
@@ -1378,6 +1443,14 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         }
     }
 
+    private func flushVideoLayer(removeImage: Bool) {
+        if removeImage {
+            videoLayer.sampleBufferRenderer.flush(removingDisplayedImage: true) {}
+        } else {
+            videoLayer.sampleBufferRenderer.flush()
+        }
+    }
+
     private func anchoredPanOffset(from panOffset: CGSize, oldZoom: Double, newZoom: Double, anchor: CGPoint) -> CGSize {
         guard oldZoom > 0 else { return panOffset }
         let ratio = CGFloat(newZoom / oldZoom)
@@ -1389,7 +1462,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     }
 
     private func updateCursor(geometry: StageGeometry) {
-        guard latestImage != nil, let remoteCursor else {
+        guard hasRenderableFrame, let remoteCursor else {
             cursorView.isHidden = true
             return
         }
@@ -1497,7 +1570,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         ))
     }
 
-    private func stageGeometry(for _: CGImage, panOffset: CGSize, zoom: Double) -> StageGeometry? {
+    private func stageGeometry(panOffset: CGSize, zoom: Double) -> StageGeometry? {
         let sourceBounds = streamSourceBounds()
         guard sourceBounds.width > 0, sourceBounds.height > 0 else { return nil }
 
@@ -1550,6 +1623,10 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     }
 
     private func streamSourceBounds() -> CGRect {
+        if videoActive, desktopSize.width > 0, desktopSize.height > 0 {
+            return CGRect(origin: .zero, size: desktopSize)
+        }
+
         if let displayInfo {
             let left = displayInfo.left ?? displayInfo.virtualLeft
             let top = displayInfo.top ?? displayInfo.virtualTop
@@ -1593,8 +1670,8 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     }
 
     private func normalizedPoint(for location: CGPoint) -> CGPoint? {
-        guard let image = latestImage else { return nil }
-        guard let geometry = stageGeometry(for: image, panOffset: panOffsetValue, zoom: zoomValue) else { return nil }
+        guard hasRenderableFrame else { return nil }
+        guard let geometry = stageGeometry(panOffset: panOffsetValue, zoom: zoomValue) else { return nil }
         guard geometry.visualFrame.width > 0, geometry.visualFrame.height > 0 else { return nil }
         let x = (location.x - geometry.visualFrame.minX) / geometry.visualFrame.width
         let y = (location.y - geometry.visualFrame.minY) / geometry.visualFrame.height
@@ -1606,8 +1683,8 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         guard gestureMode == .trackpad else {
             return normalizedPoint(for: location)
         }
-        guard let image = latestImage else { return nil }
-        guard let geometry = stageGeometry(for: image, panOffset: panOffsetValue, zoom: zoomValue) else { return nil }
+        guard hasRenderableFrame else { return nil }
+        guard let geometry = stageGeometry(panOffset: panOffsetValue, zoom: zoomValue) else { return nil }
         guard geometry.visualFrame.width > 0, geometry.visualFrame.height > 0 else { return nil }
         let start = trackpadStartCursor ?? remoteCursor ?? CGPoint(x: 0.5, y: 0.5)
         let sensitivity: CGFloat = 1.25
@@ -1620,7 +1697,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     }
 
     private func handleOneFingerViewportPan(to location: CGPoint) {
-        guard latestImage != nil else { return }
+        guard hasRenderableFrame else { return }
         let translation = CGSize(
             width: location.x - touchStartLocation.x,
             height: location.y - touchStartLocation.y
@@ -1660,7 +1737,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     }
 
     private func clampedPanOffset(_ offset: CGSize) -> CGSize {
-        guard let image = latestImage, let geometry = stageGeometry(for: image, panOffset: .zero, zoom: zoomValue), zoomValue > 1.01 else {
+        guard hasRenderableFrame, let geometry = stageGeometry(panOffset: .zero, zoom: zoomValue), zoomValue > 1.01 else {
             return .zero
         }
 

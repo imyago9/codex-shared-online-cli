@@ -119,6 +119,17 @@ enum RemoteStreamProfile: String, Codable, CaseIterable, Identifiable {
         }
     }
 
+    var videoFps: Int {
+        switch self {
+        case .economy:
+            return 15
+        case .balanced:
+            return 30
+        case .fluid, .sharp:
+            return 60
+        }
+    }
+
     var jpegQuality: Int {
         switch self {
         case .economy:

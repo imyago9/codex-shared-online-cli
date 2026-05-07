@@ -5,6 +5,7 @@ const STREAM_PRESETS = [
     id: 'economy',
     label: 'Economy',
     fps: 5,
+    videoFps: 15,
     jpegQuality: 46,
     intent: 'Lower bandwidth and calmer battery use'
   },
@@ -12,6 +13,7 @@ const STREAM_PRESETS = [
     id: 'balanced',
     label: 'Balanced',
     fps: 10,
+    videoFps: 30,
     jpegQuality: 62,
     intent: 'Good default for iPhone remote control'
   },
@@ -19,6 +21,7 @@ const STREAM_PRESETS = [
     id: 'fluid',
     label: 'Fluid',
     fps: 20,
+    videoFps: 60,
     jpegQuality: 64,
     intent: 'Smoother pointer movement'
   },
@@ -26,6 +29,7 @@ const STREAM_PRESETS = [
     id: 'sharp',
     label: 'Sharp',
     fps: 12,
+    videoFps: 60,
     jpegQuality: 86,
     intent: 'More readable text and UI detail'
   }
@@ -57,6 +61,12 @@ function toSafeInteger(rawValue, fallback, min, max) {
     return fallback;
   }
   return Math.max(min, Math.min(max, Math.trunc(parsed)));
+}
+
+function videoBitrateForQuality(rawQuality, fallbackQuality = 62) {
+  const quality = toSafeInteger(rawQuality, fallbackQuality, 20, 95);
+  const ratio = (quality - 20) / 75;
+  return toSafeInteger(Math.round(1_200 + ratio * 6_800), 4_000, 500, 50_000);
 }
 
 function serializeMonitorLayout(layout) {
@@ -340,6 +350,9 @@ class RemoteClient {
       monitors: resolvedStatus.sidecar && resolvedStatus.sidecar.health
         ? resolvedStatus.sidecar.health.displays || resolvedStatus.sidecar.health.monitors || []
         : [],
+      video: resolvedStatus.sidecar && resolvedStatus.sidecar.health
+        ? resolvedStatus.sidecar.health.video || null
+        : null,
       gateway: this.getGatewaySnapshot()
     };
   }
@@ -348,6 +361,23 @@ class RemoteClient {
     const wsUrl = this.buildSidecarWsUrl('/stream', {
       fps: toSafeInteger(options.fps, this.streamFps, 1, 20),
       quality: toSafeInteger(options.quality, this.jpegQuality, 20, 95),
+      monitors: Array.isArray(options.monitors) && options.monitors.length > 0
+        ? options.monitors.join(',')
+        : null,
+      layout: serializeMonitorLayout(options.layout)
+    });
+
+    return new WebSocket(wsUrl, {
+      perMessageDeflate: false
+    });
+  }
+
+  openVideoSocket(options = {}) {
+    const quality = toSafeInteger(options.quality, this.jpegQuality, 20, 95);
+    const wsUrl = this.buildSidecarWsUrl('/video', {
+      fps: toSafeInteger(options.fps, 60, 1, 120),
+      quality,
+      bitrateKbps: toSafeInteger(options.bitrateKbps, videoBitrateForQuality(quality, this.jpegQuality), 500, 50_000),
       monitors: Array.isArray(options.monitors) && options.monitors.length > 0
         ? options.monitors.join(',')
         : null,

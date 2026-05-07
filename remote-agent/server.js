@@ -11,6 +11,13 @@ const COMPOSED_FRAME_MAX_PIXELS = 4_000_000;
 const COMPOSED_FRAME_MAX_WIDTH = 4096;
 const COMPOSED_FRAME_MAX_HEIGHT = 2304;
 
+let bundledFfmpegPath = null;
+try {
+  bundledFfmpegPath = require('ffmpeg-static');
+} catch (_error) {
+  bundledFfmpegPath = null;
+}
+
 function parseInteger(rawValue, fallback) {
   const parsed = Number.parseInt(rawValue, 10);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -2081,6 +2088,13 @@ const config = {
   port: clampInteger(parseInteger(process.env.REMOTE_AGENT_PORT, 3390), 1, 65_535),
   streamFps: clampInteger(parseInteger(process.env.REMOTE_STREAM_FPS, 10), 1, 20),
   jpegQuality: clampInteger(parseInteger(process.env.REMOTE_JPEG_QUALITY, 62), 20, 95),
+  videoEnabled: parseBoolean(process.env.REMOTE_VIDEO_ENABLED, true),
+  videoFps: clampInteger(parseInteger(process.env.REMOTE_VIDEO_FPS, 60), 1, 120),
+  videoBitrateKbps: clampInteger(parseInteger(process.env.REMOTE_VIDEO_BITRATE_KBPS, 4_000), 500, 50_000),
+  videoMaxWidth: clampInteger(parseInteger(process.env.REMOTE_VIDEO_MAX_WIDTH, 1920), 640, 7680),
+  videoMaxHeight: clampInteger(parseInteger(process.env.REMOTE_VIDEO_MAX_HEIGHT, 1080), 360, 4320),
+  videoEncoder: process.env.REMOTE_VIDEO_ENCODER || 'libx264',
+  videoFfmpegPath: process.env.REMOTE_VIDEO_FFMPEG_PATH || bundledFfmpegPath || 'ffmpeg',
   inputEnabled: parseBoolean(process.env.REMOTE_INPUT_ENABLED, true),
   logLevel: process.env.LOG_LEVEL || 'info'
 };
@@ -2110,6 +2124,28 @@ const streamState = {
   lastCaptureLatencyMs: 0,
   lastCaptureError: null,
   lastErrorAt: 0
+};
+
+const videoState = {
+  clients: new Set(),
+  process: null,
+  cursorTimer: null,
+  statsTimer: null,
+  activeFps: config.videoFps,
+  activeBitrateKbps: config.videoBitrateKbps,
+  activeMonitorIds: [],
+  activeMonitorLayout: [],
+  bytesInWindow: 0,
+  chunksInWindow: 0,
+  currentFps: 0,
+  currentBitrateKbps: 0,
+  lastFrameBytes: 0,
+  lastError: null,
+  lastErrorAt: 0,
+  restartTimer: null,
+  processStartedAt: 0,
+  lastStderr: '',
+  activePlan: null
 };
 
 const captureDisplayCatalog = {
@@ -2566,6 +2602,421 @@ function stopStreamLoopIfIdle() {
   }
 }
 
+function getOpenVideoClientCount() {
+  let count = 0;
+  for (const client of videoState.clients) {
+    if (isWsOpen(client)) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function isVideoStreamAvailable() {
+  return config.videoEnabled === true
+    && process.platform === 'win32'
+    && Boolean(config.videoFfmpegPath);
+}
+
+function broadcastVideoControl(payload) {
+  const message = JSON.stringify(payload);
+  for (const client of videoState.clients) {
+    if (!isWsOpen(client)) {
+      continue;
+    }
+    try {
+      client.send(message);
+    } catch (_error) {
+      // Ignore send races.
+    }
+  }
+}
+
+function getSelectedVideoDisplays() {
+  const catalog = getDisplayCatalogSnapshot();
+  let selectedDisplays = catalog;
+  if (Array.isArray(videoState.activeMonitorIds) && videoState.activeMonitorIds.length > 0) {
+    const selected = new Set(videoState.activeMonitorIds);
+    const nextDisplays = catalog.filter((display) => selected.has(display.id));
+    if (nextDisplays.length > 0) {
+      selectedDisplays = nextDisplays;
+    }
+  }
+  return applyMonitorLayout(selectedDisplays, videoState.activeMonitorLayout);
+}
+
+function evenVideoDimension(value) {
+  return Math.max(2, Math.floor(Math.max(2, value) / 2) * 2);
+}
+
+function fitVideoOutputSize(width, height) {
+  const safeWidth = Math.max(2, Number(width) || 2);
+  const safeHeight = Math.max(2, Number(height) || 2);
+  const scale = Math.min(1, config.videoMaxWidth / safeWidth, config.videoMaxHeight / safeHeight);
+  return {
+    width: evenVideoDimension(safeWidth * scale),
+    height: evenVideoDimension(safeHeight * scale)
+  };
+}
+
+function createVideoCapturePlan() {
+  const displays = getSelectedVideoDisplays();
+  const bounds = computeDisplayUnion(displays) || createVirtualDisplayDescriptor(displayBounds);
+  const captureBounds = {
+    left: Math.round(bounds.left || 0),
+    top: Math.round(bounds.top || 0),
+    width: evenVideoDimension(bounds.width || displayBounds.virtualWidth || displayBounds.width || 1920),
+    height: evenVideoDimension(bounds.height || displayBounds.virtualHeight || displayBounds.height || 1080)
+  };
+  const output = fitVideoOutputSize(captureBounds.width, captureBounds.height);
+  return {
+    bounds: captureBounds,
+    output,
+    displays
+  };
+}
+
+function buildFfmpegVideoArgs(plan) {
+  const fps = clampInteger(videoState.activeFps, 1, 120);
+  const bitrateKbps = clampInteger(videoState.activeBitrateKbps, 500, 50_000);
+  const keyframeInterval = Math.max(1, Math.min(120, fps));
+  const filters = [];
+  if (plan.output.width !== plan.bounds.width || plan.output.height !== plan.bounds.height) {
+    filters.push(`scale=${plan.output.width}:${plan.output.height}:flags=fast_bilinear`);
+  }
+  filters.push('format=yuv420p');
+
+  const args = [
+    '-hide_banner',
+    '-loglevel', 'warning',
+    '-fflags', 'nobuffer',
+    '-f', 'gdigrab',
+    '-framerate', String(fps),
+    '-draw_mouse', '1',
+    '-offset_x', String(plan.bounds.left),
+    '-offset_y', String(plan.bounds.top),
+    '-video_size', `${plan.bounds.width}x${plan.bounds.height}`,
+    '-i', 'desktop',
+    '-an',
+    '-sn',
+    '-vf', filters.join(','),
+    '-c:v', config.videoEncoder
+  ];
+
+  if (config.videoEncoder === 'libx264') {
+    args.push(
+      '-preset', 'ultrafast',
+      '-tune', 'zerolatency',
+      '-profile:v', 'baseline',
+      '-level', '4.2',
+      '-refs', '1',
+      '-bf', '0',
+      '-g', String(keyframeInterval),
+      '-keyint_min', String(keyframeInterval),
+      '-b:v', `${bitrateKbps}k`,
+      '-maxrate', `${bitrateKbps}k`,
+      '-bufsize', `${Math.max(500, Math.round(bitrateKbps / 2))}k`,
+      '-x264-params', 'repeat-headers=1:scenecut=0:aud=1'
+    );
+  } else {
+    args.push(
+      '-bf', '0',
+      '-g', String(keyframeInterval),
+      '-b:v', `${bitrateKbps}k`,
+      '-maxrate', `${bitrateKbps}k`,
+      '-bufsize', `${Math.max(500, Math.round(bitrateKbps / 2))}k`
+    );
+  }
+
+  args.push('-f', 'h264', 'pipe:1');
+  return args;
+}
+
+function sendVideoReady(socket, plan) {
+  if (!isWsOpen(socket)) {
+    return;
+  }
+  socket.send(JSON.stringify({
+    type: 'ready',
+    transport: 'video',
+    codec: 'h264',
+    format: 'annexb',
+    fps: videoState.activeFps,
+    bitrateKbps: videoState.activeBitrateKbps,
+    video: {
+      codec: 'h264',
+      format: 'annexb',
+      encoder: config.videoEncoder,
+      width: plan.output.width,
+      height: plan.output.height,
+      captureWidth: plan.bounds.width,
+      captureHeight: plan.bounds.height
+    },
+    display: displayBounds,
+    monitors: getDisplayCatalogSnapshot(),
+    monitorIds: socket.requestedMonitorIds,
+    monitorLayout: socket.requestedMonitorLayout
+  }));
+}
+
+function broadcastVideoCursor() {
+  const cursorSnapshot = cursorTracker.getSnapshot(displayBounds);
+  if (!cursorSnapshot) {
+    return;
+  }
+  const bounds = videoState.activePlan && videoState.activePlan.bounds
+    ? videoState.activePlan.bounds
+    : null;
+  const x = bounds && Number.isFinite(cursorSnapshot.screenX)
+    ? Math.max(0, Math.min(1, (cursorSnapshot.screenX - bounds.left) / Math.max(1, bounds.width - 1)))
+    : cursorSnapshot.x;
+  const y = bounds && Number.isFinite(cursorSnapshot.screenY)
+    ? Math.max(0, Math.min(1, (cursorSnapshot.screenY - bounds.top) / Math.max(1, bounds.height - 1)))
+    : cursorSnapshot.y;
+  broadcastVideoControl({
+    type: 'cursor',
+    x,
+    y,
+    screenX: cursorSnapshot.screenX,
+    screenY: cursorSnapshot.screenY,
+    mapLeft: cursorSnapshot.mapLeft,
+    mapTop: cursorSnapshot.mapTop,
+    mapWidth: cursorSnapshot.mapWidth,
+    mapHeight: cursorSnapshot.mapHeight,
+    at: cursorSnapshot.at
+  });
+}
+
+function broadcastVideoStats() {
+  const bytes = videoState.bytesInWindow;
+  const chunks = videoState.chunksInWindow;
+  videoState.bytesInWindow = 0;
+  videoState.chunksInWindow = 0;
+  videoState.currentBitrateKbps = Number(((bytes * 8) / 1000).toFixed(2));
+  videoState.currentFps = videoState.activeFps;
+  videoState.lastFrameBytes = videoState.activeFps > 0
+    ? Math.round(bytes / videoState.activeFps)
+    : bytes;
+
+  broadcastVideoControl({
+    type: 'stats',
+    transport: 'video',
+    codec: 'h264',
+    fps: videoState.currentFps,
+    chunks,
+    frameBytes: videoState.lastFrameBytes,
+    bitrateKbps: videoState.currentBitrateKbps,
+    clients: getOpenVideoClientCount(),
+    captureTs: Date.now(),
+    captureLatencyMs: null,
+    display: displayBounds,
+    displays: getDisplayCatalogSnapshot()
+  });
+}
+
+function stopVideoProcess(reason) {
+  if (videoState.restartTimer) {
+    clearTimeout(videoState.restartTimer);
+    videoState.restartTimer = null;
+  }
+  if (videoState.cursorTimer) {
+    clearInterval(videoState.cursorTimer);
+    videoState.cursorTimer = null;
+  }
+  if (videoState.statsTimer) {
+    clearInterval(videoState.statsTimer);
+    videoState.statsTimer = null;
+  }
+  if (videoState.process) {
+    const child = videoState.process;
+    videoState.process = null;
+    try {
+      child.kill('SIGTERM');
+    } catch (_error) {
+      // Ignore process teardown races.
+    }
+    if (reason) {
+      logger.debug('Stopped video process', { reason });
+    }
+  }
+}
+
+function scheduleVideoRestart(reason) {
+  stopVideoProcess(reason);
+  if (getOpenVideoClientCount() === 0 || videoState.restartTimer) {
+    return;
+  }
+  videoState.restartTimer = setTimeout(() => {
+    videoState.restartTimer = null;
+    startVideoStream(reason);
+  }, 120);
+  videoState.restartTimer.unref();
+}
+
+function recomputeVideoSettings() {
+  let nextFps = config.videoFps;
+  let nextBitrateKbps = config.videoBitrateKbps;
+  let nextMonitorIds = [];
+  let nextMonitorLayout = [];
+
+  for (const client of videoState.clients) {
+    if (!isWsOpen(client)) {
+      continue;
+    }
+    if (Number.isFinite(client.requestedFps)) {
+      nextFps = clampInteger(client.requestedFps, 1, 120);
+    }
+    if (Number.isFinite(client.requestedBitrateKbps)) {
+      nextBitrateKbps = clampInteger(client.requestedBitrateKbps, 500, 50_000);
+    }
+    if (Array.isArray(client.requestedMonitorIds) && client.requestedMonitorIds.length > 0) {
+      nextMonitorIds = client.requestedMonitorIds.slice(0, 16);
+    }
+    if (Array.isArray(client.requestedMonitorLayout)) {
+      nextMonitorLayout = client.requestedMonitorLayout.slice(0, 16);
+    }
+  }
+
+  const changed = nextFps !== videoState.activeFps
+    || nextBitrateKbps !== videoState.activeBitrateKbps
+    || JSON.stringify(nextMonitorIds) !== JSON.stringify(videoState.activeMonitorIds)
+    || JSON.stringify(nextMonitorLayout) !== JSON.stringify(videoState.activeMonitorLayout);
+
+  videoState.activeFps = nextFps;
+  videoState.activeBitrateKbps = nextBitrateKbps;
+  videoState.activeMonitorIds = nextMonitorIds;
+  videoState.activeMonitorLayout = nextMonitorLayout;
+  streamState.activeMonitorIds = nextMonitorIds;
+  streamState.activeMonitorLayout = nextMonitorLayout;
+
+  if (changed && videoState.process) {
+    scheduleVideoRestart('video-settings-changed');
+  }
+}
+
+function startVideoStream(reason) {
+  if (videoState.process || getOpenVideoClientCount() === 0) {
+    return;
+  }
+
+  if (!isVideoStreamAvailable()) {
+    videoState.lastError = process.platform === 'win32'
+      ? 'ffmpeg-unavailable'
+      : 'video-stream-windows-only';
+    broadcastVideoControl({
+      type: 'error',
+      message: videoState.lastError
+    });
+    return;
+  }
+
+  refreshCaptureDisplayCatalog(false).catch(() => {});
+  const plan = createVideoCapturePlan();
+  videoState.activePlan = plan;
+  const args = buildFfmpegVideoArgs(plan);
+  videoState.lastError = null;
+  videoState.lastStderr = '';
+  videoState.bytesInWindow = 0;
+  videoState.chunksInWindow = 0;
+  videoState.processStartedAt = Date.now();
+
+  for (const client of videoState.clients) {
+    sendVideoReady(client, plan);
+  }
+
+  logger.info('Starting low-latency video stream', {
+    reason: reason || null,
+    ffmpeg: config.videoFfmpegPath,
+    fps: videoState.activeFps,
+    bitrateKbps: videoState.activeBitrateKbps,
+    encoder: config.videoEncoder,
+    capture: plan.bounds,
+    output: plan.output
+  });
+
+  const child = childProcess.spawn(config.videoFfmpegPath, args, {
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  videoState.process = child;
+
+  child.stdout.on('data', (chunk) => {
+    if (!Buffer.isBuffer(chunk) || chunk.length === 0) {
+      return;
+    }
+    videoState.bytesInWindow += chunk.length;
+    videoState.chunksInWindow += 1;
+    for (const client of videoState.clients) {
+      if (!isWsOpen(client)) {
+        continue;
+      }
+      try {
+        client.send(chunk, { binary: true });
+      } catch (_error) {
+        // Ignore send races.
+      }
+    }
+  });
+
+  child.stderr.on('data', (chunk) => {
+    const text = String(chunk || '').trim();
+    if (!text) {
+      return;
+    }
+    videoState.lastStderr = text.slice(-1000);
+    logger.debug('FFmpeg video stream output', { message: videoState.lastStderr });
+  });
+
+  child.on('error', (error) => {
+    if (videoState.process !== child) {
+      return;
+    }
+    videoState.process = null;
+    stopVideoProcess('video-spawn-error');
+    videoState.lastError = error && error.message ? error.message : 'ffmpeg-spawn-failed';
+    logger.warn('Failed to start video stream', {
+      message: videoState.lastError
+    });
+    broadcastVideoControl({
+      type: 'error',
+      message: videoState.lastError
+    });
+  });
+
+  child.on('close', (code, signal) => {
+    if (videoState.process !== child) {
+      return;
+    }
+    videoState.process = null;
+    stopVideoProcess('video-process-closed');
+    const message = videoState.lastStderr || `ffmpeg exited (${code ?? 'null'} ${signal || ''})`.trim();
+    videoState.lastError = message;
+    logger.warn('Video stream stopped', {
+      code,
+      signal,
+      message
+    });
+    if (getOpenVideoClientCount() > 0) {
+      broadcastVideoControl({
+        type: 'error',
+        message
+      });
+    }
+  });
+
+  videoState.cursorTimer = setInterval(broadcastVideoCursor, 33);
+  videoState.cursorTimer.unref();
+  videoState.statsTimer = setInterval(broadcastVideoStats, 1000);
+  videoState.statsTimer.unref();
+}
+
+function stopVideoStreamIfIdle() {
+  if (getOpenVideoClientCount() > 0) {
+    return;
+  }
+  stopVideoProcess('idle');
+}
+
 app.get('/health', (_req, res) => {
   const cursorSnapshot = cursorTracker.getSnapshot(displayBounds);
   const displays = getDisplayCatalogSnapshot();
@@ -2582,6 +3033,23 @@ app.get('/health', (_req, res) => {
       lastCaptureTs: streamState.lastCaptureTs || null,
       lastCaptureLatencyMs: streamState.lastCaptureLatencyMs || null,
       lastError: streamState.lastCaptureError
+    },
+    video: {
+      available: isVideoStreamAvailable(),
+      transport: 'websocket',
+      codec: 'h264',
+      format: 'annexb',
+      targetFps: videoState.activeFps,
+      fps: Number(videoState.currentFps.toFixed(2)),
+      bitrateKbps: videoState.currentBitrateKbps,
+      targetBitrateKbps: videoState.activeBitrateKbps,
+      encoder: config.videoEncoder,
+      maxWidth: config.videoMaxWidth,
+      maxHeight: config.videoMaxHeight,
+      clients: getOpenVideoClientCount(),
+      processRunning: Boolean(videoState.process),
+      lastFrameBytes: videoState.lastFrameBytes,
+      lastError: videoState.lastError
     },
     input: {
       available: inputController.available === true,
@@ -2659,6 +3127,94 @@ streamWss.on('connection', (socket, req) => {
 
   socket.on('error', (error) => {
     logger.warn('Stream websocket client error', {
+      message: error.message
+    });
+  });
+});
+
+function qualityToVideoBitrateKbps(rawQuality) {
+  const quality = clampInteger(parseInteger(rawQuality, config.jpegQuality), 20, 95);
+  const ratio = (quality - 20) / 75;
+  return clampInteger(Math.round(1_200 + ratio * 6_800), 500, 50_000);
+}
+
+const videoWss = new WebSocketServer({ noServer: true });
+videoWss.on('connection', (socket, req) => {
+  const query = parseRequestQuery(req);
+  socket.requestedFps = clampInteger(parseInteger(query.get('fps'), config.videoFps), 1, 120);
+  socket.requestedBitrateKbps = clampInteger(
+    parseInteger(query.get('bitrateKbps'), qualityToVideoBitrateKbps(query.get('quality'))),
+    500,
+    50_000
+  );
+  socket.requestedMonitorIds = sanitizeMonitorIds(query.get('monitors'));
+  socket.requestedMonitorLayout = sanitizeMonitorLayout(query.get('layout'));
+
+  videoState.clients.add(socket);
+  recomputeVideoSettings();
+
+  if (!isVideoStreamAvailable()) {
+    const message = process.platform === 'win32'
+      ? 'ffmpeg-unavailable'
+      : 'video-stream-windows-only';
+    if (isWsOpen(socket)) {
+      socket.send(JSON.stringify({ type: 'error', message }));
+    }
+    videoState.clients.delete(socket);
+    recomputeVideoSettings();
+    socket.close(1013, message);
+    return;
+  }
+
+  sendVideoReady(socket, createVideoCapturePlan());
+  startVideoStream('client-connected');
+
+  socket.on('message', (rawValue, isBinary) => {
+    if (isBinary) {
+      return;
+    }
+
+    const text = decodeWsText(rawValue);
+    if (!text) {
+      return;
+    }
+
+    let payload = null;
+    try {
+      payload = JSON.parse(text);
+    } catch (_error) {
+      return;
+    }
+
+    const type = payload && typeof payload.type === 'string'
+      ? payload.type.trim().toLowerCase()
+      : '';
+
+    if (type === 'set-monitor-layout' || type === 'remote:set-monitor-layout') {
+      socket.requestedMonitorLayout = sanitizeMonitorLayout(payload.layout || []);
+      recomputeVideoSettings();
+      return;
+    }
+
+    if (type === 'set-stream' || type === 'remote:set-stream') {
+      socket.requestedFps = clampInteger(parseInteger(payload.fps, socket.requestedFps), 1, 120);
+      socket.requestedBitrateKbps = clampInteger(
+        parseInteger(payload.bitrateKbps, socket.requestedBitrateKbps),
+        500,
+        50_000
+      );
+      recomputeVideoSettings();
+    }
+  });
+
+  socket.on('close', () => {
+    videoState.clients.delete(socket);
+    recomputeVideoSettings();
+    stopVideoStreamIfIdle();
+  });
+
+  socket.on('error', (error) => {
+    logger.warn('Video websocket client error', {
       message: error.message
     });
   });
@@ -2779,6 +3335,13 @@ server.on('upgrade', (req, socket, head) => {
     return;
   }
 
+  if (pathname === '/video') {
+    videoWss.handleUpgrade(req, socket, head, (clientSocket) => {
+      videoWss.emit('connection', clientSocket, req);
+    });
+    return;
+  }
+
   if (pathname === '/input') {
     inputWss.handleUpgrade(req, socket, head, (clientSocket) => {
       inputWss.emit('connection', clientSocket, req);
@@ -2802,6 +3365,8 @@ server.listen(config.port, config.host, () => {
     inputReason: inputController.reason,
     cursorAvailable: cursorTracker.available,
     cursorReason: cursorTracker.reason,
+    videoAvailable: isVideoStreamAvailable(),
+    videoEncoder: config.videoEncoder,
     display: displayBounds,
     displays: getDisplayCatalogSnapshot()
   });
@@ -2820,6 +3385,7 @@ function shutdown(signal) {
     clearInterval(streamState.timer);
     streamState.timer = null;
   }
+  stopVideoProcess('sidecar-shutdown');
 
   if (inputController && typeof inputController.close === 'function') {
     try {
@@ -2855,7 +3421,16 @@ function shutdown(signal) {
     }
   }
 
+  for (const socket of videoWss.clients) {
+    try {
+      socket.close(1001, 'Sidecar shutting down');
+    } catch (_error) {
+      // Ignore close races.
+    }
+  }
+
   streamWss.close();
+  videoWss.close();
   inputWss.close();
 
   server.close(() => {

@@ -1,4 +1,6 @@
 import Foundation
+import AVFoundation
+import CoreMedia
 import ImageIO
 import Observation
 import UIKit
@@ -29,6 +31,18 @@ struct RemoteFrameRenderUpdate {
     let sequence: UInt64
     let decodeMs: Double
     let receivedAt: TimeInterval
+}
+
+struct RemoteVideoRenderUpdate {
+    let sampleBuffer: CMSampleBuffer?
+    let pixelSize: CGSize
+    let sequence: UInt64
+    let receivedAt: TimeInterval
+}
+
+enum RemoteStreamTransport: String {
+    case jpeg
+    case video
 }
 
 struct RemoteRenderDiagnostics: Equatable {
@@ -62,8 +76,10 @@ final class RemoteDesktopClient {
     @ObservationIgnored private(set) var frameImage: CGImage?
     @ObservationIgnored private(set) var remoteCursor: CGPoint?
     @ObservationIgnored private(set) var frameSequence: UInt64 = 0
+    @ObservationIgnored private(set) var videoSequence: UInt64 = 0
     @ObservationIgnored private(set) var desktopSize = CGSize(width: 1280, height: 720)
     @ObservationIgnored var frameSink: ((RemoteFrameRenderUpdate) -> Void)?
+    @ObservationIgnored var videoSink: ((RemoteVideoRenderUpdate) -> Void)?
     @ObservationIgnored var cursorSink: ((CGPoint?) -> Void)?
 
     var connectionState: RemoteConnectionState = .disconnected
@@ -106,6 +122,8 @@ final class RemoteDesktopClient {
     @ObservationIgnored private var adaptiveGoodSince: TimeInterval?
     @ObservationIgnored private var adaptiveDroppedFrameBaseline = 0
     @ObservationIgnored private var adaptiveDroppedInputBaseline = 0
+    @ObservationIgnored private var streamTransport: RemoteStreamTransport = .video
+    @ObservationIgnored private var h264Decoder = RemoteH264AnnexBDecoder()
     private var lastControlPromptAt: TimeInterval = 0
     private let monitorLayoutSendInterval: TimeInterval = 1.0 / 30.0
     private var lastMonitorLayoutSendAt: TimeInterval = 0
@@ -132,7 +150,8 @@ final class RemoteDesktopClient {
             let api = OnlineCLIAPI(baseURL: baseURL)
             var queryItems = [
                 URLQueryItem(name: "mode", value: desiredMode.rawValue),
-                URLQueryItem(name: "fps", value: "\(streamProfile.fps)"),
+                URLQueryItem(name: "transport", value: "video"),
+                URLQueryItem(name: "fps", value: "\(streamProfile.videoFps)"),
                 URLQueryItem(name: "quality", value: "\(streamProfile.jpegQuality)")
             ]
             if !visibleMonitorIds.isEmpty {
@@ -178,6 +197,8 @@ final class RemoteDesktopClient {
         pendingFrameData = nil
         pendingDecodedFrame = nil
         pendingMonitorLayoutOffsets = nil
+        h264Decoder.reset()
+        streamTransport = .video
         webSocketTask?.cancel(with: .goingAway, reason: nil)
         webSocketTask = nil
         frameImage = nil
@@ -190,6 +211,13 @@ final class RemoteDesktopClient {
             pixelSize: desktopSize,
             sequence: frameSequence,
             decodeMs: 0,
+            receivedAt: ProcessInfo.processInfo.systemUptime
+        ))
+        videoSequence &+= 1
+        videoSink?(RemoteVideoRenderUpdate(
+            sampleBuffer: nil,
+            pixelSize: desktopSize,
+            sequence: videoSequence,
             receivedAt: ProcessInfo.processInfo.systemUptime
         ))
         cursorSink?(nil)
@@ -216,6 +244,7 @@ final class RemoteDesktopClient {
         sendEnvelope([
             "type": "set-stream",
             "fps": nextProfile.fps,
+            "videoFps": nextProfile.videoFps,
             "quality": nextProfile.jpegQuality
         ])
         if adaptive {
@@ -367,7 +396,11 @@ final class RemoteDesktopClient {
     private func handle(_ message: URLSessionWebSocketTask.Message) async {
         switch message {
         case .data(let data):
-            enqueueFrameData(data)
+            if Self.isJPEGData(data) || streamTransport == .jpeg {
+                enqueueFrameData(data)
+            } else {
+                handleVideoData(data)
+            }
         case .string(let text):
             handleControlText(text)
         @unknown default:
@@ -396,6 +429,9 @@ final class RemoteDesktopClient {
             updateGatewayStatus(decodeObject(RemoteGatewayStatus.self, from: payload["gateway"]))
             if let stream = payload["stream"] as? [String: Any] {
                 frameFps = doubleValue(stream["fps"]) ?? frameFps
+                if let transport = streamTransportValue(stream["transport"]) {
+                    streamTransport = transport
+                }
             }
             if let rawMode = payload["mode"] as? String, let nextMode = RemoteMode(rawValue: rawMode) {
                 mode = nextMode
@@ -406,8 +442,14 @@ final class RemoteDesktopClient {
             connectionState = .connected
             setStatusText("Stream connected")
         case "remote-stream-config":
+            if let transport = streamTransportValue(payload["transport"]) {
+                if transport != streamTransport {
+                    h264Decoder.reset()
+                }
+                streamTransport = transport
+            }
             updateMonitors(decodeObject([RemoteMonitorDescriptor].self, from: payload["monitors"]))
-            setStatusText("Stream tuned to \(streamProfile.title)")
+            setStatusText(streamTransport == .video ? "Live video stream active" : "JPEG fallback stream active")
         case "remote-monitor-config":
             updateMonitors(decodeObject([RemoteMonitorDescriptor].self, from: payload["monitors"]))
             setStatusText("Monitor view updated")
@@ -453,6 +495,32 @@ final class RemoteDesktopClient {
             connectionState = .failed("Remote stream disconnected")
         default:
             break
+        }
+    }
+
+    private func handleVideoData(_ data: Data) {
+        let receivedAt = ProcessInfo.processInfo.systemUptime
+        recordReceivedFrame(byteCount: data.count, at: receivedAt)
+        let samples = h264Decoder.append(data, receivedAt: receivedAt)
+        for sample in samples {
+            publishVideoFrame(sample)
+        }
+    }
+
+    private func publishVideoFrame(_ sample: RemoteVideoSample) {
+        videoSequence &+= 1
+        desktopSize = sample.pixelSize
+        diagnosticsDraft.decodeMs = sample.packetizeMs
+        diagnosticsDraft.frameBytes = sample.byteCount
+        publishDiagnosticsIfNeeded()
+        videoSink?(RemoteVideoRenderUpdate(
+            sampleBuffer: sample.sampleBuffer,
+            pixelSize: sample.pixelSize,
+            sequence: videoSequence,
+            receivedAt: sample.receivedAt
+        ))
+        if connectionState != .connected {
+            connectionState = .connected
         }
     }
 
@@ -828,6 +896,23 @@ final class RemoteDesktopClient {
         )
     }
 
+    private nonisolated static func isJPEGData(_ data: Data) -> Bool {
+        guard data.count >= 2 else { return false }
+        return data[data.startIndex] == 0xFF && data[data.index(after: data.startIndex)] == 0xD8
+    }
+
+    private func streamTransportValue(_ value: Any?) -> RemoteStreamTransport? {
+        guard let rawValue = value as? String else { return nil }
+        switch rawValue.lowercased() {
+        case "video", "h264":
+            return .video
+        case "jpeg", "jpg", "image":
+            return .jpeg
+        default:
+            return nil
+        }
+    }
+
     private func intValue(_ value: Any?) -> Int? {
         if let value = value as? Int {
             return value
@@ -862,6 +947,244 @@ final class RemoteDesktopClient {
             return nil
         }
         return try? JSONDecoder().decode(type, from: data)
+    }
+}
+
+private struct RemoteVideoSample {
+    let sampleBuffer: CMSampleBuffer
+    let pixelSize: CGSize
+    let sequence: UInt64
+    let packetizeMs: Double
+    let byteCount: Int
+    let receivedAt: TimeInterval
+}
+
+private final class RemoteH264AnnexBDecoder {
+    private var buffer = Data()
+    private var currentAccessUnit: [Data] = []
+    private var sps: Data?
+    private var pps: Data?
+    private var formatDescription: CMVideoFormatDescription?
+    private var sampleSequence: UInt64 = 0
+
+    func reset() {
+        buffer.removeAll(keepingCapacity: true)
+        currentAccessUnit.removeAll(keepingCapacity: true)
+        sps = nil
+        pps = nil
+        formatDescription = nil
+        sampleSequence = 0
+    }
+
+    func append(_ data: Data, receivedAt: TimeInterval) -> [RemoteVideoSample] {
+        guard !data.isEmpty else { return [] }
+        buffer.append(data)
+        let units = drainCompleteNALUnits()
+        guard !units.isEmpty else { return [] }
+
+        var samples: [RemoteVideoSample] = []
+        for unit in units {
+            if let sample = processNALUnit(unit, receivedAt: receivedAt) {
+                samples.append(sample)
+            }
+        }
+        return samples
+    }
+
+    private func drainCompleteNALUnits() -> [Data] {
+        guard buffer.count >= 5 else { return [] }
+        let bytes = [UInt8](buffer)
+        var starts: [(index: Int, length: Int)] = []
+        var index = 0
+
+        while index + 3 < bytes.count {
+            if bytes[index] == 0, bytes[index + 1] == 0 {
+                if bytes[index + 2] == 1 {
+                    starts.append((index, 3))
+                    index += 3
+                    continue
+                }
+                if index + 3 < bytes.count, bytes[index + 2] == 0, bytes[index + 3] == 1 {
+                    starts.append((index, 4))
+                    index += 4
+                    continue
+                }
+            }
+            index += 1
+        }
+
+        guard starts.count >= 2 else {
+            if let first = starts.first, first.index > 0 {
+                buffer.removeSubrange(0..<first.index)
+            } else if starts.isEmpty, buffer.count > 2_000_000 {
+                buffer.removeAll(keepingCapacity: true)
+            }
+            return []
+        }
+
+        var units: [Data] = []
+        for unitIndex in 0..<(starts.count - 1) {
+            let start = starts[unitIndex].index + starts[unitIndex].length
+            let end = starts[unitIndex + 1].index
+            if end > start {
+                units.append(buffer.subdata(in: start..<end))
+            }
+        }
+
+        buffer.removeSubrange(0..<starts[starts.count - 1].index)
+        return units
+    }
+
+    private func processNALUnit(_ unit: Data, receivedAt: TimeInterval) -> RemoteVideoSample? {
+        guard let firstByte = unit.first else { return nil }
+        let type = firstByte & 0x1F
+
+        if type == 9 {
+            return flushAccessUnit(receivedAt: receivedAt)
+        }
+
+        if type == 7 {
+            sps = unit
+            rebuildFormatDescription()
+        } else if type == 8 {
+            pps = unit
+            rebuildFormatDescription()
+        }
+
+        if shouldKeepInAccessUnit(type: type) {
+            currentAccessUnit.append(unit)
+        }
+        return nil
+    }
+
+    private func shouldKeepInAccessUnit(type: UInt8) -> Bool {
+        switch type {
+        case 1, 5, 6, 7, 8:
+            return true
+        default:
+            return !currentAccessUnit.isEmpty
+        }
+    }
+
+    private func rebuildFormatDescription() {
+        guard let sps, let pps else { return }
+        sps.withUnsafeBytes { spsBuffer in
+            pps.withUnsafeBytes { ppsBuffer in
+                guard
+                    let spsPointer = spsBuffer.bindMemory(to: UInt8.self).baseAddress,
+                    let ppsPointer = ppsBuffer.bindMemory(to: UInt8.self).baseAddress
+                else {
+                    return
+                }
+                let pointers: [UnsafePointer<UInt8>] = [spsPointer, ppsPointer]
+                let sizes = [sps.count, pps.count]
+                var nextDescription: CMFormatDescription?
+                let status = pointers.withUnsafeBufferPointer { pointerBuffer in
+                    sizes.withUnsafeBufferPointer { sizeBuffer in
+                        CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                            allocator: kCFAllocatorDefault,
+                            parameterSetCount: 2,
+                            parameterSetPointers: pointerBuffer.baseAddress!,
+                            parameterSetSizes: sizeBuffer.baseAddress!,
+                            nalUnitHeaderLength: 4,
+                            formatDescriptionOut: &nextDescription
+                        )
+                    }
+                }
+                if status == noErr {
+                    formatDescription = nextDescription
+                }
+            }
+        }
+    }
+
+    private func flushAccessUnit(receivedAt: TimeInterval) -> RemoteVideoSample? {
+        let accessUnit = currentAccessUnit
+        currentAccessUnit.removeAll(keepingCapacity: true)
+        guard
+            accessUnit.contains(where: { (($0.first ?? 0) & 0x1F) == 1 || (($0.first ?? 0) & 0x1F) == 5 }),
+            let formatDescription
+        else {
+            return nil
+        }
+
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        var blockData = Data()
+        blockData.reserveCapacity(accessUnit.reduce(0) { $0 + $1.count + 4 })
+        for nal in accessUnit {
+            var length = UInt32(nal.count).bigEndian
+            withUnsafeBytes(of: &length) { blockData.append(contentsOf: $0) }
+            blockData.append(nal)
+        }
+
+        var blockBuffer: CMBlockBuffer?
+        let blockStatus = CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault,
+            memoryBlock: nil,
+            blockLength: blockData.count,
+            blockAllocator: kCFAllocatorDefault,
+            customBlockSource: nil,
+            offsetToData: 0,
+            dataLength: blockData.count,
+            flags: 0,
+            blockBufferOut: &blockBuffer
+        )
+        guard blockStatus == noErr, let blockBuffer else { return nil }
+
+        let replaceStatus = blockData.withUnsafeBytes { bytes in
+            CMBlockBufferReplaceDataBytes(
+                with: bytes.baseAddress!,
+                blockBuffer: blockBuffer,
+                offsetIntoDestination: 0,
+                dataLength: blockData.count
+            )
+        }
+        guard replaceStatus == noErr else { return nil }
+
+        sampleSequence &+= 1
+        var timing = CMSampleTimingInfo(
+            duration: CMTime(value: 1, timescale: 60),
+            presentationTimeStamp: CMTime(value: CMTimeValue(sampleSequence), timescale: 60),
+            decodeTimeStamp: .invalid
+        )
+        var sampleSize = blockData.count
+        var sampleBuffer: CMSampleBuffer?
+        let sampleStatus = CMSampleBufferCreateReady(
+            allocator: kCFAllocatorDefault,
+            dataBuffer: blockBuffer,
+            formatDescription: formatDescription,
+            sampleCount: 1,
+            sampleTimingEntryCount: 1,
+            sampleTimingArray: &timing,
+            sampleSizeEntryCount: 1,
+            sampleSizeArray: &sampleSize,
+            sampleBufferOut: &sampleBuffer
+        )
+        guard sampleStatus == noErr, let sampleBuffer else { return nil }
+        markSampleBufferForImmediateDisplay(sampleBuffer)
+
+        let dimensions = CMVideoFormatDescriptionGetDimensions(formatDescription)
+        return RemoteVideoSample(
+            sampleBuffer: sampleBuffer,
+            pixelSize: CGSize(width: CGFloat(dimensions.width), height: CGFloat(dimensions.height)),
+            sequence: sampleSequence,
+            packetizeMs: (ProcessInfo.processInfo.systemUptime - startedAt) * 1_000,
+            byteCount: blockData.count,
+            receivedAt: receivedAt
+        )
+    }
+
+    private func markSampleBufferForImmediateDisplay(_ sampleBuffer: CMSampleBuffer) {
+        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: true) else {
+            return
+        }
+        let rawDictionary = CFArrayGetValueAtIndex(attachments, 0)
+        let dictionary = unsafeBitCast(rawDictionary, to: CFMutableDictionary.self)
+        CFDictionarySetValue(
+            dictionary,
+            Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+            Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
+        )
     }
 }
 

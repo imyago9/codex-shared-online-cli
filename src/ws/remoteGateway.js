@@ -25,6 +25,17 @@ function normalizeMode(rawValue, fallback = 'view') {
   return fallback;
 }
 
+function normalizeStreamTransport(rawValue, fallback = 'jpeg') {
+  const normalized = typeof rawValue === 'string' ? rawValue.trim().toLowerCase() : '';
+  if (normalized === 'video' || normalized === 'h264') {
+    return 'video';
+  }
+  if (normalized === 'jpeg' || normalized === 'jpg' || normalized === 'image') {
+    return 'jpeg';
+  }
+  return fallback;
+}
+
 function parseQueryValue(req, key) {
   try {
     const host = req.headers.host || 'localhost';
@@ -347,7 +358,13 @@ function createRemoteGateway(server, remoteClient, options = {}) {
     }
 
     const requestedMode = normalizeMode(parseQueryValue(req, 'mode'), defaults.defaultMode);
-    const requestedStreamFps = toBoundedInteger(parseQueryValue(req, 'fps'), defaults.streamFps, 1, 20);
+    const requestedTransport = normalizeStreamTransport(parseQueryValue(req, 'transport'), 'jpeg');
+    const requestedStreamFps = toBoundedInteger(
+      parseQueryValue(req, 'fps'),
+      requestedTransport === 'video' ? 60 : defaults.streamFps,
+      1,
+      requestedTransport === 'video' ? 120 : 20
+    );
     const requestedJpegQuality = toBoundedInteger(parseQueryValue(req, 'quality'), defaults.jpegQuality, 20, 95);
     const requestedMonitorIds = sanitizeMonitorIds(parseQueryValue(req, 'monitors'));
     const requestedMonitorLayout = sanitizeMonitorLayout(parseQueryValue(req, 'layout'));
@@ -356,6 +373,7 @@ function createRemoteGateway(server, remoteClient, options = {}) {
       mode: requestedMode === 'control' && controlAllowed ? 'control' : 'view',
       requestedMode,
       controlAllowed,
+      transport: requestedTransport,
       streamFps: requestedStreamFps,
       jpegQuality: requestedJpegQuality,
       monitorIds: requestedMonitorIds,
@@ -382,7 +400,9 @@ function createRemoteGateway(server, remoteClient, options = {}) {
       lastThrottleNoticeAt: 0,
       lastBackpressureNoticeAt: 0,
       lastFrameStats: null,
-      lastInputError: null
+      lastInputError: null,
+      videoFallbackAttempted: false,
+      seenStreamFrame: false
     };
     activeContexts.set(remoteConnectionId, context);
     publishGatewaySnapshot({
@@ -540,7 +560,8 @@ function createRemoteGateway(server, remoteClient, options = {}) {
     }
 
     function applyStreamSettings(nextFps, nextQuality, reason) {
-      const streamFps = toBoundedInteger(nextFps, connectionSettings.streamFps, 1, 20);
+      const maxFps = connectionSettings.transport === 'video' ? 120 : 20;
+      const streamFps = toBoundedInteger(nextFps, connectionSettings.streamFps, 1, maxFps);
       const jpegQuality = toBoundedInteger(nextQuality, connectionSettings.jpegQuality, 20, 95);
       const changed = streamFps !== connectionSettings.streamFps || jpegQuality !== connectionSettings.jpegQuality;
 
@@ -551,6 +572,7 @@ function createRemoteGateway(server, remoteClient, options = {}) {
       };
 
       sendControl('remote-stream-config', {
+        transport: connectionSettings.transport,
         fps: connectionSettings.streamFps,
         jpegQuality: connectionSettings.jpegQuality,
         reason: reason || null
@@ -822,13 +844,48 @@ function createRemoteGateway(server, remoteClient, options = {}) {
     }
 
     function bindStreamSocket() {
-      const streamSocket = remoteClient.openStreamSocket({
+      const transport = connectionSettings.transport === 'video' ? 'video' : 'jpeg';
+      context.seenStreamFrame = false;
+      const socketOptions = {
         fps: connectionSettings.streamFps,
         quality: connectionSettings.jpegQuality,
         monitors: connectionSettings.monitorIds,
         layout: connectionSettings.monitorLayout
-      });
+      };
+      const streamSocket = transport === 'video'
+        ? remoteClient.openVideoSocket(socketOptions)
+        : remoteClient.openStreamSocket(socketOptions);
       context.streamSocket = streamSocket;
+
+      function fallbackToJpeg(reason) {
+        if (transport !== 'video' || context.closed || context.videoFallbackAttempted) {
+          return false;
+        }
+        context.videoFallbackAttempted = true;
+        if (context.streamSocket === streamSocket) {
+          context.streamSocket = null;
+        }
+        if (streamSocket.readyState === WebSocket.OPEN || streamSocket.readyState === WebSocket.CONNECTING) {
+          try {
+            streamSocket.close(1000, 'video-fallback');
+          } catch (_error) {
+            // Ignore fallback close races.
+          }
+        }
+        connectionSettings = {
+          ...connectionSettings,
+          transport: 'jpeg',
+          streamFps: Math.min(20, defaults.streamFps || 10)
+        };
+        sendControl('remote-stream-config', {
+          transport: 'jpeg',
+          fps: connectionSettings.streamFps,
+          jpegQuality: connectionSettings.jpegQuality,
+          reason: reason || 'video-fallback'
+        });
+        bindStreamSocket();
+        return true;
+      }
 
       streamSocket.on('open', () => {
         if (context.closed || context.streamSocket !== streamSocket) {
@@ -836,6 +893,7 @@ function createRemoteGateway(server, remoteClient, options = {}) {
         }
 
         sendControl('remote-stream-connected', {
+          transport,
           fps: connectionSettings.streamFps,
           jpegQuality: connectionSettings.jpegQuality,
           monitorIds: connectionSettings.monitorIds,
@@ -850,6 +908,7 @@ function createRemoteGateway(server, remoteClient, options = {}) {
         }
 
         if (isBinary) {
+          context.seenStreamFrame = true;
           try {
             clientSocket.send(rawValue, { binary: true });
           } catch (_error) {
@@ -876,6 +935,10 @@ function createRemoteGateway(server, remoteClient, options = {}) {
 
         if (payload.type === 'ready') {
           sendControl('remote-stream-config', {
+            transport: payload.transport || transport,
+            codec: payload.codec || null,
+            format: payload.format || null,
+            video: payload.video || null,
             fps: Number(payload.fps) || connectionSettings.streamFps,
             jpegQuality: Number(payload.jpegQuality) || connectionSettings.jpegQuality,
             monitors: Array.isArray(payload.monitors) ? payload.monitors : [],
@@ -887,8 +950,11 @@ function createRemoteGateway(server, remoteClient, options = {}) {
 
         if (payload.type === 'stats') {
           const frameStats = {
+            transport: payload.transport || transport,
+            codec: payload.codec || null,
             fps: Number(payload.fps) || 0,
             frameBytes: Number(payload.frameBytes) || 0,
+            bitrateKbps: Number(payload.bitrateKbps) || null,
             captureTs: Number(payload.captureTs) || null,
             captureLatencyMs: Number(payload.captureLatencyMs) || null,
             receivedAt: new Date().toISOString()
@@ -919,6 +985,9 @@ function createRemoteGateway(server, remoteClient, options = {}) {
         }
 
         if (payload.type === 'error') {
+          if (fallbackToJpeg(payload.message || 'video-stream-error')) {
+            return;
+          }
           sendControl('remote-stream-error', {
             message: payload.message || 'stream-error'
           });
@@ -937,6 +1006,10 @@ function createRemoteGateway(server, remoteClient, options = {}) {
         const reason = typeof reasonBuffer === 'string'
           ? reasonBuffer
           : (reasonBuffer ? reasonBuffer.toString('utf8') : '');
+
+        if (fallbackToJpeg(reason || 'video-stream-closed')) {
+          return;
+        }
 
         sendControl('remote-stream-disconnected', {
           code,
@@ -1000,7 +1073,10 @@ function createRemoteGateway(server, remoteClient, options = {}) {
         const requestedQuality = Object.prototype.hasOwnProperty.call(payload, 'quality')
           ? payload.quality
           : payload.jpegQuality;
-        applyStreamSettings(payload.fps, requestedQuality, 'client-toggle');
+        const requestedFps = connectionSettings.transport === 'video'
+          ? (payload.videoFps || payload.fps)
+          : payload.fps;
+        applyStreamSettings(requestedFps, requestedQuality, 'client-toggle');
         return;
       }
 
@@ -1072,9 +1148,11 @@ function createRemoteGateway(server, remoteClient, options = {}) {
         inputRateLimitPerSec,
         inputQueueMax,
         stream: {
+          transport: connectionSettings.transport,
           fps: connectionSettings.streamFps,
           jpegQuality: connectionSettings.jpegQuality,
-          presets: remoteClient.getStreamPresets()
+          presets: remoteClient.getStreamPresets(),
+          video: status.sidecar && status.sidecar.health ? status.sidecar.health.video || null : null
         },
         actions: remoteClient.getRemoteActions(),
         display: status.sidecar && status.sidecar.health ? status.sidecar.health.display || null : null,
