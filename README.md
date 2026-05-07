@@ -1,6 +1,6 @@
 # Local Codex WSL Console
 
-A localhost-first web console for WSL with a session-management scaffold suitable for evolving into a production architecture.
+A Tailscale-first web console for WSL with tmux-backed sessions, Codex session browsing, and optional remote desktop streaming.
 
 ## What is included
 - Per-session tmux-backed terminal state (refresh-safe attach/detach semantics)
@@ -14,9 +14,10 @@ A localhost-first web console for WSL with a session-management scaffold suitabl
   - Metrics now expose `metricsQuality` (`complete|partial|estimated`) and both `activeDurationMs` + `elapsedDurationMs`
 - Session-scoped WebSocket streaming (`/ws?sessionId=...`)
 - Optional remote desktop sidecar integration (`Remote` tab, decoupled from Console)
-  - Browser stream via proxied WS (`/ws/remote`) and short-lived backend tokens
+  - Browser stream via proxied WS (`/ws/remote`) over the same tailnet access boundary
   - View-only by default, with explicit control enable toggle
   - Touch controls for iOS (tap/long-press/drag/two-finger wheel)
+  - Native iOS stream presets, remote cursor relay, live gateway stats, and desktop shortcut actions
 - Idle session cleanup + max session guardrails
 - Graceful shutdown persistence:
   - Server shutdown detaches web clients but keeps tmux sessions alive
@@ -51,20 +52,24 @@ A localhost-first web console for WSL with a session-management scaffold suitabl
 ## Requirements
 - Windows with WSL installed and a default distro configured
 - Node.js 18+
+- Tailscale installed, signed in, and running on the host
 - `tmux` installed inside the runtime environment (usually your WSL distro)
 
-## Run locally
-From a shell where `tmux` is available (typically your WSL distro):
+## Run
+From the project root on the host where the `tailscale` CLI is available:
 ```bash
 npm install
 npm start
 ```
 
-Open:
-- `http://localhost:3000`
+`npm start` verifies Tailscale is running, configures Tailscale Serve for `http://127.0.0.1:<PORT>`, starts the optional remote sidecar when `REMOTE_ENABLED=true`, and then starts the app.
 
-By default the server binds to `127.0.0.1` to stay localhost-only.
-To access from another device on your LAN (for example iPhone), run with `HOST=0.0.0.0` and use your desktop IP in the browser.
+Open the printed tailnet URL:
+```text
+https://<node>.<tailnet>.ts.net
+```
+
+The backend always binds to `127.0.0.1`. Plain `localhost` browser access is rejected; Tailscale Serve identity headers, Tailscale source addresses, and tailnet ACLs are the access layer.
 
 ### Optional `.env` setup
 The server auto-loads `.env` from the project root.
@@ -73,17 +78,19 @@ The server auto-loads `.env` from the project root.
 cp .env.example .env
 ```
 
-Then edit `.env` with your local settings (especially `AUTH_PASSWORD` if auth is enabled).
+Then edit `.env` with your local settings.
 
-### Password lock (recommended for LAN sharing)
-Set in `.env`:
-```bash
-HOST=0.0.0.0
-AUTH_ENABLED=true
-AUTH_PASSWORD=your-strong-password
-```
+### Tailscale access model
+Tailscale is required. Startup fails if `tailscale status --json` cannot prove the node is connected, or if `tailscale serve --bg http://127.0.0.1:<PORT>` cannot be configured.
 
-After restart, unauthenticated users are redirected to `/login`, and both REST + WebSocket traffic require auth.
+HTTP and WebSocket requests are accepted only when they arrive through Tailscale Serve identity headers or from Tailscale source ranges (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`). Local browser requests to `localhost` are blocked.
+
+## Native iOS App
+The SwiftUI iPhone app lives in `ios/OnlineCLI.xcodeproj`. It keeps the existing terminal intact by wrapping the Tailscale-served console in a native `WKWebView`, and it adds a native remote desktop tab that talks directly to `/ws/remote` over the same tailnet URL.
+
+Run `npm start` first, keep Tailscale connected on the iPhone, then open the Xcode project and build the `OnlineCLI` scheme. The app defaults to the printed tailnet URL and can be changed in Settings.
+
+The native remote tab uses the backend's capabilities contract instead of guessing: `/api/remote/capabilities` returns stream presets, supported shortcut actions, live gateway counts, input limits, and display metadata. The WebSocket also accepts `set-stream` messages, so the app can switch between Economy, Balanced, Fluid, and Sharp profiles while connected.
 
 ## Remote Desktop MVP (Windows sidecar)
 Remote desktop is disabled by default and does not affect terminal behavior until enabled.
@@ -96,15 +103,9 @@ REMOTE_AGENT_URL=http://127.0.0.1:3390
 REMOTE_DEFAULT_MODE=view
 ```
 
-### 2) Run the Windows sidecar
-From Windows PowerShell:
-```powershell
-cd remote-agent
-npm install
-npm start
-```
+### 2) Use the `Remote` tab
+When `REMOTE_ENABLED=true`, the main `npm start` command installs missing sidecar dependencies and starts `remote-agent` automatically.
 
-### 3) Use the new `Remote` tab
 - `View only`: stream only, no input execution
 - `Control enabled`: mouse/touch/keyboard routed to desktop
 - `Open Keyboard` button (mobile-friendly) explicitly summons software keyboard for remote typing
@@ -120,12 +121,12 @@ npm start
 If the sidecar is offline or input automation is unavailable, the UI degrades to view-only/offline states and the terminal remains fully usable.
 
 ## Minimal Shared Setup (Desktop + iPhone + Local Terminal)
-1. Start server in WSL:
+1. Start everything:
 ```bash
 npm install
-HOST=0.0.0.0 npm start
+npm start
 ```
-2. Open web console on desktop and iPhone using `http://<desktop-ip>:3000`.
+2. Open the printed `https://<node>.<tailnet>.ts.net` URL on desktop or iPhone while Tailscale is connected.
 3. Create/select a session in each web client using the session picker.
 4. Click `Copy Attach Cmd` for the selected session and run it in a local terminal to attach to that exact session.
 
@@ -140,8 +141,8 @@ HOST=0.0.0.0 npm start
 - Windows helper script: `scripts/tailscale-serve.ps1`
 
 Quick command example:
-```powershell
-tailscale serve --bg 3000
+```bash
+npm start
 ```
 
 ## Troubleshooting
@@ -167,17 +168,13 @@ npm install
 - `POST /api/codex/sessions/:codexSessionId/resume`
 - `GET /api/remote/status`
 - `GET /api/remote/capabilities`
-- `POST /api/remote/token`
-- `WS /ws/remote?token=...`
+  - Includes stream presets, supported desktop actions, display metadata, and live remote gateway stats
+- `WS /ws/remote?mode=view|control`
+  - Optional query params: `fps`, `quality`
+  - Client control messages: `set-mode`, `set-stream`, `input`, `ping`
 
 ## Environment options
-- `HOST` (default: `127.0.0.1`)
 - `PORT` (default: `3000`)
-- `AUTH_ENABLED` (default: `false`; when `true`, `/login` password gate protects the app)
-- `AUTH_PASSWORD` (required when `AUTH_ENABLED=true`)
-- `AUTH_COOKIE_NAME` (default: `online_cli_auth`)
-- `AUTH_SESSION_TTL_MS` (default: `43200000` / 12 hours)
-- `AUTH_COOKIE_SECURE` (default: `false`; set `true` when serving via HTTPS)
 - `REMOTE_ENABLED` (default: `false`; enables backend remote proxy + UI tab)
 - `REMOTE_AGENT_URL` (default: `http://127.0.0.1:3390`)
 - `REMOTE_DEFAULT_MODE` (`view|control`, default: `view`)
@@ -185,7 +182,6 @@ npm install
 - `REMOTE_JPEG_QUALITY` (default: `55`)
 - `REMOTE_INPUT_RATE_LIMIT_PER_SEC` (default: `120`)
 - `REMOTE_INPUT_MAX_QUEUE` (default: `300`)
-- `REMOTE_TOKEN_TTL_MS` (default: `60000`)
 - `MAX_SESSIONS` (default: `24`)
 - `SESSION_IDLE_TIMEOUT_MS` (default: `2700000`)
 - `SESSION_SWEEP_INTERVAL_MS` (default: `60000`)
@@ -208,17 +204,17 @@ npm install
 - `CODEX_EXTRA_SESSIONS_DIRS` (optional `;`-delimited extra Codex session dirs)
 
 ## Code layout
-- `server.js`: entry point
+- `server.js`: startup entry point
+- `scripts/start.js`: Tailscale Serve + optional remote sidecar orchestrator
 - `src/server.js`: app bootstrap + graceful shutdown
 - `src/config.js`: runtime config parsing
-- `src/auth/authManager.js`: password auth session manager (cookie-based)
-- `src/http/authRoutes.js`: login/status/logout endpoints
-- `src/http/remoteRoutes.js`: remote status/capability/token endpoints
+- `src/network/tailscaleAccess.js`: loopback/Tailscale source and same-origin access checks
+- `src/http/remoteRoutes.js`: remote status/capability endpoints
 - `src/sessions/`: tmux-backed session runtime and manager
 - `src/codex/codexSessionIndex.js`: parses local Codex JSONL sessions and metrics
 - `src/ws/sessionGateway.js`: WebSocket routing and heartbeats
-- `src/ws/remoteGateway.js`: authenticated remote stream/control websocket proxy
-- `src/remote/remoteClient.js`: sidecar health/token/connection helper
+- `src/ws/remoteGateway.js`: tailnet-gated remote stream/control websocket proxy
+- `src/remote/remoteClient.js`: sidecar health/connection helper
 - `src/http/sessionRoutes.js`: session API
 - `public/`: browser app and styles
 - `remote-agent/`: Windows host sidecar service (desktop capture + input automation)

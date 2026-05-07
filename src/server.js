@@ -5,8 +5,7 @@ const express = require('express');
 const config = require('./config');
 const { createLogger } = require('./logger');
 const { SessionManager } = require('./sessions/sessionManager');
-const { createAuthManager } = require('./auth/authManager');
-const { createAuthRoutes } = require('./http/authRoutes');
+const { createTailscaleAccess } = require('./network/tailscaleAccess');
 const { createSessionRoutes } = require('./http/sessionRoutes');
 const { createRemoteRoutes } = require('./http/remoteRoutes');
 const { createRemoteClient } = require('./remote/remoteClient');
@@ -14,24 +13,21 @@ const { createSessionGateway } = require('./ws/sessionGateway');
 const { createRemoteGateway } = require('./ws/remoteGateway');
 const { CodexSessionIndex } = require('./codex/codexSessionIndex');
 
-function startServer() {
+function startServer(options = {}) {
   const logger = createLogger(config.logLevel);
   const publicDir = path.join(__dirname, '..', 'public');
 
   const app = express();
   app.disable('x-powered-by');
 
-  app.use(express.json({ limit: '128kb' }));
-
-  const authManager = createAuthManager({
-    enabled: config.authEnabled,
-    password: config.authPassword,
-    cookieName: config.authCookieName,
-    sessionTtlMs: config.authSessionTtlMs,
-    cookieSecure: config.authCookieSecure,
+  const tailscaleAccess = createTailscaleAccess({
+    tailnetHost: config.tailnetHost,
     logger
   });
-  authManager.logAuthEnabled();
+  tailscaleAccess.logAccessMode();
+
+  app.use(tailscaleAccess.requireHttpAccess());
+  app.use(express.json({ limit: '128kb' }));
 
   const remoteClient = createRemoteClient({
     enabled: config.remoteEnabled,
@@ -41,7 +37,6 @@ function startServer() {
     jpegQuality: config.remoteJpegQuality,
     inputRateLimitPerSec: config.remoteInputRateLimitPerSec,
     inputMaxQueue: config.remoteInputMaxQueue,
-    tokenTtlMs: config.remoteTokenTtlMs,
     healthTimeoutMs: config.remoteHealthTimeoutMs,
     logger
   });
@@ -50,19 +45,8 @@ function startServer() {
   app.use('/vendor/xterm', express.static(path.join(__dirname, '..', 'node_modules', 'xterm', 'lib')));
   app.use('/vendor/xterm-addon-fit', express.static(path.join(__dirname, '..', 'node_modules', 'xterm-addon-fit', 'lib')));
   app.use('/vendor/xterm-css', express.static(path.join(__dirname, '..', 'node_modules', 'xterm', 'css')));
-  app.use('/api/auth', createAuthRoutes(authManager));
 
-  app.get('/login', (req, res) => {
-    if (!authManager.isEnabled()) {
-      return res.redirect('/');
-    }
-    if (authManager.isAuthenticatedRequest(req)) {
-      return res.redirect('/');
-    }
-    return res.sendFile(path.join(publicDir, 'login.html'));
-  });
-
-  app.get('/', authManager.requirePageAuth(), (_req, res) => {
+  app.get('/', (_req, res) => {
     res.sendFile(path.join(publicDir, 'index.html'));
   });
 
@@ -90,8 +74,7 @@ function startServer() {
     defaultShell: config.defaultShell
   });
 
-  app.use('/api', authManager.requireApiAuth());
-  app.use('/api', createRemoteRoutes(remoteClient, { logger }));
+  app.use('/api', createRemoteRoutes(remoteClient));
   app.use('/api', createSessionRoutes(sessionManager, codexSessionIndex));
 
   app.use((error, _req, res, _next) => {
@@ -110,12 +93,12 @@ function startServer() {
   const sessionGateway = createSessionGateway(server, sessionManager, {
     logger,
     wsHeartbeatMs: config.wsHeartbeatMs,
-    authManager
+    accessManager: tailscaleAccess
   });
   const remoteGateway = createRemoteGateway(server, remoteClient, {
     logger,
     wsHeartbeatMs: config.wsHeartbeatMs,
-    authManager
+    accessManager: tailscaleAccess
   });
 
   server.on('upgrade', (req, socket, head) => {
@@ -144,11 +127,25 @@ function startServer() {
       url: `http://${config.host}:${config.port}`,
       defaultSessionId: sessionManager.defaultSessionId
     });
+
+    if (typeof options.onListening === 'function') {
+      try {
+        options.onListening({
+          host: config.host,
+          port: config.port,
+          defaultSessionId: sessionManager.defaultSessionId
+        });
+      } catch (error) {
+        logger.warn('Listening hook failed', {
+          message: error && error.message ? error.message : 'listening-hook-error'
+        });
+      }
+    }
   });
 
   let shuttingDown = false;
 
-  function shutdown(signal) {
+  function shutdown(signal, exitCode = 0) {
     if (shuttingDown) return;
     shuttingDown = true;
 
@@ -157,7 +154,15 @@ function startServer() {
     sessionGateway.close();
     remoteGateway.close();
     remoteClient.close();
-    authManager.close();
+    if (typeof options.beforeShutdown === 'function') {
+      try {
+        options.beforeShutdown(signal);
+      } catch (error) {
+        logger.warn('Shutdown hook failed', {
+          message: error && error.message ? error.message : 'shutdown-hook-error'
+        });
+      }
+    }
     sessionManager.stop({
       persistState: true,
       preserveTmux: true,
@@ -166,7 +171,7 @@ function startServer() {
 
     server.close(() => {
       logger.info('Server stopped');
-      process.exit(0);
+      process.exit(exitCode);
     });
 
     setTimeout(() => {

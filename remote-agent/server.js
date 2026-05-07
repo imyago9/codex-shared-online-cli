@@ -817,6 +817,7 @@ function createNutInputController(nut, displayBounds, logger) {
     PageUp: ['PageUp'],
     PageDown: ['PageDown'],
     Insert: ['Insert'],
+    PrintScreen: ['PrintScreen', 'Print'],
     F1: ['F1'],
     F2: ['F2'],
     F3: ['F3'],
@@ -851,7 +852,9 @@ function createNutInputController(nut, displayBounds, logger) {
     home: ['Home'],
     end: ['End'],
     pageup: ['PageUp'],
-    pagedown: ['PageDown']
+    pagedown: ['PageDown'],
+    printscreen: ['PrintScreen', 'Print'],
+    print: ['PrintScreen', 'Print']
   };
 
   function resolveCharacterKey(keyValue) {
@@ -1148,6 +1151,7 @@ function resolveWindowsVirtualKey(event) {
     PageUp: 0x21,
     PageDown: 0x22,
     Insert: 0x2D,
+    PrintScreen: 0x2C,
     F1: 0x70,
     F2: 0x71,
     F3: 0x72,
@@ -1182,7 +1186,9 @@ function resolveWindowsVirtualKey(event) {
     home: 0x24,
     end: 0x23,
     pageup: 0x21,
-    pagedown: 0x22
+    pagedown: 0x22,
+    printscreen: 0x2C,
+    print: 0x2C
   };
 
   const code = typeof event.code === 'string' ? event.code.trim() : '';

@@ -103,7 +103,7 @@ function resolveDefaultShell() {
 loadEnvFile(path.join(process.cwd(), '.env'));
 
 const config = {
-  host: process.env.HOST || '127.0.0.1',
+  host: '127.0.0.1',
   port: parseInteger(process.env.PORT, 3000),
   defaultCols: parseInteger(process.env.DEFAULT_COLS, 120),
   defaultRows: parseInteger(process.env.DEFAULT_ROWS, 30),
@@ -119,11 +119,7 @@ const config = {
   tmuxHistoryLimit: Math.max(parseInteger(process.env.TMUX_HISTORY_LIMIT, 200_000), 2_000),
   tmuxMouseMode: parseBoolean(process.env.TMUX_MOUSE_MODE, true),
   singleConsoleMode: parseBoolean(process.env.SINGLE_CONSOLE_MODE, false),
-  authEnabled: parseBoolean(process.env.AUTH_ENABLED, false),
-  authPassword: process.env.AUTH_PASSWORD || '',
-  authCookieName: process.env.AUTH_COOKIE_NAME || 'online_cli_auth',
-  authSessionTtlMs: Math.max(parseInteger(process.env.AUTH_SESSION_TTL_MS, 12 * 60 * 60 * 1000), 60_000),
-  authCookieSecure: parseBoolean(process.env.AUTH_COOKIE_SECURE, false),
+  tailnetHost: process.env.TAILSCALE_DNS_NAME || '',
   remoteEnabled: parseBoolean(process.env.REMOTE_ENABLED, false),
   remoteAgentUrl: process.env.REMOTE_AGENT_URL || 'http://127.0.0.1:3390',
   remoteDefaultMode: parseRemoteMode(process.env.REMOTE_DEFAULT_MODE, 'view'),
@@ -131,7 +127,6 @@ const config = {
   remoteJpegQuality: clampInteger(parseInteger(process.env.REMOTE_JPEG_QUALITY, 55), 20, 95),
   remoteInputRateLimitPerSec: clampInteger(parseInteger(process.env.REMOTE_INPUT_RATE_LIMIT_PER_SEC, 120), 10, 600),
   remoteInputMaxQueue: clampInteger(parseInteger(process.env.REMOTE_INPUT_MAX_QUEUE, 300), 20, 2_000),
-  remoteTokenTtlMs: clampInteger(parseInteger(process.env.REMOTE_TOKEN_TTL_MS, 60_000), 5_000, 10 * 60 * 1000),
   remoteHealthTimeoutMs: clampInteger(parseInteger(process.env.REMOTE_HEALTH_TIMEOUT_MS, 2_500), 500, 10_000),
   sessionStateFile: process.env.SESSION_STATE_FILE
     ? path.resolve(process.env.SESSION_STATE_FILE)

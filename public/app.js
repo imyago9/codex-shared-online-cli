@@ -124,7 +124,7 @@ const terminalPopoutState = {
 };
 
 const wsTextDecoder = new TextDecoder();
-let redirectingToLogin = false;
+let accessDeniedShown = false;
 
 const term = new Terminal({
   cursorBlink: true,
@@ -668,12 +668,13 @@ function setCodexStatus(text) {
   codexStatusElement.textContent = text || '';
 }
 
-function redirectToLogin() {
-  if (redirectingToLogin) {
+function showAccessDenied() {
+  if (accessDeniedShown) {
     return;
   }
-  redirectingToLogin = true;
-  window.location.replace('/login');
+  accessDeniedShown = true;
+  setStatus('Tailscale access required', 'disconnected');
+  setHint('Connect to Tailscale and reload this page.');
 }
 
 function updateActiveSessionHint() {
@@ -1369,8 +1370,8 @@ async function requestJson(path, options = {}) {
   }
 
   if (!response.ok) {
-    if (response.status === 401) {
-      redirectToLogin();
+    if (response.status === 401 || response.status === 403) {
+      showAccessDenied();
     }
     throw new Error(payload && payload.error ? payload.error : `Request failed (${response.status})`);
   }
@@ -1518,7 +1519,7 @@ function connectSocket() {
     state.socket = null;
 
     if (event && event.code === 1008) {
-      redirectToLogin();
+      showAccessDenied();
       return;
     }
 

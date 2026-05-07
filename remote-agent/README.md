@@ -10,10 +10,12 @@ This sidecar runs on the Windows host and exposes desktop streaming + input cont
 ## Why this exists
 The main app can run inside WSL, but Windows desktop capture/control must execute on the Windows host. This sidecar keeps those responsibilities isolated.
 
-## Quick start (Windows host)
+## Startup
+Set `REMOTE_ENABLED=true` in the main app `.env`, then run `npm start` from the repository root. The main startup script installs missing sidecar dependencies and starts this process automatically.
+
+Manual sidecar startup is still useful for debugging:
 ```powershell
 cd remote-agent
-npm install
 npm start
 ```
 
@@ -37,4 +39,4 @@ If both `nut-js` and the PowerShell fallback are unavailable, the sidecar starts
 
 ## Notes
 - Keep this service private to localhost/Tailscale.
-- The main app issues short-lived remote tokens; clients should connect through the main app, not directly to this sidecar.
+- Browser clients should connect through the main app over Tailscale, not directly to this sidecar.

@@ -198,19 +198,35 @@ function controlEnvelope(type, payload = {}) {
 
 function createRemoteGateway(server, remoteClient, options = {}) {
   const logger = options.logger;
-  const authManager = options.authManager;
+  const accessManager = options.accessManager;
   const heartbeatMs = toBoundedInteger(options.wsHeartbeatMs, 30_000, 10_000, 120_000);
   const defaults = remoteClient.getDefaults();
 
   const wss = new WebSocketServer({ noServer: true });
+  const activeContexts = new Map();
 
   function heartbeat() {
     this.isAlive = true;
   }
 
-  wss.on('connection', (clientSocket, req) => {
-    if (authManager && authManager.isEnabled() && !authManager.isAuthenticatedRequest(req)) {
-      clientSocket.close(1008, 'Authentication required');
+  function publishGatewaySnapshot(extra = {}) {
+    const contexts = Array.from(activeContexts.values()).filter((context) => !context.closed);
+    const controlConnections = contexts.filter((context) => context.mode === 'control').length;
+    const droppedEvents = contexts.reduce((total, context) => total + context.droppedEvents, 0);
+
+    remoteClient.updateGatewaySnapshot({
+      activeConnections: contexts.length,
+      controlConnections,
+      viewConnections: contexts.length - controlConnections,
+      droppedEvents,
+      ...extra
+    });
+  }
+
+  wss.on('connection', async (clientSocket, req) => {
+    const access = accessManager ? accessManager.checkRequest(req) : { allowed: true };
+    if (!access.allowed) {
+      clientSocket.close(1008, access.message || 'Tailscale connection required');
       return;
     }
 
@@ -219,12 +235,34 @@ function createRemoteGateway(server, remoteClient, options = {}) {
       return;
     }
 
-    const sessionToken = parseQueryValue(req, 'token');
-    const token = remoteClient.consumeSessionToken(sessionToken || '');
-    if (!token) {
-      clientSocket.close(1008, 'Invalid or expired remote token');
+    let status = null;
+    try {
+      status = await remoteClient.getStatus({ forceHealthCheck: true });
+    } catch (error) {
+      clientSocket.close(1013, 'Remote status unavailable');
       return;
     }
+
+    if (!isWsOpen(clientSocket)) {
+      return;
+    }
+
+    if (!status || !status.sidecar || status.sidecar.reachable !== true) {
+      clientSocket.close(1013, 'Remote sidecar unavailable');
+      return;
+    }
+
+    const requestedMode = normalizeMode(parseQueryValue(req, 'mode'), defaults.defaultMode);
+    const requestedStreamFps = toBoundedInteger(parseQueryValue(req, 'fps'), defaults.streamFps, 1, 20);
+    const requestedJpegQuality = toBoundedInteger(parseQueryValue(req, 'quality'), defaults.jpegQuality, 20, 95);
+    const controlAllowed = status.sidecar.inputAvailable === true;
+    let connectionSettings = {
+      mode: requestedMode === 'control' && controlAllowed ? 'control' : 'view',
+      requestedMode,
+      controlAllowed,
+      streamFps: requestedStreamFps,
+      jpegQuality: requestedJpegQuality
+    };
 
     const remoteConnectionId = crypto.randomUUID();
     const connectionMeta = {
@@ -236,8 +274,8 @@ function createRemoteGateway(server, remoteClient, options = {}) {
       closed: false,
       streamSocket: null,
       inputSocket: null,
-      mode: normalizeMode(token.mode, 'view'),
-      controlAllowed: token.controlAllowed === true,
+      mode: normalizeMode(connectionSettings.mode, 'view'),
+      controlAllowed: connectionSettings.controlAllowed === true,
       inputQueue: [],
       inputFlushTimer: null,
       rateWindowStartedAt: Date.now(),
@@ -245,8 +283,14 @@ function createRemoteGateway(server, remoteClient, options = {}) {
       droppedEvents: 0,
       lastThrottleNoticeAt: 0,
       lastBackpressureNoticeAt: 0,
+      lastFrameStats: null,
       lastInputError: null
     };
+    activeContexts.set(remoteConnectionId, context);
+    publishGatewaySnapshot({
+      totalConnections: (remoteClient.getGatewaySnapshot().totalConnections || 0) + 1,
+      lastConnectedAt: new Date().toISOString()
+    });
 
     clientSocket.isAlive = true;
     clientSocket.on('pong', heartbeat);
@@ -313,6 +357,11 @@ function createRemoteGateway(server, remoteClient, options = {}) {
       clearInputFlushTimer();
       context.inputQueue.length = 0;
       cleanupSidecarSockets();
+      activeContexts.delete(remoteConnectionId);
+      publishGatewaySnapshot({
+        lastDisconnectedAt: new Date().toISOString(),
+        lastInputError: context.lastInputError
+      });
 
       if (logger) {
         logger.info('Remote websocket disconnected', {
@@ -336,6 +385,7 @@ function createRemoteGateway(server, remoteClient, options = {}) {
       }
 
       context.mode = effectiveMode;
+      publishGatewaySnapshot();
       sendControl('remote-mode', {
         mode: context.mode,
         controlAllowed: context.controlAllowed,
@@ -357,6 +407,44 @@ function createRemoteGateway(server, remoteClient, options = {}) {
       if (context.mode === 'control') {
         ensureInputSocket();
       }
+    }
+
+    function applyStreamSettings(nextFps, nextQuality, reason) {
+      const streamFps = toBoundedInteger(nextFps, connectionSettings.streamFps, 1, 20);
+      const jpegQuality = toBoundedInteger(nextQuality, connectionSettings.jpegQuality, 20, 95);
+      const changed = streamFps !== connectionSettings.streamFps || jpegQuality !== connectionSettings.jpegQuality;
+
+      connectionSettings = {
+        ...connectionSettings,
+        streamFps,
+        jpegQuality
+      };
+
+      sendControl('remote-stream-config', {
+        fps: connectionSettings.streamFps,
+        jpegQuality: connectionSettings.jpegQuality,
+        reason: reason || null
+      });
+
+      publishGatewaySnapshot();
+
+      if (!changed || context.closed) {
+        return;
+      }
+
+      const previousStreamSocket = context.streamSocket;
+      context.streamSocket = null;
+      if (previousStreamSocket && (
+        previousStreamSocket.readyState === WebSocket.OPEN
+        || previousStreamSocket.readyState === WebSocket.CONNECTING
+      )) {
+        try {
+          previousStreamSocket.close(1000, 'stream-settings-changed');
+        } catch (_error) {
+          // Ignore close races.
+        }
+      }
+      bindStreamSocket();
     }
 
     function consumeRateBudget() {
@@ -487,6 +575,7 @@ function createRemoteGateway(server, remoteClient, options = {}) {
 
         if (payload.type === 'error' && payload.message) {
           context.lastInputError = String(payload.message);
+          publishGatewaySnapshot({ lastInputError: context.lastInputError });
           sendControl('remote-input-error', {
             message: context.lastInputError
           });
@@ -530,8 +619,8 @@ function createRemoteGateway(server, remoteClient, options = {}) {
 
     function bindStreamSocket() {
       const streamSocket = remoteClient.openStreamSocket({
-        fps: token.streamFps,
-        quality: token.jpegQuality
+        fps: connectionSettings.streamFps,
+        quality: connectionSettings.jpegQuality
       });
       context.streamSocket = streamSocket;
 
@@ -541,8 +630,8 @@ function createRemoteGateway(server, remoteClient, options = {}) {
         }
 
         sendControl('remote-stream-connected', {
-          fps: token.streamFps,
-          jpegQuality: token.jpegQuality
+          fps: connectionSettings.streamFps,
+          jpegQuality: connectionSettings.jpegQuality
         });
       });
 
@@ -577,11 +666,17 @@ function createRemoteGateway(server, remoteClient, options = {}) {
         }
 
         if (payload.type === 'stats') {
-          sendControl('remote-stats', {
+          const frameStats = {
             fps: Number(payload.fps) || 0,
             frameBytes: Number(payload.frameBytes) || 0,
             captureTs: Number(payload.captureTs) || null,
-            captureLatencyMs: Number(payload.captureLatencyMs) || null
+            captureLatencyMs: Number(payload.captureLatencyMs) || null,
+            receivedAt: new Date().toISOString()
+          };
+          context.lastFrameStats = frameStats;
+          publishGatewaySnapshot({ lastFrameStats: frameStats });
+          sendControl('remote-stats', {
+            ...frameStats
           });
           return;
         }
@@ -679,6 +774,14 @@ function createRemoteGateway(server, remoteClient, options = {}) {
         return;
       }
 
+      if (rawType === 'set-stream' || rawType === 'remote:set-stream') {
+        const requestedQuality = Object.prototype.hasOwnProperty.call(payload, 'quality')
+          ? payload.quality
+          : payload.jpegQuality;
+        applyStreamSettings(payload.fps, requestedQuality, 'client-toggle');
+        return;
+      }
+
       if (rawType === 'ping' || rawType === 'remote:ping') {
         sendControl('remote-pong', { ts: Date.now() });
         return;
@@ -731,20 +834,32 @@ function createRemoteGateway(server, remoteClient, options = {}) {
         controlAllowed: context.controlAllowed,
         inputRateLimitPerSec,
         inputQueueMax,
-        tokenExpiresAt: token.expiresAt
+        stream: {
+          fps: connectionSettings.streamFps,
+          jpegQuality: connectionSettings.jpegQuality,
+          presets: remoteClient.getStreamPresets()
+        },
+        actions: remoteClient.getRemoteActions(),
+        display: status.sidecar && status.sidecar.health ? status.sidecar.health.display || null : null,
+        sidecar: {
+          reachable: status.sidecar.reachable === true,
+          inputAvailable: status.sidecar.inputAvailable === true,
+          platform: status.sidecar.health ? status.sidecar.health.platform || null : null
+        },
+        gateway: remoteClient.getGatewaySnapshot()
       });
     }
 
     if (logger) {
       logger.info('Remote websocket connected', {
         ...connectionMeta,
-        requestedMode: token.requestedMode,
+        requestedMode: connectionSettings.requestedMode,
         mode: context.mode,
         controlAllowed: context.controlAllowed
       });
     }
 
-    applyMode(token.mode, 'token-default');
+    applyMode(connectionSettings.mode, 'client-default');
   });
 
   const pingInterval = setInterval(() => {

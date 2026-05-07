@@ -1,3 +1,6 @@
-const { startServer } = require('./src/server');
+const { start } = require('./scripts/start');
 
-startServer();
+start().catch((error) => {
+  console.error(`[startup] ${error.message}`);
+  process.exit(1);
+});

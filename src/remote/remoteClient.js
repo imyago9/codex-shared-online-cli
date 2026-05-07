@@ -1,5 +1,47 @@
-const crypto = require('crypto');
 const { WebSocket } = require('ws');
+
+const STREAM_PRESETS = [
+  {
+    id: 'economy',
+    label: 'Economy',
+    fps: 4,
+    jpegQuality: 42,
+    intent: 'Lower bandwidth and calmer battery use'
+  },
+  {
+    id: 'balanced',
+    label: 'Balanced',
+    fps: 8,
+    jpegQuality: 58,
+    intent: 'Good default for iPhone remote control'
+  },
+  {
+    id: 'fluid',
+    label: 'Fluid',
+    fps: 14,
+    jpegQuality: 58,
+    intent: 'Smoother pointer movement'
+  },
+  {
+    id: 'sharp',
+    label: 'Sharp',
+    fps: 8,
+    jpegQuality: 78,
+    intent: 'More readable text and UI detail'
+  }
+];
+
+const REMOTE_ACTIONS = [
+  { id: 'copy', label: 'Copy', key: 'c', code: 'KeyC', modifiers: { ctrl: true } },
+  { id: 'paste', label: 'Paste', key: 'v', code: 'KeyV', modifiers: { ctrl: true } },
+  { id: 'selectAll', label: 'Select All', key: 'a', code: 'KeyA', modifiers: { ctrl: true } },
+  { id: 'altTab', label: 'Alt Tab', key: 'Tab', code: 'Tab', modifiers: { alt: true } },
+  { id: 'winTab', label: 'Win Tab', key: 'Tab', code: 'Tab', modifiers: { meta: true } },
+  { id: 'showDesktop', label: 'Show Desktop', key: 'd', code: 'KeyD', modifiers: { meta: true } },
+  { id: 'taskManager', label: 'Task Manager', key: 'Escape', code: 'Escape', modifiers: { ctrl: true, shift: true } },
+  { id: 'lock', label: 'Lock', key: 'l', code: 'KeyL', modifiers: { meta: true } },
+  { id: 'screenshot', label: 'Screenshot', key: 'PrintScreen', code: 'PrintScreen', modifiers: {} }
+];
 
 function normalizeMode(rawValue, fallback = 'view') {
   const normalized = typeof rawValue === 'string' ? rawValue.trim().toLowerCase() : '';
@@ -46,20 +88,26 @@ class RemoteClient {
     this.jpegQuality = toSafeInteger(options.jpegQuality, 55, 20, 95);
     this.inputRateLimitPerSec = toSafeInteger(options.inputRateLimitPerSec, 120, 10, 600);
     this.inputMaxQueue = toSafeInteger(options.inputMaxQueue, 300, 20, 2_000);
-    this.tokenTtlMs = toSafeInteger(options.tokenTtlMs, 60_000, 5_000, 10 * 60 * 1000);
     this.healthTimeoutMs = toSafeInteger(options.healthTimeoutMs, 2_500, 500, 10_000);
 
-    this.sessionTokens = new Map();
     this.healthCache = {
       fetchedAt: 0,
       result: null,
       inFlight: null
     };
 
-    this.tokenCleanupTimer = setInterval(() => {
-      this.pruneExpiredTokens();
-    }, Math.max(5_000, Math.min(this.tokenTtlMs, 60_000)));
-    this.tokenCleanupTimer.unref();
+    this.gatewaySnapshot = {
+      activeConnections: 0,
+      viewConnections: 0,
+      controlConnections: 0,
+      totalConnections: 0,
+      droppedEvents: 0,
+      lastConnectedAt: null,
+      lastDisconnectedAt: null,
+      lastFrameStats: null,
+      lastInputError: null,
+      updatedAt: null
+    };
   }
 
   isEnabled() {
@@ -73,8 +121,35 @@ class RemoteClient {
       jpegQuality: this.jpegQuality,
       inputRateLimitPerSec: this.inputRateLimitPerSec,
       inputMaxQueue: this.inputMaxQueue,
-      tokenTtlMs: this.tokenTtlMs,
       agentUrl: this.agentUrl
+    };
+  }
+
+  getStreamPresets() {
+    return STREAM_PRESETS.map((preset) => ({ ...preset }));
+  }
+
+  getRemoteActions() {
+    return REMOTE_ACTIONS.map((action) => ({
+      ...action,
+      modifiers: { ...(action.modifiers || {}) }
+    }));
+  }
+
+  getGatewaySnapshot() {
+    return {
+      ...this.gatewaySnapshot,
+      lastFrameStats: this.gatewaySnapshot.lastFrameStats
+        ? { ...this.gatewaySnapshot.lastFrameStats }
+        : null
+    };
+  }
+
+  updateGatewaySnapshot(patch = {}) {
+    this.gatewaySnapshot = {
+      ...this.gatewaySnapshot,
+      ...patch,
+      updatedAt: new Date().toISOString()
     };
   }
 
@@ -99,76 +174,6 @@ class RemoteClient {
     }
 
     return url.toString();
-  }
-
-  issueSessionToken(options = {}) {
-    const token = crypto.randomBytes(24).toString('hex');
-    const requestedMode = normalizeMode(options.mode, this.defaultMode);
-    const controlAllowed = options.controlAllowed === true;
-    const mode = requestedMode === 'control' && controlAllowed ? 'control' : 'view';
-    const now = Date.now();
-
-    const payload = {
-      mode,
-      requestedMode,
-      controlAllowed,
-      streamFps: toSafeInteger(options.streamFps, this.streamFps, 1, 20),
-      jpegQuality: toSafeInteger(options.jpegQuality, this.jpegQuality, 20, 95),
-      issuedAt: new Date(now).toISOString(),
-      expiresAt: new Date(now + this.tokenTtlMs).toISOString(),
-      meta: {
-        ip: options.ip || null,
-        userAgent: options.userAgent || null
-      }
-    };
-
-    this.sessionTokens.set(token, {
-      ...payload,
-      expiresAtMs: now + this.tokenTtlMs
-    });
-
-    return {
-      token,
-      ...payload,
-      ttlMs: this.tokenTtlMs
-    };
-  }
-
-  consumeSessionToken(token) {
-    if (typeof token !== 'string' || token.length < 20 || token.length > 160) {
-      return null;
-    }
-
-    const entry = this.sessionTokens.get(token);
-    if (!entry) {
-      return null;
-    }
-
-    this.sessionTokens.delete(token);
-    if (!Number.isFinite(entry.expiresAtMs) || entry.expiresAtMs <= Date.now()) {
-      return null;
-    }
-
-    return {
-      token,
-      mode: entry.mode,
-      requestedMode: entry.requestedMode,
-      controlAllowed: entry.controlAllowed,
-      streamFps: entry.streamFps,
-      jpegQuality: entry.jpegQuality,
-      issuedAt: entry.issuedAt,
-      expiresAt: entry.expiresAt,
-      meta: entry.meta || {}
-    };
-  }
-
-  pruneExpiredTokens() {
-    const now = Date.now();
-    for (const [token, entry] of this.sessionTokens.entries()) {
-      if (!entry || !Number.isFinite(entry.expiresAtMs) || entry.expiresAtMs <= now) {
-        this.sessionTokens.delete(token);
-      }
-    }
   }
 
   async checkAgentHealth(options = {}) {
@@ -266,7 +271,9 @@ class RemoteClient {
       jpegQuality: this.jpegQuality,
       inputRateLimitPerSec: this.inputRateLimitPerSec,
       inputMaxQueue: this.inputMaxQueue,
-      tokenTtlMs: this.tokenTtlMs,
+      streamPresets: this.getStreamPresets(),
+      actions: this.getRemoteActions(),
+      gateway: this.getGatewaySnapshot(),
       sidecar: {
         url: this.agentUrl,
         reachable: health.reachable === true,
@@ -275,6 +282,38 @@ class RemoteClient {
         reason: health.reason || null,
         health: health.health || null
       }
+    };
+  }
+
+  getCapabilities(status) {
+    const resolvedStatus = status || {
+      enabled: this.enabled,
+      defaultMode: this.defaultMode,
+      streamFps: this.streamFps,
+      jpegQuality: this.jpegQuality,
+      inputRateLimitPerSec: this.inputRateLimitPerSec,
+      inputMaxQueue: this.inputMaxQueue,
+      sidecar: {
+        reachable: false,
+        inputAvailable: false
+      }
+    };
+
+    return {
+      enabled: resolvedStatus.enabled === true,
+      defaultMode: resolvedStatus.defaultMode || this.defaultMode,
+      sidecarReachable: Boolean(resolvedStatus.sidecar && resolvedStatus.sidecar.reachable === true),
+      controlAvailable: Boolean(resolvedStatus.sidecar && resolvedStatus.sidecar.inputAvailable === true),
+      streamFps: resolvedStatus.streamFps || this.streamFps,
+      jpegQuality: resolvedStatus.jpegQuality || this.jpegQuality,
+      inputRateLimitPerSec: resolvedStatus.inputRateLimitPerSec || this.inputRateLimitPerSec,
+      inputMaxQueue: resolvedStatus.inputMaxQueue || this.inputMaxQueue,
+      streamPresets: this.getStreamPresets(),
+      actions: this.getRemoteActions(),
+      display: resolvedStatus.sidecar && resolvedStatus.sidecar.health
+        ? resolvedStatus.sidecar.health.display || null
+        : null,
+      gateway: this.getGatewaySnapshot()
     };
   }
 
@@ -297,11 +336,6 @@ class RemoteClient {
   }
 
   close() {
-    if (this.tokenCleanupTimer) {
-      clearInterval(this.tokenCleanupTimer);
-      this.tokenCleanupTimer = null;
-    }
-    this.sessionTokens.clear();
     this.healthCache.result = null;
     this.healthCache.inFlight = null;
     this.healthCache.fetchedAt = 0;

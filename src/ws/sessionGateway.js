@@ -13,7 +13,7 @@ function getSessionIdFromRequest(req) {
 function createSessionGateway(server, sessionManager, options) {
   const logger = options.logger;
   const heartbeatMs = options.wsHeartbeatMs;
-  const authManager = options.authManager;
+  const accessManager = options.accessManager;
 
   const wss = new WebSocketServer({ noServer: true });
 
@@ -22,8 +22,9 @@ function createSessionGateway(server, sessionManager, options) {
   }
 
   wss.on('connection', (ws, req) => {
-    if (authManager && authManager.isEnabled() && !authManager.isAuthenticatedRequest(req)) {
-      ws.close(1008, 'Authentication required');
+    const access = accessManager ? accessManager.checkRequest(req) : { allowed: true };
+    if (!access.allowed) {
+      ws.close(1008, access.message || 'Tailscale connection required');
       return;
     }
 

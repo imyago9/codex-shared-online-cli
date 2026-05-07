@@ -943,10 +943,6 @@
     }
 
     if (!response.ok) {
-      if (response.status === 401) {
-        window.location.assign('/login');
-        throw new Error('Authentication required');
-      }
       throw new Error(payload && payload.error ? payload.error : `Request failed (${response.status})`);
     }
 
@@ -1440,15 +1436,6 @@
     }
   }
 
-  async function requestRemoteToken() {
-    return requestJson('/api/remote/token', {
-      method: 'POST',
-      body: JSON.stringify({
-        mode: state.desiredMode
-      })
-    });
-  }
-
   async function ensureRemoteSocket() {
     if (!isRemoteViewActive()) {
       return;
@@ -1474,19 +1461,9 @@
       setOverlayText('Connecting to remote stream...');
     }
 
-    let tokenPayload = null;
-    try {
-      tokenPayload = await requestRemoteToken();
-    } catch (error) {
-      setConnectionState('Token request failed', 'disconnected');
-      setOverlayText(`Could not start remote stream: ${error.message}`);
-      scheduleReconnect();
-      return;
-    }
-
     const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    const wsPath = tokenPayload && tokenPayload.wsPath ? tokenPayload.wsPath : '/ws/remote';
-    const wsUrl = `${protocol}://${window.location.host}${wsPath}?token=${encodeURIComponent(tokenPayload.token)}`;
+    const params = new URLSearchParams({ mode: state.desiredMode });
+    const wsUrl = `${protocol}://${window.location.host}/ws/remote?${params.toString()}`;
     const socket = new WebSocket(wsUrl);
     state.ws = socket;
 
@@ -1495,8 +1472,10 @@
         return;
       }
       state.reconnectBackoffMs = 1200;
-      state.controlAllowed = tokenPayload.controlAllowed === true;
-      state.effectiveMode = normalizeMode(tokenPayload.mode);
+      state.controlAllowed = state.inputAvailable === true;
+      state.effectiveMode = state.desiredMode === 'control' && state.controlAllowed === true
+        ? 'control'
+        : 'view';
       updateModeUi();
       setConnectionState('Connected to gateway', 'warn');
       if (!state.hasFrame) {
