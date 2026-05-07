@@ -401,11 +401,13 @@ struct RemoteDesktopView: View {
                         zoom: $zoom,
                         panOffset: $panOffset,
                         controlMode: desiredMode == .control,
+                        interactionEnabled: !(monitorPanelPresented && monitorDragMode),
                         displayInfo: client.displayInfo,
                         monitors: availableMonitors,
                         selectedMonitorIds: effectiveSelectedMonitorIds,
                         monitorLayoutOffsets: monitorLayoutOffsets
                     )
+                    .allowsHitTesting(!(monitorPanelPresented && monitorDragMode))
                     .ignoresSafeArea(edges: .bottom)
 
                     VStack(spacing: 0) {
@@ -455,6 +457,7 @@ struct RemoteDesktopView: View {
                             }
                         }
                         .transition(.opacity)
+                        .zIndex(40)
                     }
 
                     FloatingRemoteControls(
@@ -714,6 +717,7 @@ struct RemoteStageHost: View {
     @Binding var zoom: Double
     @Binding var panOffset: CGSize
     let controlMode: Bool
+    let interactionEnabled: Bool
     let displayInfo: RemoteDisplayInfo?
     let monitors: [RemoteMonitorDescriptor]
     let selectedMonitorIds: Set<String>
@@ -725,6 +729,7 @@ struct RemoteStageHost: View {
             zoom: $zoom,
             panOffset: $panOffset,
             controlMode: controlMode,
+            interactionEnabled: interactionEnabled,
             displayInfo: displayInfo,
             monitors: monitors,
             selectedMonitorIds: selectedMonitorIds,
@@ -765,6 +770,7 @@ struct RemoteStageView: View {
     @Binding var zoom: Double
     @Binding var panOffset: CGSize
     let controlMode: Bool
+    let interactionEnabled: Bool
     let displayInfo: RemoteDisplayInfo?
     let monitors: [RemoteMonitorDescriptor]
     let selectedMonitorIds: Set<String>
@@ -814,6 +820,7 @@ struct RemoteStageView: View {
                     zoom: $zoom,
                     panOffset: $panOffset,
                     controlMode: controlMode,
+                    interactionEnabled: interactionEnabled,
                     onClick: onClick,
                     onDragStart: onDragStart,
                     onDragMove: onDragMove,
@@ -926,6 +933,7 @@ struct RemoteStageGestureLayer: UIViewRepresentable {
     @Binding var zoom: Double
     @Binding var panOffset: CGSize
     let controlMode: Bool
+    let interactionEnabled: Bool
     let onClick: (CGPoint) -> Void
     let onDragStart: (CGPoint) -> Void
     let onDragMove: (CGPoint) -> Void
@@ -940,6 +948,7 @@ struct RemoteStageGestureLayer: UIViewRepresentable {
         view.coordinator = context.coordinator
         view.backgroundColor = .clear
         view.isMultipleTouchEnabled = true
+        view.isUserInteractionEnabled = interactionEnabled
 
         let twoFingerPan = UIPanGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleTwoFingerPan(_:)))
         twoFingerPan.minimumNumberOfTouches = 2
@@ -972,6 +981,10 @@ struct RemoteStageGestureLayer: UIViewRepresentable {
 
     func updateUIView(_ uiView: UIView, context: Context) {
         context.coordinator.parent = self
+        uiView.isUserInteractionEnabled = interactionEnabled
+        if !interactionEnabled {
+            context.coordinator.cancelInteraction()
+        }
     }
 
     final class GestureView: UIView {
@@ -1016,14 +1029,14 @@ struct RemoteStageGestureLayer: UIViewRepresentable {
         }
 
         @objc func handleSingleTap(_ recognizer: UITapGestureRecognizer) {
-            guard recognizer.state == .ended, parent.controlMode else { return }
+            guard parent.interactionEnabled, recognizer.state == .ended, parent.controlMode else { return }
             if let normalized = normalizedPoint(for: recognizer.location(in: recognizer.view), in: recognizer.view) {
                 parent.onClick(normalized)
             }
         }
 
         @objc func handleDoubleTap(_ recognizer: UITapGestureRecognizer) {
-            guard recognizer.state == .ended, parent.image != nil else { return }
+            guard parent.interactionEnabled, recognizer.state == .ended, parent.image != nil else { return }
             if parent.zoom > 1.01 {
                 parent.zoom = RemoteViewportSettings.minimumZoom
                 parent.panOffset = .zero
@@ -1034,7 +1047,7 @@ struct RemoteStageGestureLayer: UIViewRepresentable {
         }
 
         func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?, in view: UIView) {
-            guard parent.image != nil, trackedTouch == nil else { return }
+            guard parent.interactionEnabled, parent.image != nil, trackedTouch == nil else { return }
             guard activeTouchCount(in: event) == 1, let touch = touches.first else { return }
 
             trackedTouch = touch
@@ -1045,6 +1058,10 @@ struct RemoteStageGestureLayer: UIViewRepresentable {
         }
 
         func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?, in view: UIView) {
+            guard parent.interactionEnabled else {
+                cancelTrackedTouch()
+                return
+            }
             guard let trackedTouch, touches.contains(trackedTouch) else { return }
             guard activeTouchCount(in: event) == 1 else {
                 cancelTrackedTouch()
@@ -1086,7 +1103,7 @@ struct RemoteStageGestureLayer: UIViewRepresentable {
         }
 
         @objc func handleTwoFingerPan(_ recognizer: UIPanGestureRecognizer) {
-            guard parent.image != nil else { return }
+            guard parent.interactionEnabled, parent.image != nil else { return }
 
             switch recognizer.state {
             case .began:
@@ -1108,7 +1125,7 @@ struct RemoteStageGestureLayer: UIViewRepresentable {
         }
 
         @objc func handlePinch(_ recognizer: UIPinchGestureRecognizer) {
-            guard parent.image != nil else { return }
+            guard parent.interactionEnabled, parent.image != nil else { return }
 
             switch recognizer.state {
             case .began:
@@ -1125,8 +1142,13 @@ struct RemoteStageGestureLayer: UIViewRepresentable {
         }
 
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+            guard parent.interactionEnabled else { return false }
             let pair = [gestureRecognizer, otherGestureRecognizer]
             return pair.contains(where: { $0 === twoFingerPan }) && pair.contains(where: { $0 === pinch })
+        }
+
+        func cancelInteraction() {
+            cancelTrackedTouch()
         }
 
         private func activeTouchCount(in event: UIEvent?) -> Int {
@@ -1704,15 +1726,7 @@ struct RemoteMonitorLayoutPreview: View {
                         monitor: monitor,
                         selected: selectedMonitorIds.isEmpty || selectedMonitorIds.contains(monitor.id),
                         dragMode: dragMode,
-                        scale: scale,
-                        offset: Binding(
-                            get: { layoutOffsets[monitor.id] ?? .zero },
-                            set: { updateMonitorOffset(monitor.id, $0, publish: true) }
-                        ),
-                        onToggle: { onToggle(monitor) },
-                        onLayoutChange: { finalOffset in
-                            updateMonitorOffset(monitor.id, finalOffset, publish: true)
-                        }
+                        onToggle: { onToggle(monitor) }
                     )
                     .frame(width: max(54, displayRect.width), height: max(38, displayRect.height))
                     .position(x: displayRect.midX, y: displayRect.midY)
@@ -1721,6 +1735,17 @@ struct RemoteMonitorLayoutPreview: View {
                         transaction.animation = nil
                         transaction.disablesAnimations = true
                     }
+                }
+
+                if dragMode {
+                    RemoteMonitorDragCaptureLayer(
+                        monitors: monitors,
+                        dragMode: dragMode,
+                        layoutOffsets: $layoutOffsets,
+                        onLayoutChange: onLayoutChange
+                    )
+                        .frame(width: proxy.size.width, height: proxy.size.height)
+                        .zIndex(10)
                 }
             }
             .clipped()
@@ -1754,32 +1779,13 @@ struct RemoteMonitorLayoutPreview: View {
             height: rect.height * scale
         )
     }
-
-    private func updateMonitorOffset(_ id: String, _ offset: CGSize, publish: Bool = false) {
-        var nextOffsets = layoutOffsets
-        nextOffsets[id] = offset
-        var transaction = Transaction()
-        transaction.disablesAnimations = true
-        withTransaction(transaction) {
-            layoutOffsets = nextOffsets
-        }
-        if publish {
-            onLayoutChange(nextOffsets)
-        }
-    }
 }
 
 struct RemoteMonitorPreviewTile: View {
     let monitor: RemoteMonitorDescriptor
     let selected: Bool
     let dragMode: Bool
-    let scale: CGFloat
-    @Binding var offset: CGSize
     let onToggle: () -> Void
-    let onLayoutChange: (CGSize) -> Void
-
-    @State private var dragStartOffset = CGSize.zero
-    @State private var dragging = false
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
@@ -1814,39 +1820,179 @@ struct RemoteMonitorPreviewTile: View {
             guard !dragMode else { return }
             onToggle()
         }
-        .gesture(tileDragGesture)
         .transaction { transaction in
             transaction.animation = nil
             transaction.disablesAnimations = true
         }
     }
+}
 
-    private var tileDragGesture: some Gesture {
-        DragGesture(minimumDistance: dragMode ? 1 : 10_000)
-            .onChanged { value in
-                guard dragMode else { return }
-                if !dragging {
-                    dragStartOffset = offset
-                    dragging = true
-                }
-                let safeScale = max(0.001, scale)
-                withoutDragAnimation {
-                    offset = CGSize(
-                        width: dragStartOffset.width + value.translation.width / safeScale,
-                        height: dragStartOffset.height + value.translation.height / safeScale
-                    )
-                }
-            }
-            .onEnded { _ in
-                dragging = false
-                onLayoutChange(offset)
-            }
+struct RemoteMonitorDragCaptureLayer: UIViewRepresentable {
+    let monitors: [RemoteMonitorDescriptor]
+    let dragMode: Bool
+    @Binding var layoutOffsets: [String: CGSize]
+    let onLayoutChange: ([String: CGSize]) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
     }
 
-    private func withoutDragAnimation(_ updates: () -> Void) {
-        var transaction = Transaction()
-        transaction.disablesAnimations = true
-        withTransaction(transaction, updates)
+    func makeUIView(context: Context) -> UIView {
+        let view = CaptureView()
+        view.coordinator = context.coordinator
+        view.backgroundColor = UIColor.white.withAlphaComponent(0.001)
+        view.isOpaque = false
+        view.isMultipleTouchEnabled = false
+        view.isUserInteractionEnabled = dragMode
+        return view
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {
+        context.coordinator.parent = self
+        uiView.isUserInteractionEnabled = dragMode
+        if !dragMode {
+            context.coordinator.clearDrag()
+        }
+    }
+
+    final class CaptureView: UIView {
+        weak var coordinator: Coordinator?
+
+        override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+            coordinator?.hitMonitorId(at: point, in: bounds.size) != nil
+        }
+
+        override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+            super.touchesBegan(touches, with: event)
+            coordinator?.touchesBegan(touches, in: self)
+        }
+
+        override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+            super.touchesMoved(touches, with: event)
+            coordinator?.touchesMoved(touches, in: self)
+        }
+
+        override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+            super.touchesEnded(touches, with: event)
+            coordinator?.clearDrag()
+        }
+
+        override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+            super.touchesCancelled(touches, with: event)
+            coordinator?.clearDrag()
+        }
+    }
+
+    final class Coordinator: NSObject {
+        var parent: RemoteMonitorDragCaptureLayer
+        private weak var trackedTouch: UITouch?
+        private var activeMonitorId: String?
+        private var dragStartLocation = CGPoint.zero
+        private var dragStartOffset = CGSize.zero
+
+        init(parent: RemoteMonitorDragCaptureLayer) {
+            self.parent = parent
+        }
+
+        func touchesBegan(_ touches: Set<UITouch>, in view: UIView) {
+            guard parent.dragMode, trackedTouch == nil, let touch = touches.first else { return }
+            let location = touch.location(in: view)
+            guard let monitorId = hitMonitorId(at: location, in: view.bounds.size) else { return }
+            trackedTouch = touch
+            activeMonitorId = monitorId
+            dragStartLocation = location
+            dragStartOffset = parent.layoutOffsets[monitorId] ?? .zero
+        }
+
+        func touchesMoved(_ touches: Set<UITouch>, in view: UIView) {
+            guard parent.dragMode, let trackedTouch, touches.contains(trackedTouch), let activeMonitorId else { return }
+            let scale = previewScale(in: view.bounds.size)
+            let location = trackedTouch.location(in: view)
+            publish(
+                activeMonitorId,
+                offset: CGSize(
+                    width: dragStartOffset.width + (location.x - dragStartLocation.x) / max(0.001, scale),
+                    height: dragStartOffset.height + (location.y - dragStartLocation.y) / max(0.001, scale)
+                )
+            )
+        }
+
+        func clearDrag() {
+            trackedTouch = nil
+            activeMonitorId = nil
+            dragStartLocation = .zero
+            dragStartOffset = .zero
+        }
+
+        func hitMonitorId(at point: CGPoint, in size: CGSize) -> String? {
+            monitorFrames(in: size)
+                .reversed()
+                .first { $0.rect.contains(point) }?
+                .id
+        }
+
+        private func publish(_ id: String, offset: CGSize) {
+            var nextOffsets = parent.layoutOffsets
+            nextOffsets[id] = offset
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                parent.layoutOffsets = nextOffsets
+            }
+            parent.onLayoutChange(nextOffsets)
+        }
+
+        private func monitorFrames(in size: CGSize) -> [(id: String, rect: CGRect)] {
+            let layout = RemoteMonitorLayoutGeometry(monitors: parent.monitors, offsets: [:])
+            let scale = previewScale(in: size)
+            return parent.monitors.map { monitor in
+                let baseRect = scaledRect(layout.rect(for: monitor), layout: layout, scale: scale, in: size)
+                let offset = parent.layoutOffsets[monitor.id] ?? .zero
+                let tileSize = CGSize(width: max(54, baseRect.width), height: max(38, baseRect.height))
+                let center = CGPoint(
+                    x: baseRect.midX + offset.width * scale,
+                    y: baseRect.midY + offset.height * scale
+                )
+                return (
+                    id: monitor.id,
+                    rect: CGRect(
+                        x: center.x - tileSize.width / 2,
+                        y: center.y - tileSize.height / 2,
+                        width: tileSize.width,
+                        height: tileSize.height
+                    )
+                )
+            }
+        }
+
+        private func previewScale(in size: CGSize) -> CGFloat {
+            let union = RemoteMonitorLayoutGeometry(monitors: parent.monitors, offsets: [:]).union
+            let availableWidth = max(1, size.width - 24)
+            let availableHeight = max(1, size.height - 24)
+            return min(availableWidth / max(1, union.width), availableHeight / max(1, union.height))
+        }
+
+        private func scaledRect(
+            _ rect: CGRect,
+            layout: RemoteMonitorLayoutGeometry,
+            scale: CGFloat,
+            in size: CGSize
+        ) -> CGRect {
+            let contentSize = CGSize(
+                width: layout.union.width * scale,
+                height: layout.union.height * scale
+            )
+            let origin = CGPoint(
+                x: (size.width - contentSize.width) / 2,
+                y: (size.height - contentSize.height) / 2
+            )
+            return CGRect(
+                x: origin.x + (rect.minX - layout.union.minX) * scale,
+                y: origin.y + (rect.minY - layout.union.minY) * scale,
+                width: rect.width * scale,
+                height: rect.height * scale
+            )
+        }
     }
 }
 
