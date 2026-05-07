@@ -1066,6 +1066,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
 
     func setVideoFrame(_ update: RemoteVideoRenderUpdate) {
         guard renderedVideoSequence != update.sequence else { return }
+        let renderStartedAt = CACurrentMediaTime()
         renderedVideoSequence = update.sequence
         guard let sampleBuffer = update.sampleBuffer else {
             videoActive = false
@@ -1077,6 +1078,8 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
             return
         }
 
+        let wasVideoActive = videoActive
+        let previousDesktopSize = desktopSize
         latestImage = nil
         imageView.layer.contents = nil
         videoActive = true
@@ -1091,7 +1094,18 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         renderer.enqueue(sampleBuffer)
         placeholderView.isHidden = true
         cursorView.isHidden = remoteCursor == nil
-        setNeedsLayout()
+
+        let geometryChanged = !wasVideoActive
+            || previousDesktopSize != update.pixelSize
+            || videoLayer.isHidden
+            || placeholderView.frame != bounds
+        if geometryChanged {
+            setNeedsLayout()
+        }
+        if renderedVideoSequence != presentedVideoSequence {
+            presentedVideoSequence = renderedVideoSequence
+            onFramePresented?((CACurrentMediaTime() - renderStartedAt) * 1_000)
+        }
     }
 
     func setRemoteCursor(_ point: CGPoint?) {
