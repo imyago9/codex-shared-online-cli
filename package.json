@@ -5,7 +5,8 @@
   "description": "Tailscale console for shared PowerShell, Codex, and remote desktop sessions",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "windows:command": "node scripts/windows-command.js"
   },
   "dependencies": {
     "@lydell/node-pty": "^1.1.0",

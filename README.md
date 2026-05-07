@@ -17,6 +17,9 @@ A Tailscale-first console for native PowerShell terminals, Codex thread browsing
   - Browser stream via proxied WS (`/ws/remote`) over the same tailnet access boundary
   - View-only by default, with explicit control enable toggle
   - Touch controls for iOS (tap/long-press/drag/two-finger wheel)
+- Optional command sidecar for Windows host automation over Tailscale
+  - Token-gated command runs, live output streaming, run history, stop support
+  - Useful for fetching/pulling on Windows, restarting `npm start`, and closing the Mac/iOS/Windows loop
 - Native iOS console, Codex Threads, metrics dashboard, stream presets, remote cursor relay, live gateway stats, and desktop shortcut actions
 - Idle session cleanup + max session guardrails
 - Graceful shutdown persistence:
@@ -121,6 +124,36 @@ When `REMOTE_ENABLED=true`, the main `npm start` command installs missing sideca
 
 If the sidecar is offline or input automation is unavailable, the UI degrades to view-only/offline states and the terminal remains fully usable.
 
+## Windows Command Sidecar
+The command sidecar is separate from the main server so it can fetch, pull, and start the main server even when the main app is not already running. It binds to loopback, requires a bearer token, and is meant to be exposed privately with Tailscale Serve.
+
+On Windows:
+```powershell
+cd command-sidecar
+npm run token
+$env:COMMAND_SIDECAR_TOKEN = "<generated-token>"
+$env:COMMAND_SIDECAR_ROOTS = "C:\Users\yagof\Projects\codex-shared-online-cli"
+$env:COMMAND_SIDECAR_BASE_PATH = "/cmd"
+npm start
+```
+
+Expose it through Tailscale Serve:
+```powershell
+cd command-sidecar
+.\tailscale-serve.ps1 -Path /cmd -Port 3777
+```
+
+From Mac/Codex:
+```bash
+export WINDOWS_COMMAND_URL="https://desktop-cguakc2.tailbca5e0.ts.net/cmd"
+export WINDOWS_COMMAND_TOKEN="<generated-token>"
+
+npm run windows:command -- --powershell --cwd 'C:\Users\yagof\Projects\codex-shared-online-cli' 'git fetch --all --prune; git pull --ff-only'
+npm run windows:command -- --powershell --timeout-ms 0 --cwd 'C:\Users\yagof\Projects\codex-shared-online-cli' 'npm start'
+```
+
+See `command-sidecar/README.md` for the REST API and more examples. The Tailscale docs describe `tailscale serve --set-path` for path-based routing to loopback HTTP services: https://tailscale.com/kb/1242/tailscale-serve
+
 ## Minimal Shared Setup (Desktop + iPhone + Local Terminal)
 1. Start everything:
 ```bash
@@ -216,5 +249,7 @@ npm install
 - `src/http/sessionRoutes.js`: session API
 - `public/`: browser app and styles
 - `remote-agent/`: Windows host sidecar service (desktop capture + input automation)
+- `command-sidecar/`: token-gated Windows command runner for tailnet automation
+- `scripts/windows-command.js`: local client for the command sidecar
 - `docs/tailscale-setup.md`: private tailnet access guide
 - `scripts/tailscale-serve.ps1`: Windows helper to configure `tailscale serve`

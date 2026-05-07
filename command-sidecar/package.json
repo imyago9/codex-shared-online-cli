@@ -1,0 +1,14 @@
+{
+  "name": "online-cli-command-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Token-gated Windows command runner for tailnet development loops",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "token": "node -e \"console.log(require('crypto').randomBytes(32).toString('base64url'))\""
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -203,6 +203,7 @@ struct TerminalSessionController: View {
 
 struct RemoteDesktopView: View {
     @Environment(AppModel.self) private var app
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
     @State private var client = RemoteDesktopClient()
     @State private var desiredMode: RemoteMode = .view
     @State private var streamProfile: RemoteStreamProfile = .balanced
@@ -211,14 +212,15 @@ struct RemoteDesktopView: View {
     @State private var panMode = false
     @State private var joystickSensitivity = 1.0
     @State private var keyboardText = ""
-    @State private var controlsCollapsed = false
+    @State private var controlsCollapsed = true
     @State private var controlsOffset = CGSize.zero
+    @State private var interfaceIsLandscape = false
     @FocusState private var keyboardFocused: Bool
 
     var body: some View {
         NavigationStack {
             GeometryReader { proxy in
-                let isLandscape = proxy.size.width > proxy.size.height
+                let isLandscape = proxy.size.width > proxy.size.height || verticalSizeClass == .compact || interfaceIsLandscape
 
                 ZStack {
                     Color.black.ignoresSafeArea()
@@ -247,7 +249,7 @@ struct RemoteDesktopView: View {
                                 mode: $desiredMode,
                                 profile: $streamProfile,
                                 panMode: $panMode,
-                                compact: isLandscape,
+                                compact: true,
                                 onConnect: connect,
                                 onDisconnect: client.disconnect,
                                 onModeChange: { mode in
@@ -260,7 +262,7 @@ struct RemoteDesktopView: View {
                                     client.setStreamProfile(profile)
                                 }
                             )
-                            .frame(maxWidth: isLandscape ? min(560, proxy.size.width * 0.64) : .infinity)
+                            .frame(maxWidth: min(isLandscape ? 300 : 360, proxy.size.width - 24))
                             Spacer(minLength: 0)
                         }
                         .padding(.horizontal, 12)
@@ -296,6 +298,8 @@ struct RemoteDesktopView: View {
                             keyboardText = ""
                         }
                 }
+                .toolbar(isLandscape ? .hidden : .visible, for: .navigationBar)
+                .toolbar(isLandscape ? .hidden : .visible, for: .tabBar)
             }
             .navigationTitle("Remote")
             .navigationBarTitleDisplayMode(.inline)
@@ -315,10 +319,14 @@ struct RemoteDesktopView: View {
             .onAppear {
                 desiredMode = app.settings.defaultRemoteMode
                 streamProfile = app.settings.remoteStreamProfile
+                updateInterfaceOrientation()
                 Task {
                     await app.refreshRemoteStatus()
                     await app.refreshRemoteCapabilities()
                 }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIDevice.orientationDidChangeNotification)) { _ in
+                updateInterfaceOrientation()
             }
             .onDisappear {
                 client.disconnect()
@@ -332,6 +340,13 @@ struct RemoteDesktopView: View {
             return
         }
         client.connect(baseURL: url, desiredMode: desiredMode, streamProfile: streamProfile)
+    }
+
+    private func updateInterfaceOrientation() {
+        interfaceIsLandscape = UIApplication.shared.connectedScenes
+            .compactMap { ($0 as? UIWindowScene)?.interfaceOrientation }
+            .first?
+            .isLandscape == true
     }
 
     private var diagnosticsText: String {
@@ -492,7 +507,7 @@ struct RemoteTopOverlay: View {
         HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(state.title)
-                    .font(.subheadline.weight(.semibold))
+                    .font(.caption.weight(.semibold))
                 Text(compactStatusLine)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
@@ -501,16 +516,7 @@ struct RemoteTopOverlay: View {
 
             Spacer(minLength: 4)
 
-            modePicker
-                .pickerStyle(.menu)
-                .frame(width: 92)
-
-            streamPicker
-                .pickerStyle(.menu)
-                .frame(width: 42)
-                .labelsHidden()
-
-            panToggle
+            compactOptionsMenu
             connectButton
         }
     }
@@ -572,6 +578,39 @@ struct RemoteTopOverlay: View {
         }
         .toggleStyle(.button)
         .labelStyle(.iconOnly)
+    }
+
+    private var compactOptionsMenu: some View {
+        Menu {
+            Picker("Mode", selection: $mode) {
+                ForEach(RemoteMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            .onChange(of: mode) { _, newMode in
+                onModeChange(newMode)
+            }
+
+            Picker("Stream", selection: $profile) {
+                ForEach(RemoteStreamProfile.allCases) { profile in
+                    Label(profile.title, systemImage: profile.systemImage).tag(profile)
+                }
+            }
+            .onChange(of: profile) { _, newProfile in
+                onProfileChange(newProfile)
+            }
+
+            Button {
+                panMode.toggle()
+            } label: {
+                Label(panMode ? "Disable Pan" : "Enable Pan", systemImage: "hand.draw")
+            }
+        } label: {
+            Image(systemName: "ellipsis.circle")
+                .frame(width: 34, height: 34)
+        }
+        .buttonStyle(.plain)
+        .nativeGlass(cornerRadius: 17, interactive: true)
     }
 
     private var isConnected: Bool {
