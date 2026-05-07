@@ -41,6 +41,7 @@ final class NativeTerminalBuffer {
     private var savedCursorY = 0
     private var cols = 80
     private var rows = 24
+    private var suppressedScrollLineFeeds = 0
     private var parseMode: ParseMode = .normal
     private var csiBuffer = ""
     private let maxLines: Int
@@ -57,6 +58,7 @@ final class NativeTerminalBuffer {
         cursorY = 0
         savedCursorX = 0
         savedCursorY = 0
+        suppressedScrollLineFeeds = 0
         parseMode = .normal
         csiBuffer = ""
         displayText = ""
@@ -67,22 +69,14 @@ final class NativeTerminalBuffer {
         let nextRows = max(6, rows)
         guard nextCols != self.cols || nextRows != self.rows else { return }
 
-        let oldScreen = screen
-        let oldCols = self.cols
         self.cols = nextCols
         self.rows = nextRows
-        screen = oldScreen.prefix(self.rows).map { oldLine in
-            var line = Array(oldLine.prefix(self.cols))
-            if line.count < self.cols {
-                line.append(contentsOf: Array(repeating: " ", count: self.cols - line.count))
-            }
-            return line
-        }
-        while screen.count < self.rows {
-            screen.append(blankLine())
-        }
-        cursorX = min(cursorX, max(0, min(oldCols, self.cols) - 1))
-        cursorY = min(cursorY, self.rows - 1)
+        screen = Self.makeBlankScreen(cols: self.cols, rows: self.rows)
+        cursorX = 0
+        cursorY = 0
+        savedCursorX = 0
+        savedCursorY = 0
+        suppressedScrollLineFeeds = max(suppressedScrollLineFeeds, self.rows + 2)
         rebuildDisplayText()
     }
 
@@ -105,6 +99,16 @@ final class NativeTerminalBuffer {
                 parseMode = .csi
             } else if scalar == "]" {
                 parseMode = .osc
+            } else if scalar == "7" {
+                savedCursorX = cursorX
+                savedCursorY = cursorY
+                parseMode = .normal
+            } else if scalar == "8" {
+                cursorX = min(cols - 1, max(0, savedCursorX))
+                cursorY = min(rows - 1, max(0, savedCursorY))
+                parseMode = .normal
+            } else if scalar == "c" {
+                reset()
             } else {
                 parseMode = .normal
             }
@@ -161,9 +165,17 @@ final class NativeTerminalBuffer {
             let col = max(1, params.dropFirst().first ?? 1) - 1
             cursorY = min(rows - 1, row)
             cursorX = min(cols - 1, col)
+            if cursorX == 0 && cursorY == 0 {
+                suppressedScrollLineFeeds = max(suppressedScrollLineFeeds, rows + 2)
+            }
+        case "d":
+            let row = max(1, params.first ?? 1) - 1
+            cursorY = min(rows - 1, row)
         case "A":
             cursorY = max(0, cursorY - max(1, params.first ?? 1))
         case "B":
+            cursorY = min(rows - 1, cursorY + max(1, params.first ?? 1))
+        case "e":
             cursorY = min(rows - 1, cursorY + max(1, params.first ?? 1))
         case "G":
             cursorX = max(0, min(cols - 1, max(1, params.first ?? 1) - 1))
@@ -183,6 +195,14 @@ final class NativeTerminalBuffer {
             scrollDown(max(1, params.first ?? 1))
         case "X":
             eraseCharacters(max(1, params.first ?? 1))
+        case "P":
+            deleteCharacters(max(1, params.first ?? 1))
+        case "@":
+            insertBlankCharacters(max(1, params.first ?? 1))
+        case "L":
+            insertLines(max(1, params.first ?? 1))
+        case "M":
+            deleteLines(max(1, params.first ?? 1))
         case "s":
             savedCursorX = cursorX
             savedCursorY = cursorY
@@ -207,9 +227,13 @@ final class NativeTerminalBuffer {
 
     private func lineFeed() {
         if cursorY >= rows - 1 {
-            scrollUp(1, recordHistory: true)
+            let shouldRecordHistory = suppressedScrollLineFeeds == 0
+            scrollUp(1, recordHistory: shouldRecordHistory)
         } else {
             cursorY += 1
+        }
+        if suppressedScrollLineFeeds > 0 {
+            suppressedScrollLineFeeds -= 1
         }
     }
 
@@ -217,7 +241,10 @@ final class NativeTerminalBuffer {
         guard count > 0 else { return }
         for _ in 0..<min(count, rows) {
             if recordHistory {
-                history.append(lineString(screen[0]))
+                let line = lineString(screen[0])
+                if !line.isEmpty || history.last?.isEmpty == false {
+                    history.append(line)
+                }
             }
             screen.removeFirst()
             screen.append(blankLine())
@@ -248,6 +275,7 @@ final class NativeTerminalBuffer {
             if mode == 3 {
                 history.removeAll(keepingCapacity: true)
             }
+            suppressedScrollLineFeeds = max(suppressedScrollLineFeeds, rows + 2)
         default:
             for row in cursorY..<rows {
                 let start = row == cursorY ? cursorX : 0
@@ -279,6 +307,48 @@ final class NativeTerminalBuffer {
         guard cursorX < cols else { return }
         for col in cursorX..<min(cols, cursorX + count) {
             screen[cursorY][col] = " "
+        }
+    }
+
+    private func deleteCharacters(_ count: Int) {
+        guard cursorX < cols else { return }
+        let amount = min(count, cols - cursorX)
+        guard amount > 0 else { return }
+        for col in cursorX..<(cols - amount) {
+            screen[cursorY][col] = screen[cursorY][col + amount]
+        }
+        for col in (cols - amount)..<cols {
+            screen[cursorY][col] = " "
+        }
+    }
+
+    private func insertBlankCharacters(_ count: Int) {
+        guard cursorX < cols else { return }
+        let amount = min(count, cols - cursorX)
+        guard amount > 0 else { return }
+        for col in stride(from: cols - 1, through: cursorX + amount, by: -1) {
+            screen[cursorY][col] = screen[cursorY][col - amount]
+        }
+        for col in cursorX..<min(cols, cursorX + amount) {
+            screen[cursorY][col] = " "
+        }
+    }
+
+    private func insertLines(_ count: Int) {
+        guard cursorY < rows else { return }
+        let amount = min(count, rows - cursorY)
+        for _ in 0..<amount {
+            screen.insert(blankLine(), at: cursorY)
+            screen.removeLast()
+        }
+    }
+
+    private func deleteLines(_ count: Int) {
+        guard cursorY < rows else { return }
+        let amount = min(count, rows - cursorY)
+        for _ in 0..<amount {
+            screen.remove(at: cursorY)
+            screen.append(blankLine())
         }
     }
 
@@ -371,7 +441,7 @@ final class NativeTerminalClient {
             receiveTask = Task { [weak self] in
                 await self?.receiveLoop(generation: generation)
             }
-            sendResize(cols: cols, rows: rows)
+            sendResize(cols: cols, rows: rows, force: true)
         } catch {
             connectionState = .failed(error.localizedDescription)
             statusText = error.localizedDescription
@@ -403,11 +473,20 @@ final class NativeTerminalClient {
     }
 
     func sendResize(cols: Int, rows: Int) {
+        sendResize(cols: cols, rows: rows, force: false)
+    }
+
+    private func sendResize(cols: Int, rows: Int, force: Bool) {
         let nextCols = max(20, cols)
         let nextRows = max(6, rows)
+        let changed = nextCols != self.cols || nextRows != self.rows
+        guard changed || force else { return }
+
         self.cols = nextCols
         self.rows = nextRows
-        buffer.resize(cols: nextCols, rows: nextRows)
+        if changed {
+            buffer.resize(cols: nextCols, rows: nextRows)
+        }
         sendEnvelope(["type": "resize", "cols": nextCols, "rows": nextRows])
     }
 
@@ -481,12 +560,6 @@ final class NativeTerminalClient {
             }
             if let backend = payload["backend"] as? String {
                 self.backend = backend
-            }
-            if let cols = payload["cols"] as? Int {
-                self.cols = cols
-            }
-            if let rows = payload["rows"] as? Int {
-                self.rows = rows
             }
             connectionState = .connected
             statusText = "\(terminalProfile.title) ready"

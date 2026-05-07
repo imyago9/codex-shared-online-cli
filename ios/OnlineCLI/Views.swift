@@ -31,6 +31,9 @@ struct ConsoleTabView: View {
     @Environment(AppModel.self) private var app
     @State private var client = NativeTerminalClient()
     @State private var fullScreen = false
+    @State private var terminalFocusToken = 0
+    @State private var terminalDismissKeyboardToken = 0
+    @State private var terminalKeyboardVisible = false
 
     var body: some View {
         NavigationStack {
@@ -44,7 +47,12 @@ struct ConsoleTabView: View {
                         }
 
                         if app.activeTerminalSession != nil {
-                            NativeTerminalView(client: client)
+                            NativeTerminalView(
+                                client: client,
+                                focusToken: $terminalFocusToken,
+                                dismissKeyboardToken: $terminalDismissKeyboardToken,
+                                keyboardVisible: $terminalKeyboardVisible
+                            )
                         } else {
                             ContentUnavailableView(
                                 "Create a terminal",
@@ -62,6 +70,16 @@ struct ConsoleTabView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     ConnectionBadge(text: app.connectionMessage)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    if terminalKeyboardVisible {
+                        Button {
+                            terminalDismissKeyboardToken += 1
+                        } label: {
+                            Image(systemName: "keyboard.chevron.compact.down")
+                        }
+                        .accessibilityLabel("Hide terminal keyboard")
+                    }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {

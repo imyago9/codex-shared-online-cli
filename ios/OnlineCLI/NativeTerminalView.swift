@@ -3,8 +3,9 @@ import UIKit
 
 struct NativeTerminalView: View {
     let client: NativeTerminalClient
-    @State private var focusToken = 0
-    @State private var dismissKeyboardToken = 0
+    @Binding var focusToken: Int
+    @Binding var dismissKeyboardToken: Int
+    @Binding var keyboardVisible: Bool
     @State private var autoScroll = true
 
     var body: some View {
@@ -14,6 +15,7 @@ struct NativeTerminalView: View {
             focusToken: $focusToken,
             dismissKeyboardToken: $dismissKeyboardToken,
             autoScroll: $autoScroll,
+            keyboardVisible: $keyboardVisible,
             onInput: client.sendInput,
             onResize: client.sendResize(cols:rows:)
         )
@@ -27,6 +29,7 @@ private struct TerminalSurface: View {
     @Binding var focusToken: Int
     @Binding var dismissKeyboardToken: Int
     @Binding var autoScroll: Bool
+    @Binding var keyboardVisible: Bool
     let onInput: (String) -> Void
     let onResize: (Int, Int) -> Void
 
@@ -45,6 +48,7 @@ private struct TerminalSurface: View {
                 TerminalInputCapture(
                     focusToken: $focusToken,
                     dismissKeyboardToken: $dismissKeyboardToken,
+                    keyboardVisible: $keyboardVisible,
                     onInput: onInput
                 )
                     .frame(width: 1, height: 1)
@@ -54,7 +58,6 @@ private struct TerminalSurface: View {
             .contentShape(Rectangle())
             .onAppear {
                 resize(for: proxy.size)
-                focusToken += 1
             }
             .onChange(of: proxy.size) { _, size in
                 resize(for: size)
@@ -81,39 +84,17 @@ private struct TerminalTextSurface: UIViewRepresentable {
     let autoScroll: Bool
     let onTap: () -> Void
 
-    func makeUIView(context: Context) -> UITextView {
-        let textView = UITextView()
-        textView.isEditable = false
-        textView.backgroundColor = UIColor(red: 0.03, green: 0.04, blue: 0.06, alpha: 1)
-        textView.textColor = UIColor(red: 0.86, green: 0.89, blue: 0.93, alpha: 1)
-        textView.font = font
-        textView.isSelectable = false
-        textView.textContainerInset = UIEdgeInsets(top: 10, left: 10, bottom: 10, right: 10)
-        textView.textContainer.lineFragmentPadding = 0
-        textView.alwaysBounceVertical = true
-        textView.keyboardDismissMode = .interactive
-        textView.autocorrectionType = .no
-        textView.autocapitalizationType = .none
-        textView.smartDashesType = .no
-        textView.smartQuotesType = .no
-        textView.spellCheckingType = .no
-
+    func makeUIView(context: Context) -> TerminalScrollView {
+        let scrollView = TerminalScrollView()
         let recognizer = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleTap))
         recognizer.cancelsTouchesInView = false
-        textView.addGestureRecognizer(recognizer)
-        return textView
+        scrollView.addGestureRecognizer(recognizer)
+        return scrollView
     }
 
-    func updateUIView(_ textView: UITextView, context: Context) {
+    func updateUIView(_ scrollView: TerminalScrollView, context: Context) {
         context.coordinator.onTap = onTap
-        textView.font = font
-        if textView.text != text {
-            textView.text = text
-            if autoScroll {
-                let maxOffset = max(0, textView.contentSize.height - textView.bounds.height + textView.adjustedContentInset.bottom)
-                textView.setContentOffset(CGPoint(x: 0, y: maxOffset), animated: false)
-            }
-        }
+        scrollView.update(text: text, font: font, autoScroll: autoScroll)
     }
 
     func makeCoordinator() -> Coordinator {
@@ -131,37 +112,152 @@ private struct TerminalTextSurface: UIViewRepresentable {
             onTap()
         }
     }
+
+    final class TerminalScrollView: UIScrollView {
+        private let terminalContentView = TerminalContentView()
+
+        override init(frame: CGRect) {
+            super.init(frame: frame)
+            backgroundColor = UIColor(red: 0.03, green: 0.04, blue: 0.06, alpha: 1)
+            indicatorStyle = .white
+            alwaysBounceVertical = true
+            alwaysBounceHorizontal = false
+            showsHorizontalScrollIndicator = false
+            keyboardDismissMode = .interactive
+            delaysContentTouches = false
+            addSubview(terminalContentView)
+        }
+
+        required init?(coder: NSCoder) {
+            return nil
+        }
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            updateContentFrame(autoScroll: false)
+        }
+
+        func update(text: String, font: UIFont, autoScroll: Bool) {
+            let wasPinnedToBottom = contentOffset.y >= max(0, contentSize.height - bounds.height - 24)
+            terminalContentView.configure(text: text, font: font)
+            updateContentFrame(autoScroll: autoScroll || wasPinnedToBottom)
+        }
+
+        private func updateContentFrame(autoScroll: Bool) {
+            let size = terminalContentView.preferredSize(minimumSize: bounds.size)
+            if terminalContentView.frame.size != size {
+                terminalContentView.frame = CGRect(origin: .zero, size: size)
+                contentSize = size
+            }
+            if autoScroll {
+                let maxOffsetY = max(0, contentSize.height - bounds.height + adjustedContentInset.bottom)
+                setContentOffset(CGPoint(x: 0, y: maxOffsetY), animated: false)
+            }
+        }
+    }
+
+    final class TerminalContentView: UIView {
+        private var lines: [String] = [""]
+        private var attributes: [NSAttributedString.Key: Any] = [:]
+        private var font = UIFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        private let inset = UIEdgeInsets(top: 10, left: 10, bottom: 10, right: 10)
+        private let textColor = UIColor(red: 0.86, green: 0.89, blue: 0.93, alpha: 1)
+        private let background = UIColor(red: 0.03, green: 0.04, blue: 0.06, alpha: 1)
+
+        private var lineHeight: CGFloat {
+            ceil(font.lineHeight)
+        }
+
+        private var characterWidth: CGFloat {
+            max(6, "W".size(withAttributes: [.font: font]).width)
+        }
+
+        override init(frame: CGRect) {
+            super.init(frame: frame)
+            isOpaque = true
+            backgroundColor = background
+            configure(text: "", font: font)
+        }
+
+        required init?(coder: NSCoder) {
+            return nil
+        }
+
+        func configure(text: String, font: UIFont) {
+            let nextLines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            self.lines = nextLines.isEmpty ? [""] : nextLines
+            self.font = font
+            self.attributes = [
+                .font: font,
+                .foregroundColor: textColor
+            ]
+            setNeedsDisplay()
+        }
+
+        func preferredSize(minimumSize: CGSize) -> CGSize {
+            let longestLine = lines.reduce(0) { max($0, $1.count) }
+            let contentWidth = CGFloat(longestLine) * characterWidth + inset.left + inset.right
+            let contentHeight = CGFloat(lines.count) * lineHeight + inset.top + inset.bottom
+            return CGSize(
+                width: max(minimumSize.width, ceil(contentWidth)),
+                height: max(minimumSize.height + 1, ceil(contentHeight))
+            )
+        }
+
+        override func draw(_ rect: CGRect) {
+            background.setFill()
+            UIRectFill(rect)
+            guard !lines.isEmpty else { return }
+
+            let firstLine = max(0, Int(floor((rect.minY - inset.top) / lineHeight)))
+            let lastLine = min(lines.count - 1, Int(ceil((rect.maxY - inset.top) / lineHeight)))
+            guard firstLine <= lastLine else { return }
+
+            for index in firstLine...lastLine {
+                let origin = CGPoint(x: inset.left, y: inset.top + CGFloat(index) * lineHeight)
+                (lines[index] as NSString).draw(at: origin, withAttributes: attributes)
+            }
+        }
+    }
 }
 
 struct TerminalInputCapture: UIViewRepresentable {
     @Binding var focusToken: Int
     @Binding var dismissKeyboardToken: Int
+    @Binding var keyboardVisible: Bool
     let onInput: (String) -> Void
 
     func makeUIView(context: Context) -> InputView {
         let view = InputView()
         view.onInput = onInput
+        view.onActiveChanged = { [binding = $keyboardVisible] isActive in
+            binding.wrappedValue = isActive
+        }
         return view
     }
 
     func updateUIView(_ uiView: InputView, context: Context) {
         uiView.onInput = onInput
+        uiView.onActiveChanged = { [binding = $keyboardVisible] isActive in
+            binding.wrappedValue = isActive
+        }
         if uiView.lastFocusToken != focusToken {
             uiView.lastFocusToken = focusToken
             DispatchQueue.main.async {
-                uiView.becomeFirstResponder()
+                _ = uiView.becomeFirstResponder()
             }
         }
         if uiView.lastDismissKeyboardToken != dismissKeyboardToken {
             uiView.lastDismissKeyboardToken = dismissKeyboardToken
             DispatchQueue.main.async {
-                uiView.resignFirstResponder()
+                _ = uiView.resignFirstResponder()
             }
         }
     }
 
     final class InputView: UIView, UIKeyInput {
         var onInput: ((String) -> Void)?
+        var onActiveChanged: ((Bool) -> Void)?
         var lastFocusToken = 0
         var lastDismissKeyboardToken = 0
         var hasText: Bool { true }
@@ -174,22 +270,24 @@ struct TerminalInputCapture: UIViewRepresentable {
 
         override var canBecomeFirstResponder: Bool { true }
         override var inputAccessoryView: UIView? {
-            accessoryToolbar
+            nil
         }
 
-        private lazy var accessoryToolbar: UIToolbar = {
-            let toolbar = UIToolbar()
-            toolbar.sizeToFit()
-            toolbar.items = [
-                UIBarButtonItem(title: "Paste", style: .plain, target: self, action: #selector(sendPaste)),
-                UIBarButtonItem(title: "Esc", style: .plain, target: self, action: #selector(sendEscape)),
-                UIBarButtonItem(title: "Tab", style: .plain, target: self, action: #selector(sendTab)),
-                UIBarButtonItem(title: "Ctrl-C", style: .plain, target: self, action: #selector(sendControlC)),
-                UIBarButtonItem(systemItem: .flexibleSpace),
-                UIBarButtonItem(title: "Done", style: .done, target: self, action: #selector(dismissKeyboard))
-            ]
-            return toolbar
-        }()
+        override func becomeFirstResponder() -> Bool {
+            let didBecome = super.becomeFirstResponder()
+            if didBecome {
+                onActiveChanged?(true)
+            }
+            return didBecome
+        }
+
+        override func resignFirstResponder() -> Bool {
+            let didResign = super.resignFirstResponder()
+            if didResign {
+                onActiveChanged?(false)
+            }
+            return didResign
+        }
 
         func insertText(_ text: String) {
             let normalized = text.replacingOccurrences(of: "\n", with: "\r")
@@ -237,13 +335,5 @@ struct TerminalInputCapture: UIViewRepresentable {
         @objc private func controlC() { onInput?(TerminalKey.controlC.sequence) }
         @objc private func controlD() { onInput?(TerminalKey.controlD.sequence) }
         @objc private func controlL() { onInput?(TerminalKey.controlL.sequence) }
-        @objc private func sendEscape() { onInput?(TerminalKey.escape.sequence) }
-        @objc private func sendTab() { onInput?(TerminalKey.tab.sequence) }
-        @objc private func sendControlC() { onInput?(TerminalKey.controlC.sequence) }
-        @objc private func sendPaste() {
-            guard let text = UIPasteboard.general.string, !text.isEmpty else { return }
-            onInput?(text.replacingOccurrences(of: "\n", with: "\r"))
-        }
-        @objc private func dismissKeyboard() { resignFirstResponder() }
     }
 }
