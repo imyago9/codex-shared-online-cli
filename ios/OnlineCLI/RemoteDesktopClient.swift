@@ -53,6 +53,10 @@ final class RemoteDesktopClient {
     private var pendingPointer: CGPoint?
     private var pointerFlushTask: Task<Void, Never>?
     private var lastControlPromptAt: TimeInterval = 0
+    private let monitorLayoutSendInterval: TimeInterval = 1.0 / 30.0
+    private var lastMonitorLayoutSendAt: TimeInterval = 0
+    private var pendingMonitorLayoutOffsets: [String: CGSize]?
+    private var monitorLayoutFlushTask: Task<Void, Never>?
 
     var isConnected: Bool {
         if case .connected = connectionState {
@@ -65,7 +69,8 @@ final class RemoteDesktopClient {
         baseURL: URL,
         desiredMode: RemoteMode,
         streamProfile: RemoteStreamProfile,
-        visibleMonitorIds: Set<String> = []
+        visibleMonitorIds: Set<String> = [],
+        monitorLayoutOffsets: [String: CGSize] = [:]
     ) {
         disconnect()
 
@@ -78,6 +83,9 @@ final class RemoteDesktopClient {
             ]
             if !visibleMonitorIds.isEmpty {
                 queryItems.append(URLQueryItem(name: "monitors", value: visibleMonitorIds.sorted().joined(separator: ",")))
+            }
+            if let layout = monitorLayoutQueryValue(monitorLayoutOffsets) {
+                queryItems.append(URLQueryItem(name: "layout", value: layout))
             }
             let url = try api.webSocketURL(
                 path: "ws/remote",
@@ -106,7 +114,10 @@ final class RemoteDesktopClient {
         receiveTask = nil
         pointerFlushTask?.cancel()
         pointerFlushTask = nil
+        monitorLayoutFlushTask?.cancel()
+        monitorLayoutFlushTask = nil
         pendingPointer = nil
+        pendingMonitorLayoutOffsets = nil
         webSocketTask?.cancel(with: .goingAway, reason: nil)
         webSocketTask = nil
         if isConnected || connectionState == .connecting {
@@ -139,21 +150,24 @@ final class RemoteDesktopClient {
     }
 
     func setMonitorLayoutOffsets(_ offsets: [String: CGSize]) {
-        let layout = offsets.compactMap { id, offset -> [String: Any]? in
-            let dx = Int(offset.width.rounded())
-            let dy = Int(offset.height.rounded())
-            guard !id.isEmpty, dx != 0 || dy != 0 else { return nil }
-            return [
-                "id": id,
-                "dx": dx,
-                "dy": dy
-            ]
+        let normalizedOffsets = normalizedMonitorLayoutOffsets(offsets)
+        if normalizedOffsets.isEmpty {
+            monitorLayoutFlushTask?.cancel()
+            monitorLayoutFlushTask = nil
+            pendingMonitorLayoutOffsets = nil
+            lastMonitorLayoutSendAt = ProcessInfo.processInfo.systemUptime
+            sendMonitorLayoutEnvelope(normalizedOffsets)
+            return
         }
 
-        sendEnvelope([
-            "type": "set-monitor-layout",
-            "layout": layout
-        ])
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - lastMonitorLayoutSendAt >= monitorLayoutSendInterval {
+            lastMonitorLayoutSendAt = now
+            sendMonitorLayoutEnvelope(normalizedOffsets)
+        } else {
+            pendingMonitorLayoutOffsets = normalizedOffsets
+            scheduleMonitorLayoutFlush(after: monitorLayoutSendInterval - (now - lastMonitorLayoutSendAt))
+        }
     }
 
     func sendPointerMove(_ point: CGPoint) {
@@ -432,6 +446,60 @@ final class RemoteDesktopClient {
             return
         }
         webSocketTask.send(.string(text)) { _ in }
+    }
+
+    private func sendMonitorLayoutEnvelope(_ offsets: [String: CGSize]) {
+        sendEnvelope([
+            "type": "set-monitor-layout",
+            "layout": monitorLayoutPayload(offsets)
+        ])
+    }
+
+    private func scheduleMonitorLayoutFlush(after delay: TimeInterval) {
+        guard monitorLayoutFlushTask == nil else { return }
+        let nanoseconds = UInt64(max(0, delay) * 1_000_000_000)
+        monitorLayoutFlushTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            self?.flushPendingMonitorLayout()
+        }
+    }
+
+    private func flushPendingMonitorLayout() {
+        monitorLayoutFlushTask = nil
+        guard let offsets = pendingMonitorLayoutOffsets else { return }
+        pendingMonitorLayoutOffsets = nil
+        lastMonitorLayoutSendAt = ProcessInfo.processInfo.systemUptime
+        sendMonitorLayoutEnvelope(offsets)
+    }
+
+    private func monitorLayoutQueryValue(_ offsets: [String: CGSize]) -> String? {
+        let payload = monitorLayoutPayload(normalizedMonitorLayoutOffsets(offsets))
+        guard !payload.isEmpty, JSONSerialization.isValidJSONObject(payload) else { return nil }
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    private func monitorLayoutPayload(_ offsets: [String: CGSize]) -> [[String: Any]] {
+        offsets.compactMap { id, offset -> [String: Any]? in
+            let dx = Int(offset.width.rounded())
+            let dy = Int(offset.height.rounded())
+            guard !id.isEmpty, dx != 0 || dy != 0 else { return nil }
+            return [
+                "id": id,
+                "dx": dx,
+                "dy": dy
+            ]
+        }
+    }
+
+    private func normalizedMonitorLayoutOffsets(_ offsets: [String: CGSize]) -> [String: CGSize] {
+        offsets.reduce(into: [String: CGSize]()) { result, entry in
+            let id = entry.key.trimmingCharacters(in: .whitespacesAndNewlines)
+            let dx = Int(entry.value.width.rounded())
+            let dy = Int(entry.value.height.rounded())
+            guard !id.isEmpty, dx != 0 || dy != 0 else { return }
+            result[id] = CGSize(width: dx, height: dy)
+        }
     }
 
     private func normalizedPoint(_ point: CGPoint) -> CGPoint {

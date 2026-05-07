@@ -66,6 +66,71 @@ function sanitizeMonitorIds(rawValue) {
   return ids;
 }
 
+function clampMonitorDelta(value) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) {
+    return 0;
+  }
+  return Math.max(-32_768, Math.min(32_768, Math.trunc(parsed)));
+}
+
+function sanitizeMonitorLayout(rawValue) {
+  let source = rawValue;
+  if (typeof rawValue === 'string') {
+    const trimmed = rawValue.trim();
+    if (!trimmed) {
+      return [];
+    }
+    try {
+      source = JSON.parse(trimmed);
+    } catch (_error) {
+      return [];
+    }
+  }
+
+  const entries = Array.isArray(source)
+    ? source
+    : (source && typeof source === 'object' ? Object.values(source) : []);
+  const seen = new Set();
+  const layout = [];
+
+  for (const entry of entries) {
+    const id = entry && typeof entry.id === 'string' ? entry.id.trim() : '';
+    if (!id || id.length > 120 || seen.has(id)) {
+      continue;
+    }
+
+    const dx = clampMonitorDelta(entry.dx);
+    const dy = clampMonitorDelta(entry.dy);
+    if (dx === 0 && dy === 0) {
+      continue;
+    }
+
+    seen.add(id);
+    layout.push({ id, dx, dy });
+    if (layout.length >= 16) {
+      break;
+    }
+  }
+
+  return layout;
+}
+
+function monitorLayoutsEqual(left, right) {
+  const a = Array.isArray(left) ? left : [];
+  const b = Array.isArray(right) ? right : [];
+  if (a.length !== b.length) {
+    return false;
+  }
+  return a.every((entry, index) => {
+    const other = b[index];
+    return other
+      && entry.id === other.id
+      && entry.dx === other.dx
+      && entry.dy === other.dy;
+  });
+}
+
 function clampNormalized(value) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) {
@@ -285,6 +350,7 @@ function createRemoteGateway(server, remoteClient, options = {}) {
     const requestedStreamFps = toBoundedInteger(parseQueryValue(req, 'fps'), defaults.streamFps, 1, 20);
     const requestedJpegQuality = toBoundedInteger(parseQueryValue(req, 'quality'), defaults.jpegQuality, 20, 95);
     const requestedMonitorIds = sanitizeMonitorIds(parseQueryValue(req, 'monitors'));
+    const requestedMonitorLayout = sanitizeMonitorLayout(parseQueryValue(req, 'layout'));
     const controlAllowed = status.sidecar.inputAvailable === true;
     let connectionSettings = {
       mode: requestedMode === 'control' && controlAllowed ? 'control' : 'view',
@@ -292,7 +358,8 @@ function createRemoteGateway(server, remoteClient, options = {}) {
       controlAllowed,
       streamFps: requestedStreamFps,
       jpegQuality: requestedJpegQuality,
-      monitorIds: requestedMonitorIds
+      monitorIds: requestedMonitorIds,
+      monitorLayout: requestedMonitorLayout
     };
 
     const remoteConnectionId = crypto.randomUUID();
@@ -548,6 +615,42 @@ function createRemoteGateway(server, remoteClient, options = {}) {
       bindStreamSocket();
     }
 
+    function sendMonitorLayoutToStream() {
+      if (!context.streamSocket || context.streamSocket.readyState !== WebSocket.OPEN) {
+        return;
+      }
+
+      try {
+        context.streamSocket.send(JSON.stringify({
+          type: 'set-monitor-layout',
+          layout: connectionSettings.monitorLayout || []
+        }));
+      } catch (_error) {
+        // The next stream reconnect or layout update will refresh sidecar state.
+      }
+    }
+
+    function applyMonitorLayout(rawLayout, reason) {
+      const monitorLayout = sanitizeMonitorLayout(rawLayout);
+      const changed = !monitorLayoutsEqual(connectionSettings.monitorLayout, monitorLayout);
+
+      connectionSettings = {
+        ...connectionSettings,
+        monitorLayout
+      };
+
+      sendControl('remote-monitor-layout', {
+        layout: monitorLayout,
+        reason: reason || null
+      });
+
+      if (!changed || context.closed) {
+        return;
+      }
+
+      sendMonitorLayoutToStream();
+    }
+
     function consumeRateBudget() {
       const now = Date.now();
       if ((now - context.rateWindowStartedAt) >= 1000) {
@@ -722,7 +825,8 @@ function createRemoteGateway(server, remoteClient, options = {}) {
       const streamSocket = remoteClient.openStreamSocket({
         fps: connectionSettings.streamFps,
         quality: connectionSettings.jpegQuality,
-        monitors: connectionSettings.monitorIds
+        monitors: connectionSettings.monitorIds,
+        layout: connectionSettings.monitorLayout
       });
       context.streamSocket = streamSocket;
 
@@ -734,8 +838,10 @@ function createRemoteGateway(server, remoteClient, options = {}) {
         sendControl('remote-stream-connected', {
           fps: connectionSettings.streamFps,
           jpegQuality: connectionSettings.jpegQuality,
-          monitorIds: connectionSettings.monitorIds
+          monitorIds: connectionSettings.monitorIds,
+          monitorLayout: connectionSettings.monitorLayout
         });
+        sendMonitorLayoutToStream();
       });
 
       streamSocket.on('message', (rawValue, isBinary) => {
@@ -773,7 +879,8 @@ function createRemoteGateway(server, remoteClient, options = {}) {
             fps: Number(payload.fps) || connectionSettings.streamFps,
             jpegQuality: Number(payload.jpegQuality) || connectionSettings.jpegQuality,
             monitors: Array.isArray(payload.monitors) ? payload.monitors : [],
-            monitorIds: Array.isArray(payload.monitorIds) ? payload.monitorIds : connectionSettings.monitorIds
+            monitorIds: Array.isArray(payload.monitorIds) ? payload.monitorIds : connectionSettings.monitorIds,
+            monitorLayout: connectionSettings.monitorLayout
           });
           return;
         }
@@ -902,6 +1009,11 @@ function createRemoteGateway(server, remoteClient, options = {}) {
         return;
       }
 
+      if (rawType === 'set-monitor-layout' || rawType === 'remote:set-monitor-layout') {
+        applyMonitorLayout(payload.layout || payload.monitors || [], 'client-drag');
+        return;
+      }
+
       if (rawType === 'release-all' || rawType === 'remote:release-all') {
         releaseRemoteInputState('client-request');
         return;
@@ -970,6 +1082,7 @@ function createRemoteGateway(server, remoteClient, options = {}) {
           ? status.sidecar.health.displays || status.sidecar.health.monitors || []
           : [],
         monitorIds: connectionSettings.monitorIds,
+        monitorLayout: connectionSettings.monitorLayout,
         sidecar: {
           reachable: status.sidecar.reachable === true,
           inputAvailable: status.sidecar.inputAvailable === true,

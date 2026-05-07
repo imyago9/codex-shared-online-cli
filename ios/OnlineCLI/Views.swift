@@ -371,18 +371,30 @@ struct RemoteDesktopView: View {
     @State private var monitorDragMode = false
     @State private var monitorLayoutOffsets: [String: CGSize] = [:]
     @State private var selectedMonitorIds: Set<String> = []
-    @FocusState private var keyboardFocused: Bool
+    @State private var remoteKeyboardVisible = false
+    @State private var remoteKeyboardFocusToken = 0
+    @State private var remoteKeyboardDismissToken = 0
     private let telemetryTicker = Timer.publish(every: 0.33, on: .main, in: .common).autoconnect()
 
     var body: some View {
         NavigationStack {
             GeometryReader { proxy in
                 let isLandscape = proxy.size.width > proxy.size.height || verticalSizeClass == .compact || interfaceIsLandscape
-                let leadingChromeOutset = isLandscape ? edgeOutset(proxy.safeAreaInsets.leading) : 0
-                let trailingChromeOutset = isLandscape ? edgeOutset(proxy.safeAreaInsets.trailing) : 0
+                let useLandscapeEdgeOutsets = isLandscape && keyboardHeight <= 0
+                let leadingChromeOutset = useLandscapeEdgeOutsets ? edgeOutset(proxy.safeAreaInsets.leading) : 0
+                let trailingChromeOutset = useLandscapeEdgeOutsets ? edgeOutset(proxy.safeAreaInsets.trailing) : 0
                 let bottomChromeOutset = isLandscape && keyboardHeight <= 0 ? edgeOutset(proxy.safeAreaInsets.bottom) : 0
                 ZStack {
                     Color.black.ignoresSafeArea()
+
+                    RemoteKeyboardBridge(
+                        client: client,
+                        focusToken: $remoteKeyboardFocusToken,
+                        dismissToken: $remoteKeyboardDismissToken,
+                        keyboardVisible: $remoteKeyboardVisible
+                    )
+                    .frame(width: max(44, proxy.size.width), height: max(44, proxy.size.height))
+                    .accessibilityHidden(true)
 
                     RemoteStageHost(
                         client: client,
@@ -456,7 +468,7 @@ struct RemoteDesktopView: View {
                         compact: isLandscape,
                         diagnosticsText: diagnosticsText,
                         actions: app.remoteCapabilities?.actions ?? [],
-                        keyboardFocused: $keyboardFocused,
+                        keyboardVisible: remoteKeyboardVisible,
                         onKeyboardFocus: focusRemoteKeyboard,
                         anchor: .leading
                     )
@@ -471,7 +483,7 @@ struct RemoteDesktopView: View {
                                 mode: desiredMode,
                                 monitorActive: monitorPanelPresented,
                                 monitorCount: availableMonitors.count,
-                                keyboardFocused: keyboardFocused,
+                                keyboardFocused: remoteKeyboardVisible,
                                 onControlToggle: toggleControlMode,
                                 onMonitorToggle: toggleMonitorPanel,
                                 onKeyboardToggle: toggleRemoteKeyboard
@@ -482,7 +494,6 @@ struct RemoteDesktopView: View {
                         .offset(x: trailingChromeOutset, y: bottomChromeOutset)
                     }
 
-                    RemoteKeyboardBridge(client: client, keyboardFocused: $keyboardFocused)
                 }
                 .ignoresSafeArea(.keyboard, edges: .bottom)
                 .toolbar(isLandscape ? .hidden : .visible, for: .navigationBar)
@@ -544,21 +555,22 @@ struct RemoteDesktopView: View {
             baseURL: url,
             desiredMode: desiredMode,
             streamProfile: streamProfile,
-            visibleMonitorIds: effectiveSelectedMonitorIds
+            visibleMonitorIds: effectiveSelectedMonitorIds,
+            monitorLayoutOffsets: monitorLayoutOffsets
         )
         refreshTelemetry()
     }
 
     private func disconnect() {
         client.disconnect()
-        keyboardFocused = false
+        dismissRemoteKeyboard()
         refreshTelemetry()
     }
 
     private func setRemoteMode(_ mode: RemoteMode) {
         desiredMode = mode
         if mode != .control {
-            keyboardFocused = false
+            dismissRemoteKeyboard()
         }
         client.setMode(mode)
         refreshTelemetry()
@@ -614,15 +626,20 @@ struct RemoteDesktopView: View {
         if desiredMode != .control {
             setRemoteMode(.control)
         }
-        keyboardFocused = true
+        remoteKeyboardFocusToken += 1
     }
 
     private func toggleRemoteKeyboard() {
-        if keyboardFocused {
-            keyboardFocused = false
+        if remoteKeyboardVisible {
+            dismissRemoteKeyboard()
         } else {
             focusRemoteKeyboard()
         }
+    }
+
+    private func dismissRemoteKeyboard() {
+        remoteKeyboardVisible = false
+        remoteKeyboardDismissToken += 1
     }
 
     private func refreshTelemetry() {
@@ -723,19 +740,23 @@ struct RemoteStageHost: View {
 
 struct RemoteKeyboardBridge: View {
     let client: RemoteDesktopClient
-    var keyboardFocused: FocusState<Bool>.Binding
+    @Binding var focusToken: Int
+    @Binding var dismissToken: Int
+    @Binding var keyboardVisible: Bool
 
     var body: some View {
         RemoteKeyboardInputCapture(
-            keyboardFocused: keyboardFocused,
+            focusToken: $focusToken,
+            dismissToken: $dismissToken,
+            keyboardVisible: $keyboardVisible,
             onText: { client.sendText($0) },
             onEnter: { client.sendKey("Enter", code: "Enter") },
             onBackspace: { client.sendKey("Backspace", code: "Backspace") },
             onEscape: { client.sendKey("Escape", code: "Escape") },
             onTab: { client.sendKey("Tab", code: "Tab") }
         )
-            .frame(width: 1, height: 1)
-            .opacity(0.01)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .accessibilityHidden(true)
     }
 }
 
@@ -1173,7 +1194,9 @@ struct RemoteStageGestureLayer: UIViewRepresentable {
 }
 
 struct RemoteKeyboardInputCapture: UIViewRepresentable {
-    var keyboardFocused: FocusState<Bool>.Binding
+    @Binding var focusToken: Int
+    @Binding var dismissToken: Int
+    @Binding var keyboardVisible: Bool
     let onText: (String) -> Void
     let onEnter: () -> Void
     let onBackspace: () -> Void
@@ -1187,7 +1210,7 @@ struct RemoteKeyboardInputCapture: UIViewRepresentable {
         view.onBackspace = onBackspace
         view.onEscape = onEscape
         view.onTab = onTab
-        view.onActiveChanged = { [binding = keyboardFocused] isActive in
+        view.onActiveChanged = { [binding = $keyboardVisible] isActive in
             binding.wrappedValue = isActive
         }
         return view
@@ -1199,15 +1222,19 @@ struct RemoteKeyboardInputCapture: UIViewRepresentable {
         uiView.onBackspace = onBackspace
         uiView.onEscape = onEscape
         uiView.onTab = onTab
-        uiView.onActiveChanged = { [binding = keyboardFocused] isActive in
+        uiView.onActiveChanged = { [binding = $keyboardVisible] isActive in
             binding.wrappedValue = isActive
         }
 
-        if keyboardFocused.wrappedValue, !uiView.isFirstResponder {
+        if uiView.lastFocusToken != focusToken {
+            uiView.lastFocusToken = focusToken
             DispatchQueue.main.async {
-                _ = uiView.becomeFirstResponder()
+                uiView.requestKeyboardFocus()
             }
-        } else if !keyboardFocused.wrappedValue, uiView.isFirstResponder {
+        }
+
+        if uiView.lastDismissToken != dismissToken {
+            uiView.lastDismissToken = dismissToken
             DispatchQueue.main.async {
                 _ = uiView.resignFirstResponder()
             }
@@ -1221,6 +1248,8 @@ struct RemoteKeyboardInputCapture: UIViewRepresentable {
         var onEscape: (() -> Void)?
         var onTab: (() -> Void)?
         var onActiveChanged: ((Bool) -> Void)?
+        var lastFocusToken = 0
+        var lastDismissToken = 0
 
         init() {
             super.init(frame: .zero, textContainer: nil)
@@ -1294,6 +1323,24 @@ struct RemoteKeyboardInputCapture: UIViewRepresentable {
                 command(input: "\u{7F}", action: #selector(backspace)),
                 command(input: UIKeyCommand.inputEscape, action: #selector(escape))
             ]
+        }
+
+        func requestKeyboardFocus(attempt: Int = 0) {
+            guard window != nil else {
+                guard attempt < 6 else { return }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                    self?.requestKeyboardFocus(attempt: attempt + 1)
+                }
+                return
+            }
+
+            reloadInputViews()
+            _ = becomeFirstResponder()
+
+            guard !isFirstResponder, attempt < 2 else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                self?.requestKeyboardFocus(attempt: attempt + 1)
+            }
         }
 
         private func command(input: String, action: Selector) -> UIKeyCommand {
@@ -1660,14 +1707,11 @@ struct RemoteMonitorLayoutPreview: View {
                         scale: scale,
                         offset: Binding(
                             get: { layoutOffsets[monitor.id] ?? .zero },
-                            set: { updateMonitorOffset(monitor.id, $0) }
+                            set: { updateMonitorOffset(monitor.id, $0, publish: true) }
                         ),
                         onToggle: { onToggle(monitor) },
                         onLayoutChange: { finalOffset in
-                            updateMonitorOffset(monitor.id, finalOffset)
-                            var nextOffsets = layoutOffsets
-                            nextOffsets[monitor.id] = finalOffset
-                            onLayoutChange(nextOffsets)
+                            updateMonitorOffset(monitor.id, finalOffset, publish: true)
                         }
                     )
                     .frame(width: max(54, displayRect.width), height: max(38, displayRect.height))
@@ -1711,11 +1755,16 @@ struct RemoteMonitorLayoutPreview: View {
         )
     }
 
-    private func updateMonitorOffset(_ id: String, _ offset: CGSize) {
+    private func updateMonitorOffset(_ id: String, _ offset: CGSize, publish: Bool = false) {
+        var nextOffsets = layoutOffsets
+        nextOffsets[id] = offset
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
-            layoutOffsets[id] = offset
+            layoutOffsets = nextOffsets
+        }
+        if publish {
+            onLayoutChange(nextOffsets)
         }
     }
 }
@@ -1871,7 +1920,7 @@ struct FloatingRemoteControls: View {
     let compact: Bool
     let diagnosticsText: String
     let actions: [RemoteActionDescriptor]
-    var keyboardFocused: FocusState<Bool>.Binding
+    let keyboardVisible: Bool
     let onKeyboardFocus: () -> Void
     let anchor: Anchor
 
@@ -1934,7 +1983,7 @@ struct FloatingRemoteControls: View {
                 joystickSensitivity: $joystickSensitivity,
                 diagnosticsText: diagnosticsText,
                 actions: actions,
-                keyboardFocused: keyboardFocused,
+                keyboardVisible: keyboardVisible,
                 onKeyboardFocus: onKeyboardFocus,
                 compact: compact
             )
@@ -2012,7 +2061,7 @@ struct RemoteControlDeck: View {
     @Binding var joystickSensitivity: Double
     let diagnosticsText: String
     let actions: [RemoteActionDescriptor]
-    var keyboardFocused: FocusState<Bool>.Binding
+    let keyboardVisible: Bool
     let onKeyboardFocus: () -> Void
     let compact: Bool
 

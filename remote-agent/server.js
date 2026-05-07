@@ -146,6 +146,81 @@ function sanitizeMonitorIds(rawValue) {
   return ids;
 }
 
+function clampMonitorDelta(value) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) {
+    return 0;
+  }
+  return Math.max(-32_768, Math.min(32_768, Math.trunc(parsed)));
+}
+
+function sanitizeMonitorLayout(rawValue) {
+  let source = rawValue;
+  if (typeof rawValue === 'string') {
+    const trimmed = rawValue.trim();
+    if (!trimmed) {
+      return [];
+    }
+    try {
+      source = JSON.parse(trimmed);
+    } catch (_error) {
+      return [];
+    }
+  }
+
+  const entries = Array.isArray(source)
+    ? source
+    : (source && typeof source === 'object' ? Object.values(source) : []);
+  const seen = new Set();
+  const layout = [];
+
+  for (const entry of entries) {
+    const id = entry && typeof entry.id === 'string' ? entry.id.trim() : '';
+    if (!id || id.length > 120 || seen.has(id)) {
+      continue;
+    }
+
+    const dx = clampMonitorDelta(entry.dx);
+    const dy = clampMonitorDelta(entry.dy);
+    if (dx === 0 && dy === 0) {
+      continue;
+    }
+
+    seen.add(id);
+    layout.push({ id, dx, dy });
+    if (layout.length >= 16) {
+      break;
+    }
+  }
+
+  return layout;
+}
+
+function applyMonitorLayout(displays, layout) {
+  const entries = Array.isArray(displays)
+    ? displays.map((entry) => normalizeDisplayDescriptor(entry)).filter((entry) => entry !== null)
+    : [];
+  const offsets = new Map(
+    sanitizeMonitorLayout(layout).map((entry) => [entry.id, entry])
+  );
+
+  if (entries.length === 0 || offsets.size === 0) {
+    return entries;
+  }
+
+  return entries.map((display) => {
+    const offset = offsets.get(display.id);
+    if (!offset) {
+      return display;
+    }
+    return {
+      ...display,
+      left: display.left + offset.dx,
+      top: display.top + offset.dy
+    };
+  });
+}
+
 function getInputBounds(displayBounds) {
   const left = Number.isFinite(displayBounds && displayBounds.left)
     ? Number(displayBounds.left)
@@ -161,6 +236,32 @@ function getInputBounds(displayBounds) {
     : (Number.isFinite(displayBounds && displayBounds.virtualHeight) ? Number(displayBounds.virtualHeight) : 1));
 
   return { left, top, width, height };
+}
+
+const inputCoordinateMapper = {
+  mapNormalizedPoint: null
+};
+
+function getInputPoint(displayBounds, x, y) {
+  if (typeof inputCoordinateMapper.mapNormalizedPoint === 'function') {
+    const mapped = inputCoordinateMapper.mapNormalizedPoint(x, y);
+    if (
+      mapped
+      && Number.isFinite(mapped.px)
+      && Number.isFinite(mapped.py)
+    ) {
+      return {
+        px: Math.round(mapped.px),
+        py: Math.round(mapped.py)
+      };
+    }
+  }
+
+  const bounds = getInputBounds(displayBounds);
+  return {
+    px: bounds.left + Math.round(x * Math.max(1, bounds.width - 1)),
+    py: bounds.top + Math.round(y * Math.max(1, bounds.height - 1))
+  };
 }
 
 function resolveDisplayBounds(logger) {
@@ -430,14 +531,7 @@ function createBlankImage(Jimp, width, height, color) {
 }
 
 function getSelectedCaptureDisplays() {
-  const catalog = getDisplayCatalogSnapshot();
-  if (!Array.isArray(streamState.activeMonitorIds) || streamState.activeMonitorIds.length === 0) {
-    return catalog;
-  }
-
-  const selected = new Set(streamState.activeMonitorIds);
-  const selectedDisplays = catalog.filter((display) => selected.has(display.id));
-  return selectedDisplays.length > 0 ? selectedDisplays : catalog;
+  return applyMonitorLayout(getSelectedDisplayCatalogSnapshot(), streamState.activeMonitorLayout);
 }
 
 function computeComposedFrameScale(bounds) {
@@ -1242,9 +1336,7 @@ function createNutInputController(nut, displayBounds, logger) {
       throw new Error('invalid-normalized-coordinates');
     }
 
-    const bounds = getInputBounds(displayBounds);
-    const px = bounds.left + Math.round(normalizedX * Math.max(1, bounds.width - 1));
-    const py = bounds.top + Math.round(normalizedY * Math.max(1, bounds.height - 1));
+    const { px, py } = getInputPoint(displayBounds, normalizedX, normalizedY);
 
     if (typeof mouse.setPosition !== 'function') {
       throw new Error('mouse-setPosition-unavailable');
@@ -1765,12 +1857,7 @@ function Invoke-TextInput([string]$base64) {
       return null;
     }
 
-    const bounds = getInputBounds(displayBounds);
-
-    return {
-      px: bounds.left + Math.round(normalizedX * Math.max(1, bounds.width - 1)),
-      py: bounds.top + Math.round(normalizedY * Math.max(1, bounds.height - 1))
-    };
+    return getInputPoint(displayBounds, normalizedX, normalizedY);
   }
 
   function flushPendingMove() {
@@ -2014,6 +2101,7 @@ const streamState = {
   activeFps: config.streamFps,
   activeQuality: config.jpegQuality,
   activeMonitorIds: [],
+  activeMonitorLayout: [],
   framesInWindow: 0,
   windowStartedAt: Date.now(),
   currentFps: 0,
@@ -2069,6 +2157,79 @@ function getDisplayCatalogSnapshot() {
 
   return [createVirtualDisplayDescriptor(displayBounds)];
 }
+
+function getSelectedDisplayCatalogSnapshot() {
+  const catalog = getDisplayCatalogSnapshot();
+  if (!Array.isArray(streamState.activeMonitorIds) || streamState.activeMonitorIds.length === 0) {
+    return catalog;
+  }
+
+  const selected = new Set(streamState.activeMonitorIds);
+  const selectedDisplays = catalog.filter((display) => selected.has(display.id));
+  return selectedDisplays.length > 0 ? selectedDisplays : catalog;
+}
+
+function mapNormalizedInputThroughMonitorLayout(x, y) {
+  const normalizedX = clampNormalized(x);
+  const normalizedY = clampNormalized(y);
+  if (normalizedX === null || normalizedY === null) {
+    return null;
+  }
+  if (!Array.isArray(streamState.activeMonitorLayout) || streamState.activeMonitorLayout.length === 0) {
+    return null;
+  }
+
+  const physicalDisplays = getSelectedDisplayCatalogSnapshot();
+  if (physicalDisplays.length <= 1) {
+    return null;
+  }
+
+  const visualDisplays = applyMonitorLayout(physicalDisplays, streamState.activeMonitorLayout);
+  const visualBounds = computeDisplayUnion(visualDisplays);
+  if (!visualBounds) {
+    return null;
+  }
+
+  const visualX = visualBounds.left + normalizedX * Math.max(1, visualBounds.width - 1);
+  const visualY = visualBounds.top + normalizedY * Math.max(1, visualBounds.height - 1);
+  let visualDisplay = visualDisplays.find((display) => (
+    visualX >= display.left
+    && visualX <= display.left + display.width
+    && visualY >= display.top
+    && visualY <= display.top + display.height
+  ));
+
+  if (!visualDisplay) {
+    visualDisplay = visualDisplays
+      .map((display) => {
+        const clampedX = Math.max(display.left, Math.min(display.left + display.width, visualX));
+        const clampedY = Math.max(display.top, Math.min(display.top + display.height, visualY));
+        return {
+          display,
+          distance: Math.hypot(visualX - clampedX, visualY - clampedY)
+        };
+      })
+      .sort((a, b) => a.distance - b.distance)[0]?.display || null;
+  }
+
+  if (!visualDisplay) {
+    return null;
+  }
+
+  const physicalDisplay = physicalDisplays.find((display) => display.id === visualDisplay.id);
+  if (!physicalDisplay) {
+    return null;
+  }
+
+  const localX = Math.max(0, Math.min(1, (visualX - visualDisplay.left) / Math.max(1, visualDisplay.width)));
+  const localY = Math.max(0, Math.min(1, (visualY - visualDisplay.top) / Math.max(1, visualDisplay.height)));
+  return {
+    px: physicalDisplay.left + Math.round(localX * Math.max(1, physicalDisplay.width - 1)),
+    py: physicalDisplay.top + Math.round(localY * Math.max(1, physicalDisplay.height - 1))
+  };
+}
+
+inputCoordinateMapper.mapNormalizedPoint = mapNormalizedInputThroughMonitorLayout;
 
 const initialWindowsDisplayCatalog = resolveWindowsDisplayCatalog(logger);
 if (initialWindowsDisplayCatalog.length > 0) {
@@ -2151,6 +2312,7 @@ function recomputeStreamSettings() {
   let nextFps = config.streamFps;
   let nextQuality = config.jpegQuality;
   let nextMonitorIds = [];
+  let nextMonitorLayout = [];
 
   for (const client of streamState.clients) {
     if (!isWsOpen(client)) {
@@ -2166,12 +2328,16 @@ function recomputeStreamSettings() {
     if (Array.isArray(client.requestedMonitorIds) && client.requestedMonitorIds.length > 0) {
       nextMonitorIds = client.requestedMonitorIds.slice(0, 16);
     }
+    if (Array.isArray(client.requestedMonitorLayout)) {
+      nextMonitorLayout = client.requestedMonitorLayout.slice(0, 16);
+    }
   }
 
   const fpsChanged = nextFps !== streamState.activeFps;
   streamState.activeFps = nextFps;
   streamState.activeQuality = nextQuality;
   streamState.activeMonitorIds = nextMonitorIds;
+  streamState.activeMonitorLayout = nextMonitorLayout;
 
   if (fpsChanged && streamState.timer) {
     clearInterval(streamState.timer);
@@ -2440,6 +2606,7 @@ streamWss.on('connection', (socket, req) => {
   socket.requestedFps = clampInteger(parseInteger(query.get('fps'), config.streamFps), 1, 20);
   socket.requestedQuality = clampInteger(parseInteger(query.get('quality'), config.jpegQuality), 20, 95);
   socket.requestedMonitorIds = sanitizeMonitorIds(query.get('monitors'));
+  socket.requestedMonitorLayout = sanitizeMonitorLayout(query.get('layout'));
 
   streamState.clients.add(socket);
   recomputeStreamSettings();
@@ -2451,9 +2618,38 @@ streamWss.on('connection', (socket, req) => {
       fps: streamState.activeFps,
       jpegQuality: streamState.activeQuality,
       monitors: getDisplayCatalogSnapshot(),
-      monitorIds: socket.requestedMonitorIds
+      monitorIds: socket.requestedMonitorIds,
+      monitorLayout: socket.requestedMonitorLayout
     }));
   }
+
+  socket.on('message', (rawValue, isBinary) => {
+    if (isBinary) {
+      return;
+    }
+
+    const text = decodeWsText(rawValue);
+    if (!text) {
+      return;
+    }
+
+    let payload = null;
+    try {
+      payload = JSON.parse(text);
+    } catch (_error) {
+      return;
+    }
+
+    const type = payload && typeof payload.type === 'string'
+      ? payload.type.trim().toLowerCase()
+      : '';
+    if (type !== 'set-monitor-layout' && type !== 'remote:set-monitor-layout') {
+      return;
+    }
+
+    socket.requestedMonitorLayout = sanitizeMonitorLayout(payload.layout || []);
+    recomputeStreamSettings();
+  });
 
   socket.on('close', () => {
     streamState.clients.delete(socket);

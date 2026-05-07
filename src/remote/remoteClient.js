@@ -59,6 +59,30 @@ function toSafeInteger(rawValue, fallback, min, max) {
   return Math.max(min, Math.min(max, Math.trunc(parsed)));
 }
 
+function serializeMonitorLayout(layout) {
+  if (!Array.isArray(layout) || layout.length === 0) {
+    return null;
+  }
+
+  const items = layout
+    .map((entry) => {
+      const id = entry && typeof entry.id === 'string' ? entry.id.trim() : '';
+      const dx = Number.parseInt(entry && entry.dx, 10);
+      const dy = Number.parseInt(entry && entry.dy, 10);
+      if (!id || id.length > 120 || (!Number.isFinite(dx) && !Number.isFinite(dy))) {
+        return null;
+      }
+      return {
+        id,
+        dx: Number.isFinite(dx) ? dx : 0,
+        dy: Number.isFinite(dy) ? dy : 0
+      };
+    })
+    .filter((entry) => entry && (entry.dx !== 0 || entry.dy !== 0));
+
+  return items.length > 0 ? JSON.stringify(items.slice(0, 16)) : null;
+}
+
 function normalizeAgentUrl(rawValue) {
   const fallback = 'http://127.0.0.1:3390';
   const candidate = typeof rawValue === 'string' && rawValue.trim() ? rawValue.trim() : fallback;
@@ -326,7 +350,8 @@ class RemoteClient {
       quality: toSafeInteger(options.quality, this.jpegQuality, 20, 95),
       monitors: Array.isArray(options.monitors) && options.monitors.length > 0
         ? options.monitors.join(',')
-        : null
+        : null,
+      layout: serializeMonitorLayout(options.layout)
     });
 
     return new WebSocket(wsUrl, {
