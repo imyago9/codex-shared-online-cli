@@ -131,6 +131,32 @@ enum RemoteStreamProfile: String, Codable, CaseIterable, Identifiable {
             return 86
         }
     }
+
+    var nextLowerPressureProfile: RemoteStreamProfile? {
+        switch self {
+        case .economy:
+            return nil
+        case .balanced:
+            return .economy
+        case .fluid:
+            return .balanced
+        case .sharp:
+            return .balanced
+        }
+    }
+
+    var nextHigherQualityProfile: RemoteStreamProfile? {
+        switch self {
+        case .economy:
+            return .balanced
+        case .balanced:
+            return .fluid
+        case .fluid:
+            return .sharp
+        case .sharp:
+            return nil
+        }
+    }
 }
 
 enum RemoteMode: String, Codable, CaseIterable, Identifiable {
@@ -145,6 +171,36 @@ enum RemoteMode: String, Codable, CaseIterable, Identifiable {
             return "View"
         case .control:
             return "Control"
+        }
+    }
+}
+
+enum RemoteGestureMode: String, Codable, CaseIterable, Identifiable {
+    case direct
+    case trackpad
+    case viewport
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .direct:
+            return "Direct"
+        case .trackpad:
+            return "Trackpad"
+        case .viewport:
+            return "Viewport"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .direct:
+            return "hand.tap"
+        case .trackpad:
+            return "rectangle.and.hand.point.up.left"
+        case .viewport:
+            return "move.3d"
         }
     }
 }
@@ -351,7 +407,7 @@ struct RemoteSidecarCursorHealth: Codable {
     let reason: String?
 }
 
-struct RemoteDisplayInfo: Codable {
+struct RemoteDisplayInfo: Codable, Hashable {
     let left: Int?
     let top: Int?
     let width: Int?

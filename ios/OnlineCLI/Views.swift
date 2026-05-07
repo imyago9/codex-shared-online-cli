@@ -3,9 +3,9 @@ import UIKit
 
 private enum RemoteViewportSettings {
     static let minimumZoom = 1.0
-    static let maximumZoom = 8.0
+    static let maximumZoom = 12.0
     static let zoomStep = 0.5
-    static let doubleTapZoom = 2.5
+    static let doubleTapZoom = 2.75
 }
 
 private enum RemoteChromeSpacing {
@@ -21,14 +21,29 @@ struct RemoteTelemetrySnapshot: Equatable {
     var latency: Double?
     var frameBytes = 0
     var displaySizeText: String?
+    var decodeMs = 0.0
+    var renderMs = 0.0
+    var droppedFrames = 0
+    var receivedFps = 0.0
+    var presentedFps = 0.0
+    var inputQueueMax: Int?
+    var droppedInputEvents = 0
 
     @MainActor
     init(client: RemoteDesktopClient) {
+        let diagnostics = client.renderDiagnostics
         state = client.connectionState
         status = client.statusText
         fps = client.frameFps
         latency = client.frameLatencyMs
         frameBytes = client.frameBytes
+        decodeMs = diagnostics.decodeMs
+        renderMs = diagnostics.renderMs
+        droppedFrames = diagnostics.droppedFrames
+        receivedFps = diagnostics.receivedFps
+        presentedFps = diagnostics.presentedFps
+        inputQueueMax = client.inputQueueMax ?? diagnostics.inputQueueMax
+        droppedInputEvents = client.droppedEvents
         if let display = client.displayInfo, let width = display.width, let height = display.height {
             displaySizeText = "\(width)x\(height)"
         }
@@ -359,6 +374,7 @@ struct RemoteDesktopView: View {
     @State private var client = RemoteDesktopClient()
     @State private var desiredMode: RemoteMode = .view
     @State private var streamProfile: RemoteStreamProfile = .balanced
+    @State private var gestureMode: RemoteGestureMode = .direct
     @State private var zoom = 1.0
     @State private var panOffset = CGSize.zero
     @State private var joystickSensitivity = 1.0
@@ -401,6 +417,7 @@ struct RemoteDesktopView: View {
                         zoom: $zoom,
                         panOffset: $panOffset,
                         controlMode: desiredMode == .control,
+                        gestureMode: gestureMode,
                         interactionEnabled: !(monitorPanelPresented && monitorDragMode),
                         displayInfo: client.displayInfo,
                         monitors: availableMonitors,
@@ -410,12 +427,21 @@ struct RemoteDesktopView: View {
                     .allowsHitTesting(!(monitorPanelPresented && monitorDragMode))
                     .ignoresSafeArea(edges: .bottom)
 
+                    VStack {
+                        Spacer()
+                        RemoteDiagnosticsOverlay(telemetry: telemetry)
+                            .padding(.bottom, quickDockBottomInset(isLandscape: isLandscape) + 58)
+                    }
+                    .allowsHitTesting(false)
+                    .zIndex(10)
+
                     VStack(spacing: 0) {
                         HStack {
                             RemoteTopOverlay(
                                 telemetry: telemetry,
                                 mode: $desiredMode,
                                 profile: $streamProfile,
+                                gestureMode: $gestureMode,
                                 compact: true,
                                 onConnect: connect,
                                 onDisconnect: disconnect,
@@ -650,6 +676,9 @@ struct RemoteDesktopView: View {
         if telemetry != next {
             telemetry = next
         }
+        if client.isConnected, streamProfile != client.streamProfile {
+            streamProfile = client.streamProfile
+        }
     }
 
     private func updateInterfaceOrientation() {
@@ -685,10 +714,19 @@ struct RemoteDesktopView: View {
     }
 
     private var diagnosticsText: String {
-        let queue = client.inputQueueMax.map { "queue \($0)" } ?? "queue --"
+        let queue = telemetry.inputQueueMax.map { "q \($0)" } ?? "q --"
         let rate = client.inputRateLimitPerSec.map { "\($0)/s" } ?? "--/s"
-        let dropped = client.droppedEvents > 0 ? " • dropped \(client.droppedEvents)" : ""
-        return "Input \(rate), \(queue)\(dropped)"
+        return String(
+            format: "rx %.1f • draw %.1f • dec %.1fms • render %.1fms • drop %d • input %@ %@/%d",
+            telemetry.receivedFps,
+            telemetry.presentedFps,
+            telemetry.decodeMs,
+            telemetry.renderMs,
+            telemetry.droppedFrames,
+            queue,
+            rate,
+            telemetry.droppedInputEvents
+        )
     }
 
     private var availableMonitors: [RemoteMonitorDescriptor] {
@@ -717,6 +755,7 @@ struct RemoteStageHost: View {
     @Binding var zoom: Double
     @Binding var panOffset: CGSize
     let controlMode: Bool
+    let gestureMode: RemoteGestureMode
     let interactionEnabled: Bool
     let displayInfo: RemoteDisplayInfo?
     let monitors: [RemoteMonitorDescriptor]
@@ -724,22 +763,966 @@ struct RemoteStageHost: View {
     let monitorLayoutOffsets: [String: CGSize]
 
     var body: some View {
-        RemoteStageView(
-            image: client.frameImage,
+        RemoteStageSurface(
+            client: client,
             zoom: $zoom,
             panOffset: $panOffset,
             controlMode: controlMode,
+            gestureMode: gestureMode,
             interactionEnabled: interactionEnabled,
             displayInfo: displayInfo,
             monitors: monitors,
             selectedMonitorIds: selectedMonitorIds,
             monitorLayoutOffsets: monitorLayoutOffsets,
-            remoteCursor: client.remoteCursor,
             onClick: { point in client.sendClick(at: point) },
+            onRightClick: { point in client.sendClick(button: "right", at: point) },
+            onPointerMove: { point in client.sendPointerMove(point) },
             onDragStart: { point in client.beginDrag(at: point) },
             onDragMove: { point in client.updateDrag(to: point) },
             onDragEnd: { point in client.endDrag(at: point) }
         )
+    }
+}
+
+private struct RemoteStageSurface: UIViewRepresentable {
+    let client: RemoteDesktopClient
+    @Binding var zoom: Double
+    @Binding var panOffset: CGSize
+    let controlMode: Bool
+    let gestureMode: RemoteGestureMode
+    let interactionEnabled: Bool
+    let displayInfo: RemoteDisplayInfo?
+    let monitors: [RemoteMonitorDescriptor]
+    let selectedMonitorIds: Set<String>
+    let monitorLayoutOffsets: [String: CGSize]
+    let onClick: (CGPoint) -> Void
+    let onRightClick: (CGPoint) -> Void
+    let onPointerMove: (CGPoint) -> Void
+    let onDragStart: (CGPoint) -> Void
+    let onDragMove: (CGPoint) -> Void
+    let onDragEnd: (CGPoint) -> Void
+
+    func makeUIView(context: Context) -> RemoteStageSurfaceView {
+        let view = RemoteStageSurfaceView()
+        attachSinks(to: view)
+        return view
+    }
+
+    func updateUIView(_ uiView: RemoteStageSurfaceView, context: Context) {
+        let zoomBinding = $zoom
+        let panOffsetBinding = $panOffset
+
+        attachSinks(to: uiView)
+        uiView.configure(
+            zoom: zoom,
+            panOffset: panOffset,
+            controlMode: controlMode,
+            gestureMode: gestureMode,
+            interactionEnabled: interactionEnabled,
+            displayInfo: displayInfo,
+            monitors: monitors,
+            selectedMonitorIds: selectedMonitorIds,
+            monitorLayoutOffsets: monitorLayoutOffsets,
+            onZoomChange: { zoomBinding.wrappedValue = $0 },
+            onPanOffsetChange: { panOffsetBinding.wrappedValue = $0 },
+            onClick: onClick,
+            onRightClick: onRightClick,
+            onPointerMove: onPointerMove,
+            onDragStart: onDragStart,
+            onDragMove: onDragMove,
+            onDragEnd: onDragEnd,
+            onFramePresented: { client.recordFramePresented(renderMs: $0) }
+        )
+        uiView.setFrame(RemoteFrameRenderUpdate(
+            image: client.frameImage,
+            pixelSize: client.desktopSize,
+            sequence: client.frameSequence,
+            decodeMs: client.renderDiagnostics.decodeMs,
+            receivedAt: ProcessInfo.processInfo.systemUptime
+        ))
+        uiView.setRemoteCursor(client.remoteCursor)
+    }
+
+    private func attachSinks(to view: RemoteStageSurfaceView) {
+        client.frameSink = { [weak view] update in
+            view?.setFrame(update)
+        }
+        client.cursorSink = { [weak view] point in
+            view?.setRemoteCursor(point)
+        }
+    }
+}
+
+private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate {
+    private final class MonitorLayers {
+        let imageLayer = CALayer()
+        let strokeLayer = CAShapeLayer()
+        let labelBackgroundLayer = CAShapeLayer()
+        let textLayer = CATextLayer()
+
+        init(contentParent: CALayer, overlayParent: CALayer, contentsScale: CGFloat) {
+            imageLayer.contentsGravity = .resize
+            imageLayer.magnificationFilter = .linear
+            imageLayer.minificationFilter = .linear
+            imageLayer.contentsScale = contentsScale
+            textLayer.contentsScale = contentsScale
+            textLayer.alignmentMode = .center
+            textLayer.truncationMode = .end
+            textLayer.isWrapped = false
+            contentParent.addSublayer(imageLayer)
+            overlayParent.addSublayer(strokeLayer)
+            overlayParent.addSublayer(labelBackgroundLayer)
+            overlayParent.addSublayer(textLayer)
+        }
+
+        func removeFromSuperlayer() {
+            imageLayer.removeFromSuperlayer()
+            strokeLayer.removeFromSuperlayer()
+            labelBackgroundLayer.removeFromSuperlayer()
+            textLayer.removeFromSuperlayer()
+        }
+    }
+
+    private struct StageGeometry {
+        let sourceBounds: CGRect
+        let visualBounds: CGRect
+        let visualFrame: CGRect
+        let monitorFrames: [RemoteMonitorStageFrame]
+        let usesMonitorImageLayers: Bool
+    }
+
+    private let imageView = UIView()
+    private let placeholderView = UIStackView()
+    private let placeholderIcon = UIImageView(image: UIImage(systemName: "display.trianglebadge.exclamationmark"))
+    private let placeholderLabel = UILabel()
+    private let monitorContentLayer = CALayer()
+    private let monitorOverlayLayer = CALayer()
+    private let cursorView = UIImageView(image: UIImage(systemName: "cursorarrow"))
+
+    private var renderedSequence: UInt64?
+    private var presentedSequence: UInt64?
+    private var latestImage: CGImage?
+    private var desktopSize = CGSize(width: 1280, height: 720)
+    private var remoteCursor: CGPoint?
+    private var zoomValue = RemoteViewportSettings.minimumZoom
+    private var panOffsetValue = CGSize.zero
+    private var controlMode = false
+    private var gestureMode = RemoteGestureMode.direct
+    private var displayInfo: RemoteDisplayInfo?
+    private var monitors: [RemoteMonitorDescriptor] = []
+    private var selectedMonitorIds: Set<String> = []
+    private var monitorLayoutOffsets: [String: CGSize] = [:]
+    private var monitorLayers: [String: MonitorLayers] = [:]
+
+    private var onZoomChange: ((Double) -> Void)?
+    private var onPanOffsetChange: ((CGSize) -> Void)?
+    private var onClick: ((CGPoint) -> Void)?
+    private var onRightClick: ((CGPoint) -> Void)?
+    private var onPointerMove: ((CGPoint) -> Void)?
+    private var onDragStart: ((CGPoint) -> Void)?
+    private var onDragMove: ((CGPoint) -> Void)?
+    private var onDragEnd: ((CGPoint) -> Void)?
+    private var onFramePresented: ((Double) -> Void)?
+
+    private weak var twoFingerPanRecognizer: UIPanGestureRecognizer?
+    private weak var pinchRecognizer: UIPinchGestureRecognizer?
+    private weak var longPressRecognizer: UILongPressGestureRecognizer?
+    private weak var trackedTouch: UITouch?
+    private var touchStartLocation = CGPoint.zero
+    private var touchStartPoint: CGPoint?
+    private var touchLastPoint: CGPoint?
+    private var trackpadStartCursor: CGPoint?
+    private var longPressConsumed = false
+    private var singleFingerViewportPanActive = false
+    private var remoteDragActive = false
+    private var initialPanOffset = CGSize.zero
+    private var initialZoom = RemoteViewportSettings.minimumZoom
+    private var initialPinchLocation = CGPoint.zero
+    private let dragActivationDistance: CGFloat = 4
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        commonInit()
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    func configure(
+        zoom: Double,
+        panOffset: CGSize,
+        controlMode: Bool,
+        gestureMode: RemoteGestureMode,
+        interactionEnabled: Bool,
+        displayInfo: RemoteDisplayInfo?,
+        monitors: [RemoteMonitorDescriptor],
+        selectedMonitorIds: Set<String>,
+        monitorLayoutOffsets: [String: CGSize],
+        onZoomChange: @escaping (Double) -> Void,
+        onPanOffsetChange: @escaping (CGSize) -> Void,
+        onClick: @escaping (CGPoint) -> Void,
+        onRightClick: @escaping (CGPoint) -> Void,
+        onPointerMove: @escaping (CGPoint) -> Void,
+        onDragStart: @escaping (CGPoint) -> Void,
+        onDragMove: @escaping (CGPoint) -> Void,
+        onDragEnd: @escaping (CGPoint) -> Void,
+        onFramePresented: @escaping (Double) -> Void
+    ) {
+        var needsLayout = false
+        let nextZoom = clampedZoom(zoom)
+        if abs(nextZoom - zoomValue) > 0.0001 {
+            zoomValue = nextZoom
+            needsLayout = true
+        }
+
+        let nextPanOffset = clampedPanOffset(panOffset)
+        if nextPanOffset != panOffsetValue {
+            panOffsetValue = nextPanOffset
+            needsLayout = true
+        }
+
+        if self.controlMode != controlMode {
+            self.controlMode = controlMode
+        }
+        if self.gestureMode != gestureMode {
+            self.gestureMode = gestureMode
+            cancelTrackedTouch()
+        }
+
+        if isUserInteractionEnabled != interactionEnabled {
+            isUserInteractionEnabled = interactionEnabled
+            if !interactionEnabled {
+                cancelTrackedTouch()
+            }
+        }
+
+        if self.displayInfo != displayInfo {
+            self.displayInfo = displayInfo
+            needsLayout = true
+        }
+        if self.monitors != monitors {
+            self.monitors = monitors
+            needsLayout = true
+        }
+        if self.selectedMonitorIds != selectedMonitorIds {
+            self.selectedMonitorIds = selectedMonitorIds
+            needsLayout = true
+        }
+        if self.monitorLayoutOffsets != monitorLayoutOffsets {
+            self.monitorLayoutOffsets = monitorLayoutOffsets
+            needsLayout = true
+        }
+
+        self.onZoomChange = onZoomChange
+        self.onPanOffsetChange = onPanOffsetChange
+        self.onClick = onClick
+        self.onRightClick = onRightClick
+        self.onPointerMove = onPointerMove
+        self.onDragStart = onDragStart
+        self.onDragMove = onDragMove
+        self.onDragEnd = onDragEnd
+        self.onFramePresented = onFramePresented
+
+        if needsLayout {
+            setNeedsLayout()
+        }
+    }
+
+    func setFrame(_ update: RemoteFrameRenderUpdate) {
+        guard renderedSequence != update.sequence else { return }
+        renderedSequence = update.sequence
+        latestImage = update.image
+        desktopSize = update.pixelSize
+        imageView.layer.contents = update.image
+        placeholderView.isHidden = update.image != nil
+        cursorView.isHidden = update.image == nil || remoteCursor == nil
+        setNeedsLayout()
+    }
+
+    func setRemoteCursor(_ point: CGPoint?) {
+        guard remoteCursor != point else { return }
+        remoteCursor = point
+        cursorView.isHidden = latestImage == nil || point == nil
+        setNeedsLayout()
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let renderStartedAt = CACurrentMediaTime()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+
+        placeholderView.frame = bounds
+        monitorContentLayer.frame = bounds
+        monitorOverlayLayer.frame = bounds
+
+        if let image = latestImage, let geometry = stageGeometry(for: image, panOffset: panOffsetValue, zoom: zoomValue) {
+            imageView.isHidden = geometry.usesMonitorImageLayers
+            monitorContentLayer.isHidden = !geometry.usesMonitorImageLayers
+            if geometry.usesMonitorImageLayers {
+                updateMonitorLayers(geometry: geometry, image: image)
+            } else {
+                hideMonitorImageLayers()
+                imageView.layer.contents = image
+                imageView.frame = pixelAligned(geometry.visualFrame)
+                updateMonitorOverlay(frames: geometry.monitorFrames)
+            }
+            updateCursor(geometry: geometry)
+        } else {
+            imageView.isHidden = true
+            imageView.layer.contents = nil
+            hideMonitorImageLayers()
+            monitorContentLayer.isHidden = true
+            monitorOverlayLayer.isHidden = true
+            cursorView.isHidden = true
+        }
+
+        CATransaction.commit()
+
+        if latestImage != nil, renderedSequence != presentedSequence {
+            presentedSequence = renderedSequence
+            onFramePresented?((CACurrentMediaTime() - renderStartedAt) * 1_000)
+        }
+    }
+
+    @objc private func handleSingleTap(_ recognizer: UITapGestureRecognizer) {
+        guard isUserInteractionEnabled, recognizer.state == .ended, controlMode, gestureMode == .trackpad else { return }
+        guard let normalized = normalizedPoint(for: recognizer.location(in: self)) else { return }
+        onClick?(normalized)
+    }
+
+    @objc private func handleDoubleTap(_ recognizer: UITapGestureRecognizer) {
+        guard isUserInteractionEnabled, recognizer.state == .ended, latestImage != nil, gestureMode == .viewport else { return }
+        if zoomValue > 1.01 {
+            setViewport(zoom: RemoteViewportSettings.minimumZoom, panOffset: .zero, notify: true)
+            return
+        }
+
+        let targetZoom = clampedZoom(RemoteViewportSettings.doubleTapZoom)
+        let pan = anchoredPanOffset(
+            from: panOffsetValue,
+            oldZoom: zoomValue,
+            newZoom: targetZoom,
+            anchor: recognizer.location(in: self)
+        )
+        setViewport(zoom: targetZoom, panOffset: pan, notify: true)
+    }
+
+    @objc private func handleLongPress(_ recognizer: UILongPressGestureRecognizer) {
+        guard recognizer.state == .began else { return }
+        guard isUserInteractionEnabled, controlMode, gestureMode != .viewport, latestImage != nil else { return }
+
+        let location = recognizer.location(in: self)
+        let target = gestureMode == .trackpad
+            ? (remoteCursor ?? touchLastPoint ?? trackpadStartCursor ?? normalizedPoint(for: location))
+            : (normalizedPoint(for: location) ?? touchLastPoint ?? touchStartPoint)
+        guard let target else { return }
+
+        longPressConsumed = true
+        if remoteDragActive {
+            onDragEnd?(target)
+            remoteDragActive = false
+        }
+        onRightClick?(target)
+    }
+
+    @objc private func handleTwoFingerPan(_ recognizer: UIPanGestureRecognizer) {
+        guard isUserInteractionEnabled, latestImage != nil else { return }
+
+        switch recognizer.state {
+        case .began:
+            initialPanOffset = panOffsetValue
+        case .changed:
+            let translation = recognizer.translation(in: self)
+            setViewport(
+                zoom: zoomValue,
+                panOffset: CGSize(
+                    width: initialPanOffset.width + translation.x,
+                    height: initialPanOffset.height + translation.y
+                ),
+                notify: true
+            )
+        case .ended, .cancelled, .failed:
+            initialPanOffset = panOffsetValue
+        default:
+            break
+        }
+    }
+
+    @objc private func handlePinch(_ recognizer: UIPinchGestureRecognizer) {
+        guard isUserInteractionEnabled, latestImage != nil else { return }
+
+        switch recognizer.state {
+        case .began:
+            initialZoom = zoomValue
+            initialPanOffset = panOffsetValue
+            initialPinchLocation = recognizer.location(in: self)
+        case .changed:
+            let nextZoom = clampedZoom(initialZoom * recognizer.scale)
+            let nextPan = anchoredPanOffset(
+                from: initialPanOffset,
+                oldZoom: initialZoom,
+                newZoom: nextZoom,
+                anchor: initialPinchLocation
+            )
+            setViewport(zoom: nextZoom, panOffset: nextPan, notify: true)
+        case .ended, .cancelled, .failed:
+            setViewport(zoom: zoomValue, panOffset: panOffsetValue, notify: true)
+        default:
+            break
+        }
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        super.touchesBegan(touches, with: event)
+        guard isUserInteractionEnabled, latestImage != nil, trackedTouch == nil else { return }
+        guard activeTouchCount(in: event) == 1, let touch = touches.first else { return }
+
+        trackedTouch = touch
+        touchStartLocation = touch.location(in: self)
+        touchStartPoint = normalizedPoint(for: touchStartLocation)
+        touchLastPoint = touchStartPoint
+        trackpadStartCursor = remoteCursor ?? touchStartPoint ?? CGPoint(x: 0.5, y: 0.5)
+        initialPanOffset = panOffsetValue
+        longPressConsumed = false
+        singleFingerViewportPanActive = false
+        remoteDragActive = false
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        super.touchesMoved(touches, with: event)
+        guard isUserInteractionEnabled else {
+            cancelTrackedTouch()
+            return
+        }
+        guard let trackedTouch, touches.contains(trackedTouch) else { return }
+        guard activeTouchCount(in: event) == 1 else {
+            cancelTrackedTouch()
+            return
+        }
+        let location = trackedTouch.location(in: self)
+
+        guard controlMode else {
+            handleOneFingerViewportPan(to: location)
+            return
+        }
+
+        guard gestureMode != .viewport else {
+            cancelTrackedTouch()
+            return
+        }
+        guard !longPressConsumed else { return }
+        guard let normalized = pointForActiveGesture(location: location) else { return }
+        touchLastPoint = normalized
+
+        if gestureMode == .trackpad {
+            onPointerMove?(normalized)
+            return
+        }
+
+        if !remoteDragActive, distance(from: touchStartLocation, to: location) >= dragActivationDistance, let startPoint = touchStartPoint {
+            remoteDragActive = true
+            onDragStart?(startPoint)
+        }
+
+        if remoteDragActive {
+            onDragMove?(normalized)
+        }
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        super.touchesEnded(touches, with: event)
+        guard let trackedTouch, touches.contains(trackedTouch) else { return }
+        if longPressConsumed || singleFingerViewportPanActive {
+            if remoteDragActive, let point = touchLastPoint ?? touchStartPoint {
+                onDragEnd?(point)
+            }
+        } else if remoteDragActive {
+            let normalized = normalizedPoint(for: trackedTouch.location(in: self)) ?? touchLastPoint ?? touchStartPoint
+            if let normalized {
+                onDragEnd?(normalized)
+            }
+        } else if controlMode, gestureMode != .viewport, distance(from: touchStartLocation, to: trackedTouch.location(in: self)) < dragActivationDistance {
+            let clickTarget = gestureMode == .trackpad
+                ? (remoteCursor ?? touchLastPoint ?? trackpadStartCursor)
+                : (normalizedPoint(for: trackedTouch.location(in: self)) ?? touchLastPoint ?? touchStartPoint)
+            if let clickTarget {
+                onClick?(clickTarget)
+            }
+        }
+        clearTrackedTouch()
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        super.touchesCancelled(touches, with: event)
+        guard let trackedTouch, touches.contains(trackedTouch) else { return }
+        cancelTrackedTouch()
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+        let pair = [gestureRecognizer, otherGestureRecognizer]
+        return pair.contains { $0 === twoFingerPanRecognizer } && pair.contains { $0 === pinchRecognizer }
+    }
+
+    override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        guard isUserInteractionEnabled else { return false }
+        if let tap = gestureRecognizer as? UITapGestureRecognizer {
+            if tap.numberOfTapsRequired == 1 {
+                return gestureMode == .trackpad
+            }
+            if tap.numberOfTapsRequired == 2 {
+                return gestureMode == .viewport
+            }
+        }
+        if gestureRecognizer === longPressRecognizer {
+            return controlMode && gestureMode != .viewport && latestImage != nil
+        }
+        return true
+    }
+
+    private func commonInit() {
+        backgroundColor = .black
+        isOpaque = true
+        clipsToBounds = true
+        isMultipleTouchEnabled = true
+
+        imageView.backgroundColor = .black
+        imageView.isOpaque = true
+        imageView.layer.contentsGravity = .resize
+        imageView.layer.magnificationFilter = .linear
+        imageView.layer.minificationFilter = .linear
+        imageView.layer.contentsScale = UIScreen.main.scale
+        addSubview(imageView)
+
+        monitorContentLayer.masksToBounds = false
+        layer.addSublayer(monitorContentLayer)
+
+        monitorOverlayLayer.masksToBounds = false
+        layer.addSublayer(monitorOverlayLayer)
+
+        placeholderIcon.tintColor = UIColor.white.withAlphaComponent(0.72)
+        placeholderIcon.contentMode = .scaleAspectFit
+        placeholderIcon.preferredSymbolConfiguration = UIImage.SymbolConfiguration(pointSize: 42, weight: .regular)
+
+        placeholderLabel.text = "Connect to start the remote desktop stream"
+        placeholderLabel.textColor = UIColor.white.withAlphaComponent(0.72)
+        placeholderLabel.font = .preferredFont(forTextStyle: .headline)
+        placeholderLabel.textAlignment = .center
+        placeholderLabel.numberOfLines = 2
+
+        placeholderView.axis = .vertical
+        placeholderView.alignment = .center
+        placeholderView.distribution = .fill
+        placeholderView.spacing = 14
+        placeholderView.isUserInteractionEnabled = false
+        placeholderView.addArrangedSubview(placeholderIcon)
+        placeholderView.addArrangedSubview(placeholderLabel)
+        addSubview(placeholderView)
+
+        cursorView.tintColor = .white
+        cursorView.contentMode = .scaleAspectFit
+        cursorView.preferredSymbolConfiguration = UIImage.SymbolConfiguration(pointSize: 22, weight: .semibold)
+        cursorView.layer.shadowColor = UIColor.black.cgColor
+        cursorView.layer.shadowOpacity = 0.85
+        cursorView.layer.shadowRadius = 2
+        cursorView.layer.shadowOffset = CGSize(width: 0, height: 1)
+        cursorView.isHidden = true
+        addSubview(cursorView)
+
+        let twoFingerPan = UIPanGestureRecognizer(target: self, action: #selector(handleTwoFingerPan(_:)))
+        twoFingerPan.minimumNumberOfTouches = 2
+        twoFingerPan.maximumNumberOfTouches = 2
+        twoFingerPan.cancelsTouchesInView = true
+        twoFingerPan.delegate = self
+        addGestureRecognizer(twoFingerPan)
+        twoFingerPanRecognizer = twoFingerPan
+
+        let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
+        pinch.cancelsTouchesInView = true
+        pinch.delegate = self
+        addGestureRecognizer(pinch)
+        pinchRecognizer = pinch
+
+        let singleTap = UITapGestureRecognizer(target: self, action: #selector(handleSingleTap(_:)))
+        singleTap.numberOfTapsRequired = 1
+        singleTap.delegate = self
+
+        let doubleTap = UITapGestureRecognizer(target: self, action: #selector(handleDoubleTap(_:)))
+        doubleTap.numberOfTapsRequired = 2
+        doubleTap.delegate = self
+        singleTap.require(toFail: doubleTap)
+
+        let longPress = UILongPressGestureRecognizer(target: self, action: #selector(handleLongPress(_:)))
+        longPress.minimumPressDuration = 0.48
+        longPress.allowableMovement = 10
+        longPress.cancelsTouchesInView = false
+        longPress.delegate = self
+
+        addGestureRecognizer(singleTap)
+        addGestureRecognizer(doubleTap)
+        addGestureRecognizer(longPress)
+        longPressRecognizer = longPress
+    }
+
+    private func setViewport(zoom: Double, panOffset: CGSize, notify: Bool) {
+        let nextZoom = clampedZoom(zoom)
+        zoomValue = nextZoom
+        let nextPanOffset = clampedPanOffset(panOffset)
+        panOffsetValue = nextPanOffset
+        setNeedsLayout()
+
+        if notify {
+            onZoomChange?(nextZoom)
+            onPanOffsetChange?(nextPanOffset)
+        }
+    }
+
+    private func anchoredPanOffset(from panOffset: CGSize, oldZoom: Double, newZoom: Double, anchor: CGPoint) -> CGSize {
+        guard oldZoom > 0 else { return panOffset }
+        let ratio = CGFloat(newZoom / oldZoom)
+        let anchorFromCenter = CGPoint(x: anchor.x - bounds.midX, y: anchor.y - bounds.midY)
+        return CGSize(
+            width: anchorFromCenter.x - (anchorFromCenter.x - panOffset.width) * ratio,
+            height: anchorFromCenter.y - (anchorFromCenter.y - panOffset.height) * ratio
+        )
+    }
+
+    private func updateCursor(geometry: StageGeometry) {
+        guard latestImage != nil, let remoteCursor else {
+            cursorView.isHidden = true
+            return
+        }
+
+        let desktopX = geometry.sourceBounds.minX + geometry.sourceBounds.width * min(1, max(0, remoteCursor.x))
+        let desktopY = geometry.sourceBounds.minY + geometry.sourceBounds.height * min(1, max(0, remoteCursor.y))
+        guard geometry.visualBounds.contains(CGPoint(x: desktopX, y: desktopY)) else {
+            cursorView.isHidden = true
+            return
+        }
+
+        let x = geometry.visualFrame.minX + ((desktopX - geometry.visualBounds.minX) / geometry.visualBounds.width) * geometry.visualFrame.width
+        let y = geometry.visualFrame.minY + ((desktopY - geometry.visualBounds.minY) / geometry.visualBounds.height) * geometry.visualFrame.height
+        cursorView.isHidden = false
+        cursorView.frame = pixelAligned(CGRect(x: x, y: y, width: 24, height: 24))
+    }
+
+    private func updateMonitorLayers(geometry: StageGeometry, image: CGImage) {
+        monitorOverlayLayer.isHidden = geometry.monitorFrames.count <= 1
+        let activeIds = Set(geometry.monitorFrames.map(\.id))
+        removeInactiveMonitorLayers(activeIds: activeIds)
+
+        for frame in geometry.monitorFrames {
+            let layers = monitorLayers[frame.id] ?? makeMonitorLayers(for: frame.id)
+            layers.imageLayer.isHidden = false
+            layers.imageLayer.contents = image
+            layers.imageLayer.contentsRect = contentsRect(for: frame.desktopRect, sourceBounds: geometry.sourceBounds)
+            layers.imageLayer.frame = pixelAligned(frame.rect)
+        }
+
+        updateMonitorOverlay(frames: geometry.monitorFrames)
+    }
+
+    private func updateMonitorOverlay(frames: [RemoteMonitorStageFrame]) {
+        guard frames.count > 1 else {
+            monitorOverlayLayer.isHidden = true
+            return
+        }
+
+        monitorOverlayLayer.isHidden = false
+        let activeIds = Set(frames.map(\.id))
+        removeInactiveMonitorLayers(activeIds: activeIds)
+
+        for frame in frames {
+            let layers = monitorLayers[frame.id] ?? makeMonitorLayers(for: frame.id)
+            let rect = pixelAligned(frame.rect)
+            let path = UIBezierPath(roundedRect: rect, cornerRadius: 5).cgPath
+            layers.strokeLayer.path = path
+            layers.strokeLayer.fillColor = UIColor.clear.cgColor
+            layers.strokeLayer.strokeColor = tintColor.cgColor
+            layers.strokeLayer.lineWidth = 2
+            layers.strokeLayer.isHidden = false
+
+            let labelRect = monitorLabelRect(for: frame.monitor.displayName, in: rect)
+            layers.labelBackgroundLayer.path = UIBezierPath(
+                roundedRect: labelRect,
+                cornerRadius: labelRect.height / 2
+            ).cgPath
+            layers.labelBackgroundLayer.fillColor = UIColor.black.withAlphaComponent(0.72).cgColor
+            layers.labelBackgroundLayer.isHidden = false
+            layers.textLayer.string = frame.monitor.displayName
+            layers.textLayer.font = UIFont.boldSystemFont(ofSize: 11)
+            layers.textLayer.fontSize = 11
+            layers.textLayer.foregroundColor = UIColor.white.cgColor
+            layers.textLayer.frame = labelRect.insetBy(dx: 5, dy: 3)
+            layers.textLayer.isHidden = false
+        }
+    }
+
+    private func makeMonitorLayers(for id: String) -> MonitorLayers {
+        let layers = MonitorLayers(
+            contentParent: monitorContentLayer,
+            overlayParent: monitorOverlayLayer,
+            contentsScale: window?.screen.scale ?? UIScreen.main.scale
+        )
+        monitorLayers[id] = layers
+        return layers
+    }
+
+    private func removeInactiveMonitorLayers(activeIds: Set<String>) {
+        for id in monitorLayers.keys.filter({ !activeIds.contains($0) }) {
+            monitorLayers[id]?.removeFromSuperlayer()
+            monitorLayers[id] = nil
+        }
+    }
+
+    private func hideMonitorImageLayers() {
+        for layers in monitorLayers.values {
+            layers.imageLayer.isHidden = true
+            layers.imageLayer.contents = nil
+        }
+    }
+
+    private func monitorLabelRect(for label: String, in rect: CGRect) -> CGRect {
+        let font = UIFont.boldSystemFont(ofSize: 11)
+        let size = (label as NSString).size(withAttributes: [.font: font])
+        let maxWidth = max(36, rect.width - 12)
+        let width = min(maxWidth, max(36, ceil(size.width) + 14))
+        let height: CGFloat = 20
+        return pixelAligned(CGRect(
+            x: rect.minX + 6,
+            y: rect.minY + 6,
+            width: width,
+            height: height
+        ))
+    }
+
+    private func stageGeometry(for _: CGImage, panOffset: CGSize, zoom: Double) -> StageGeometry? {
+        let sourceBounds = streamSourceBounds()
+        guard sourceBounds.width > 0, sourceBounds.height > 0 else { return nil }
+
+        let selectedMonitors = stageMonitors()
+        let selectedMonitorIds = Set(selectedMonitors.map(\.id))
+        let usesMonitorImageLayers = monitors.count > 1
+            && !selectedMonitors.isEmpty
+            && selectedMonitorIds.count < Set(monitors.map(\.id)).count
+            && sourceBoundsIntersects(monitors: selectedMonitors, sourceBounds: sourceBounds)
+
+        let visualBounds = usesMonitorImageLayers ? monitorUnion(for: selectedMonitors) : sourceBounds
+        guard visualBounds.width > 0, visualBounds.height > 0 else { return nil }
+
+        let frame = pixelAligned(contentFrame(for: visualBounds.size, panOffset: panOffset, zoom: zoom))
+        return StageGeometry(
+            sourceBounds: sourceBounds,
+            visualBounds: visualBounds,
+            visualFrame: frame,
+            monitorFrames: monitorFrames(in: frame, visualBounds: visualBounds, monitors: usesMonitorImageLayers ? selectedMonitors : monitors),
+            usesMonitorImageLayers: usesMonitorImageLayers
+        )
+    }
+
+    private func monitorFrames(
+        in visualFrame: CGRect,
+        visualBounds: CGRect,
+        monitors: [RemoteMonitorDescriptor]
+    ) -> [RemoteMonitorStageFrame] {
+        guard !monitors.isEmpty else { return [] }
+        let layout = RemoteMonitorLayoutGeometry(monitors: monitors, offsets: monitorLayoutOffsets)
+
+        return monitors.compactMap { monitor in
+            let rawRect = layout.rect(for: monitor)
+            let intersection = rawRect.intersection(visualBounds)
+            guard !intersection.isNull, intersection.width > 1, intersection.height > 1 else {
+                return nil
+            }
+
+            let x = visualFrame.minX + ((intersection.minX - visualBounds.minX) / visualBounds.width) * visualFrame.width
+            let y = visualFrame.minY + ((intersection.minY - visualBounds.minY) / visualBounds.height) * visualFrame.height
+            let width = (intersection.width / visualBounds.width) * visualFrame.width
+            let height = (intersection.height / visualBounds.height) * visualFrame.height
+            return RemoteMonitorStageFrame(
+                id: monitor.id,
+                monitor: monitor,
+                rect: CGRect(x: x, y: y, width: width, height: height),
+                desktopRect: intersection
+            )
+        }
+    }
+
+    private func streamSourceBounds() -> CGRect {
+        if let displayInfo {
+            let left = displayInfo.left ?? displayInfo.virtualLeft
+            let top = displayInfo.top ?? displayInfo.virtualTop
+            let width = displayInfo.width ?? displayInfo.virtualWidth
+            let height = displayInfo.height ?? displayInfo.virtualHeight
+
+            if let left, let top, let width, let height, width > 0, height > 0 {
+                return CGRect(x: CGFloat(left), y: CGFloat(top), width: CGFloat(width), height: CGFloat(height))
+            }
+        }
+
+        let layoutBounds = RemoteMonitorLayoutGeometry(monitors: monitors, offsets: [:]).union
+        if !monitors.isEmpty, layoutBounds.width > 0, layoutBounds.height > 0 {
+            return layoutBounds
+        }
+
+        if desktopSize.width > 0, desktopSize.height > 0 {
+            return CGRect(origin: .zero, size: desktopSize)
+        }
+
+        return layoutBounds
+    }
+
+    private func stageMonitors() -> [RemoteMonitorDescriptor] {
+        guard !monitors.isEmpty else { return [] }
+        guard !selectedMonitorIds.isEmpty else { return monitors }
+        let selected = monitors.filter { selectedMonitorIds.contains($0.id) }
+        return selected.isEmpty ? monitors : selected
+    }
+
+    private func monitorUnion(for monitors: [RemoteMonitorDescriptor]) -> CGRect {
+        RemoteMonitorLayoutGeometry(monitors: monitors, offsets: monitorLayoutOffsets).union
+    }
+
+    private func sourceBoundsIntersects(monitors: [RemoteMonitorDescriptor], sourceBounds: CGRect) -> Bool {
+        let layout = RemoteMonitorLayoutGeometry(monitors: monitors, offsets: monitorLayoutOffsets)
+        return monitors.contains { monitor in
+            let intersection = layout.rect(for: monitor).intersection(sourceBounds)
+            return !intersection.isNull && intersection.width > 1 && intersection.height > 1
+        }
+    }
+
+    private func normalizedPoint(for location: CGPoint) -> CGPoint? {
+        guard let image = latestImage else { return nil }
+        guard let geometry = stageGeometry(for: image, panOffset: panOffsetValue, zoom: zoomValue) else { return nil }
+        guard geometry.visualFrame.width > 0, geometry.visualFrame.height > 0 else { return nil }
+        let x = (location.x - geometry.visualFrame.minX) / geometry.visualFrame.width
+        let y = (location.y - geometry.visualFrame.minY) / geometry.visualFrame.height
+        guard x.isFinite, y.isFinite else { return nil }
+        return CGPoint(x: min(1, max(0, x)), y: min(1, max(0, y)))
+    }
+
+    private func pointForActiveGesture(location: CGPoint) -> CGPoint? {
+        guard gestureMode == .trackpad else {
+            return normalizedPoint(for: location)
+        }
+        guard let image = latestImage else { return nil }
+        guard let geometry = stageGeometry(for: image, panOffset: panOffsetValue, zoom: zoomValue) else { return nil }
+        guard geometry.visualFrame.width > 0, geometry.visualFrame.height > 0 else { return nil }
+        let start = trackpadStartCursor ?? remoteCursor ?? CGPoint(x: 0.5, y: 0.5)
+        let sensitivity: CGFloat = 1.25
+        let dx = ((location.x - touchStartLocation.x) / geometry.visualFrame.width) * sensitivity
+        let dy = ((location.y - touchStartLocation.y) / geometry.visualFrame.height) * sensitivity
+        return CGPoint(
+            x: min(1, max(0, start.x + dx)),
+            y: min(1, max(0, start.y + dy))
+        )
+    }
+
+    private func handleOneFingerViewportPan(to location: CGPoint) {
+        guard latestImage != nil else { return }
+        let translation = CGSize(
+            width: location.x - touchStartLocation.x,
+            height: location.y - touchStartLocation.y
+        )
+        guard singleFingerViewportPanActive || hypot(translation.width, translation.height) >= dragActivationDistance else {
+            return
+        }
+
+        singleFingerViewportPanActive = true
+        setViewport(
+            zoom: zoomValue,
+            panOffset: CGSize(
+                width: initialPanOffset.width + translation.width,
+                height: initialPanOffset.height + translation.height
+            ),
+            notify: true
+        )
+    }
+
+    private func contentFrame(for contentSize: CGSize, panOffset: CGSize, zoom: Double) -> CGRect {
+        guard contentSize.width > 0, contentSize.height > 0, bounds.width > 0, bounds.height > 0 else {
+            return bounds
+        }
+
+        let scale = min(bounds.width / contentSize.width, bounds.height / contentSize.height) * CGFloat(zoom)
+        let displaySize = CGSize(width: contentSize.width * scale, height: contentSize.height * scale)
+        return CGRect(
+            x: (bounds.width - displaySize.width) / 2 + panOffset.width,
+            y: (bounds.height - displaySize.height) / 2 + panOffset.height,
+            width: displaySize.width,
+            height: displaySize.height
+        )
+    }
+
+    private func clampedZoom(_ value: Double) -> Double {
+        min(RemoteViewportSettings.maximumZoom, max(RemoteViewportSettings.minimumZoom, value))
+    }
+
+    private func clampedPanOffset(_ offset: CGSize) -> CGSize {
+        guard let image = latestImage, let geometry = stageGeometry(for: image, panOffset: .zero, zoom: zoomValue), zoomValue > 1.01 else {
+            return .zero
+        }
+
+        let horizontalLimit = max(0, (geometry.visualFrame.width - bounds.width) / 2 + 44)
+        let verticalLimit = max(0, (geometry.visualFrame.height - bounds.height) / 2 + 44)
+        return CGSize(
+            width: min(horizontalLimit, max(-horizontalLimit, offset.width)),
+            height: min(verticalLimit, max(-verticalLimit, offset.height))
+        )
+    }
+
+    private func contentsRect(for desktopRect: CGRect, sourceBounds: CGRect) -> CGRect {
+        guard sourceBounds.width > 0, sourceBounds.height > 0 else {
+            return CGRect(x: 0, y: 0, width: 1, height: 1)
+        }
+
+        let x = (desktopRect.minX - sourceBounds.minX) / sourceBounds.width
+        let y = (desktopRect.minY - sourceBounds.minY) / sourceBounds.height
+        let width = desktopRect.width / sourceBounds.width
+        let height = desktopRect.height / sourceBounds.height
+        return CGRect(
+            x: min(1, max(0, x)),
+            y: min(1, max(0, y)),
+            width: min(1, max(0, width)),
+            height: min(1, max(0, height))
+        )
+    }
+
+    private func pixelAligned(_ rect: CGRect) -> CGRect {
+        let scale = window?.screen.scale ?? UIScreen.main.scale
+        guard scale > 0 else { return rect }
+        return CGRect(
+            x: (rect.origin.x * scale).rounded() / scale,
+            y: (rect.origin.y * scale).rounded() / scale,
+            width: (rect.size.width * scale).rounded() / scale,
+            height: (rect.size.height * scale).rounded() / scale
+        )
+    }
+
+    private func activeTouchCount(in event: UIEvent?) -> Int {
+        event?.allTouches?.filter { $0.phase != .ended && $0.phase != .cancelled }.count ?? 0
+    }
+
+    private func cancelTrackedTouch() {
+        if remoteDragActive, let point = touchLastPoint ?? touchStartPoint {
+            onDragEnd?(point)
+        }
+        clearTrackedTouch()
+    }
+
+    private func clearTrackedTouch() {
+        trackedTouch = nil
+        touchStartPoint = nil
+        touchLastPoint = nil
+        trackpadStartCursor = nil
+        longPressConsumed = false
+        singleFingerViewportPanActive = false
+        remoteDragActive = false
+    }
+
+    private func distance(from start: CGPoint, to end: CGPoint) -> CGFloat {
+        hypot(end.x - start.x, end.y - start.y)
     }
 }
 
@@ -762,456 +1745,6 @@ struct RemoteKeyboardBridge: View {
         )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .accessibilityHidden(true)
-    }
-}
-
-struct RemoteStageView: View {
-    let image: UIImage?
-    @Binding var zoom: Double
-    @Binding var panOffset: CGSize
-    let controlMode: Bool
-    let interactionEnabled: Bool
-    let displayInfo: RemoteDisplayInfo?
-    let monitors: [RemoteMonitorDescriptor]
-    let selectedMonitorIds: Set<String>
-    let monitorLayoutOffsets: [String: CGSize]
-    let remoteCursor: CGPoint?
-    let onClick: (CGPoint) -> Void
-    let onDragStart: (CGPoint) -> Void
-    let onDragMove: (CGPoint) -> Void
-    let onDragEnd: (CGPoint) -> Void
-
-    var body: some View {
-        GeometryReader { proxy in
-            ZStack {
-                if let image {
-                    Image(uiImage: image)
-                        .resizable()
-                        .interpolation(.high)
-                        .aspectRatio(contentMode: .fit)
-                        .scaleEffect(zoom)
-                        .offset(panOffset)
-                    monitorOverlay(in: proxy.size, image: image)
-                    if let remoteCursor, let cursorPoint = denormalize(remoteCursor, in: proxy.size, image: image) {
-                        Image(systemName: "cursorarrow")
-                            .font(.system(size: 22, weight: .semibold))
-                            .foregroundStyle(.white)
-                            .shadow(color: .black.opacity(0.8), radius: 2, x: 0, y: 1)
-                            .position(cursorPoint)
-                    }
-                } else {
-                    VStack(spacing: 14) {
-                        Image(systemName: "display.trianglebadge.exclamationmark")
-                            .font(.system(size: 42))
-                        Text("Connect to start the remote desktop stream")
-                            .font(.headline)
-                    }
-                    .foregroundStyle(.white.opacity(0.72))
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .contentShape(Rectangle())
-            .transaction { transaction in
-                transaction.animation = nil
-            }
-            .overlay {
-                RemoteStageGestureLayer(
-                    image: image,
-                    zoom: $zoom,
-                    panOffset: $panOffset,
-                    controlMode: controlMode,
-                    interactionEnabled: interactionEnabled,
-                    onClick: onClick,
-                    onDragStart: onDragStart,
-                    onDragMove: onDragMove,
-                    onDragEnd: onDragEnd
-                )
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func monitorOverlay(in container: CGSize, image: UIImage) -> some View {
-        let visibleMonitors = monitorFrames(in: container, image: image)
-        if visibleMonitors.count > 1 {
-            ZStack {
-                ForEach(visibleMonitors) { monitorFrame in
-                    let isSelected = selectedMonitorIds.isEmpty || selectedMonitorIds.contains(monitorFrame.monitor.id)
-                    RoundedRectangle(cornerRadius: 5)
-                        .fill(isSelected ? Color.clear : Color.black.opacity(0.48))
-                        .frame(width: monitorFrame.rect.width, height: monitorFrame.rect.height)
-                        .position(x: monitorFrame.rect.midX, y: monitorFrame.rect.midY)
-
-                    RoundedRectangle(cornerRadius: 5)
-                        .stroke(isSelected ? Color.accentColor : Color.white.opacity(0.35), lineWidth: isSelected ? 2 : 1)
-                        .frame(width: monitorFrame.rect.width, height: monitorFrame.rect.height)
-                        .position(x: monitorFrame.rect.midX, y: monitorFrame.rect.midY)
-
-                    Text(monitorFrame.monitor.displayName)
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 4)
-                        .background(Capsule().fill(Color.black.opacity(0.72)))
-                        .position(x: monitorFrame.rect.minX + 54, y: monitorFrame.rect.minY + 18)
-                }
-            }
-            .allowsHitTesting(false)
-        }
-    }
-
-    private func denormalize(_ point: CGPoint, in container: CGSize, image: UIImage?) -> CGPoint? {
-        guard let image else { return nil }
-        let imageRect = imageFrame(in: container, image: image)
-        return CGPoint(
-            x: imageRect.minX + imageRect.width * min(1, max(0, point.x)),
-            y: imageRect.minY + imageRect.height * min(1, max(0, point.y))
-        )
-    }
-
-    private func imageFrame(in container: CGSize, image: UIImage) -> CGRect {
-        let imageSize = image.size
-        let scale = min(container.width / imageSize.width, container.height / imageSize.height) * zoom
-        let displaySize = CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
-        let origin = CGPoint(
-            x: (container.width - displaySize.width) / 2 + panOffset.width,
-            y: (container.height - displaySize.height) / 2 + panOffset.height
-        )
-        return CGRect(origin: origin, size: displaySize)
-    }
-
-    private func monitorFrames(in container: CGSize, image: UIImage) -> [RemoteMonitorStageFrame] {
-        guard monitors.count > 1 else { return [] }
-        let layout = RemoteMonitorLayoutGeometry(monitors: monitors, offsets: monitorLayoutOffsets)
-        let desktopBounds = monitorDesktopBounds()
-        guard desktopBounds.width > 0, desktopBounds.height > 0 else { return [] }
-
-        let imageRect = imageFrame(in: container, image: image)
-        return monitors.compactMap { monitor in
-            let rawRect = layout.rect(for: monitor)
-            let intersection = rawRect.intersection(desktopBounds)
-            guard !intersection.isNull, intersection.width > 1, intersection.height > 1 else {
-                return nil
-            }
-
-            let x = imageRect.minX + ((intersection.minX - desktopBounds.minX) / desktopBounds.width) * imageRect.width
-            let y = imageRect.minY + ((intersection.minY - desktopBounds.minY) / desktopBounds.height) * imageRect.height
-            let width = (intersection.width / desktopBounds.width) * imageRect.width
-            let height = (intersection.height / desktopBounds.height) * imageRect.height
-            return RemoteMonitorStageFrame(
-                id: monitor.id,
-                monitor: monitor,
-                rect: CGRect(x: x, y: y, width: width, height: height)
-            )
-        }
-    }
-
-    private func monitorDesktopBounds() -> CGRect {
-        if !monitorLayoutOffsets.isEmpty {
-            return RemoteMonitorLayoutGeometry(monitors: monitors, offsets: monitorLayoutOffsets).union
-        }
-
-        if let displayInfo {
-            let useCaptureBounds = displayInfo.captureWidth != nil || displayInfo.captureHeight != nil
-            let left = useCaptureBounds ? displayInfo.left : (displayInfo.virtualLeft ?? displayInfo.left)
-            let top = useCaptureBounds ? displayInfo.top : (displayInfo.virtualTop ?? displayInfo.top)
-            let width = useCaptureBounds ? displayInfo.width : (displayInfo.virtualWidth ?? displayInfo.width)
-            let height = useCaptureBounds ? displayInfo.height : (displayInfo.virtualHeight ?? displayInfo.height)
-
-            if let left, let top, let width, let height, width > 0, height > 0 {
-                return CGRect(x: CGFloat(left), y: CGFloat(top), width: CGFloat(width), height: CGFloat(height))
-            }
-        }
-
-        let layout = RemoteMonitorLayoutGeometry(monitors: monitors, offsets: [:])
-        return layout.union
-    }
-}
-
-struct RemoteStageGestureLayer: UIViewRepresentable {
-    let image: UIImage?
-    @Binding var zoom: Double
-    @Binding var panOffset: CGSize
-    let controlMode: Bool
-    let interactionEnabled: Bool
-    let onClick: (CGPoint) -> Void
-    let onDragStart: (CGPoint) -> Void
-    let onDragMove: (CGPoint) -> Void
-    let onDragEnd: (CGPoint) -> Void
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(parent: self)
-    }
-
-    func makeUIView(context: Context) -> UIView {
-        let view = GestureView()
-        view.coordinator = context.coordinator
-        view.backgroundColor = .clear
-        view.isMultipleTouchEnabled = true
-        view.isUserInteractionEnabled = interactionEnabled
-
-        let twoFingerPan = UIPanGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleTwoFingerPan(_:)))
-        twoFingerPan.minimumNumberOfTouches = 2
-        twoFingerPan.maximumNumberOfTouches = 2
-        twoFingerPan.delegate = context.coordinator
-        twoFingerPan.cancelsTouchesInView = true
-
-        let pinch = UIPinchGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handlePinch(_:)))
-        pinch.delegate = context.coordinator
-        pinch.cancelsTouchesInView = true
-
-        let singleTap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleSingleTap(_:)))
-        singleTap.numberOfTapsRequired = 1
-        singleTap.delegate = context.coordinator
-
-        let doubleTap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleDoubleTap(_:)))
-        doubleTap.numberOfTapsRequired = 2
-        doubleTap.delegate = context.coordinator
-        singleTap.require(toFail: doubleTap)
-
-        context.coordinator.twoFingerPan = twoFingerPan
-        context.coordinator.pinch = pinch
-
-        view.addGestureRecognizer(twoFingerPan)
-        view.addGestureRecognizer(pinch)
-        view.addGestureRecognizer(singleTap)
-        view.addGestureRecognizer(doubleTap)
-        return view
-    }
-
-    func updateUIView(_ uiView: UIView, context: Context) {
-        context.coordinator.parent = self
-        uiView.isUserInteractionEnabled = interactionEnabled
-        if !interactionEnabled {
-            context.coordinator.cancelInteraction()
-        }
-    }
-
-    final class GestureView: UIView {
-        weak var coordinator: Coordinator?
-
-        override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-            super.touchesBegan(touches, with: event)
-            coordinator?.touchesBegan(touches, with: event, in: self)
-        }
-
-        override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-            super.touchesMoved(touches, with: event)
-            coordinator?.touchesMoved(touches, with: event, in: self)
-        }
-
-        override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-            super.touchesEnded(touches, with: event)
-            coordinator?.touchesEnded(touches, with: event, in: self)
-        }
-
-        override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-            super.touchesCancelled(touches, with: event)
-            coordinator?.touchesCancelled(touches, with: event, in: self)
-        }
-    }
-
-    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
-        var parent: RemoteStageGestureLayer
-        weak var twoFingerPan: UIPanGestureRecognizer?
-        weak var pinch: UIPinchGestureRecognizer?
-        private weak var trackedTouch: UITouch?
-        private var touchStartLocation = CGPoint.zero
-        private var touchStartPoint: CGPoint?
-        private var touchLastPoint: CGPoint?
-        private var remoteDragActive = false
-        private var initialPanOffset = CGSize.zero
-        private var initialZoom = RemoteViewportSettings.minimumZoom
-        private let dragActivationDistance: CGFloat = 4
-
-        init(parent: RemoteStageGestureLayer) {
-            self.parent = parent
-        }
-
-        @objc func handleSingleTap(_ recognizer: UITapGestureRecognizer) {
-            guard parent.interactionEnabled, recognizer.state == .ended, parent.controlMode else { return }
-            if let normalized = normalizedPoint(for: recognizer.location(in: recognizer.view), in: recognizer.view) {
-                parent.onClick(normalized)
-            }
-        }
-
-        @objc func handleDoubleTap(_ recognizer: UITapGestureRecognizer) {
-            guard parent.interactionEnabled, recognizer.state == .ended, parent.image != nil else { return }
-            if parent.zoom > 1.01 {
-                parent.zoom = RemoteViewportSettings.minimumZoom
-                parent.panOffset = .zero
-            } else {
-                parent.zoom = RemoteViewportSettings.doubleTapZoom
-                parent.panOffset = clampedPanOffset(parent.panOffset, in: recognizer.view)
-            }
-        }
-
-        func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?, in view: UIView) {
-            guard parent.interactionEnabled, parent.image != nil, trackedTouch == nil else { return }
-            guard activeTouchCount(in: event) == 1, let touch = touches.first else { return }
-
-            trackedTouch = touch
-            touchStartLocation = touch.location(in: view)
-            touchStartPoint = normalizedPoint(for: touchStartLocation, in: view)
-            touchLastPoint = touchStartPoint
-            remoteDragActive = false
-        }
-
-        func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?, in view: UIView) {
-            guard parent.interactionEnabled else {
-                cancelTrackedTouch()
-                return
-            }
-            guard let trackedTouch, touches.contains(trackedTouch) else { return }
-            guard activeTouchCount(in: event) == 1 else {
-                cancelTrackedTouch()
-                return
-            }
-            guard parent.controlMode else {
-                cancelTrackedTouch()
-                return
-            }
-
-            let location = trackedTouch.location(in: view)
-            guard let normalized = normalizedPoint(for: location, in: view) else { return }
-            touchLastPoint = normalized
-
-            if !remoteDragActive, distance(from: touchStartLocation, to: location) >= dragActivationDistance, let startPoint = touchStartPoint {
-                remoteDragActive = true
-                parent.onDragStart(startPoint)
-            }
-
-            if remoteDragActive {
-                parent.onDragMove(normalized)
-            }
-        }
-
-        func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?, in view: UIView) {
-            guard let trackedTouch, touches.contains(trackedTouch) else { return }
-            if remoteDragActive {
-                let normalized = normalizedPoint(for: trackedTouch.location(in: view), in: view) ?? touchLastPoint ?? touchStartPoint
-                if let normalized {
-                    parent.onDragEnd(normalized)
-                }
-            }
-            clearTrackedTouch()
-        }
-
-        func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?, in view: UIView) {
-            guard let trackedTouch, touches.contains(trackedTouch) else { return }
-            cancelTrackedTouch()
-        }
-
-        @objc func handleTwoFingerPan(_ recognizer: UIPanGestureRecognizer) {
-            guard parent.interactionEnabled, parent.image != nil else { return }
-
-            switch recognizer.state {
-            case .began:
-                initialPanOffset = parent.panOffset
-            case .changed:
-                let translation = recognizer.translation(in: recognizer.view)
-                parent.panOffset = clampedPanOffset(
-                    CGSize(
-                        width: initialPanOffset.width + translation.x,
-                        height: initialPanOffset.height + translation.y
-                    ),
-                    in: recognizer.view
-                )
-            case .ended, .cancelled, .failed:
-                initialPanOffset = parent.panOffset
-            default:
-                break
-            }
-        }
-
-        @objc func handlePinch(_ recognizer: UIPinchGestureRecognizer) {
-            guard parent.interactionEnabled, parent.image != nil else { return }
-
-            switch recognizer.state {
-            case .began:
-                initialZoom = parent.zoom
-            case .changed:
-                parent.zoom = clampedZoom(initialZoom * recognizer.scale)
-                parent.panOffset = clampedPanOffset(parent.panOffset, in: recognizer.view)
-            case .ended, .cancelled, .failed:
-                parent.zoom = clampedZoom(parent.zoom)
-                parent.panOffset = clampedPanOffset(parent.panOffset, in: recognizer.view)
-            default:
-                break
-            }
-        }
-
-        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
-            guard parent.interactionEnabled else { return false }
-            let pair = [gestureRecognizer, otherGestureRecognizer]
-            return pair.contains(where: { $0 === twoFingerPan }) && pair.contains(where: { $0 === pinch })
-        }
-
-        func cancelInteraction() {
-            cancelTrackedTouch()
-        }
-
-        private func activeTouchCount(in event: UIEvent?) -> Int {
-            event?.allTouches?.filter { $0.phase != .ended && $0.phase != .cancelled }.count ?? 0
-        }
-
-        private func cancelTrackedTouch() {
-            if remoteDragActive, let point = touchLastPoint ?? touchStartPoint {
-                parent.onDragEnd(point)
-            }
-            clearTrackedTouch()
-        }
-
-        private func clearTrackedTouch() {
-            trackedTouch = nil
-            touchStartPoint = nil
-            touchLastPoint = nil
-            remoteDragActive = false
-        }
-
-        private func distance(from start: CGPoint, to end: CGPoint) -> CGFloat {
-            hypot(end.x - start.x, end.y - start.y)
-        }
-
-        private func normalizedPoint(for location: CGPoint, in view: UIView?) -> CGPoint? {
-            guard let view, let image = parent.image else { return nil }
-            let imageRect = imageFrame(in: view.bounds.size, image: image)
-            guard imageRect.width > 0, imageRect.height > 0 else { return nil }
-            let x = (location.x - imageRect.minX) / imageRect.width
-            let y = (location.y - imageRect.minY) / imageRect.height
-            guard x.isFinite, y.isFinite else { return nil }
-            return CGPoint(x: min(1, max(0, x)), y: min(1, max(0, y)))
-        }
-
-        private func imageFrame(in container: CGSize, image: UIImage) -> CGRect {
-            let imageSize = image.size
-            let scale = min(container.width / imageSize.width, container.height / imageSize.height) * parent.zoom
-            let displaySize = CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
-            let origin = CGPoint(
-                x: (container.width - displaySize.width) / 2 + parent.panOffset.width,
-                y: (container.height - displaySize.height) / 2 + parent.panOffset.height
-            )
-            return CGRect(origin: origin, size: displaySize)
-        }
-
-        private func clampedZoom(_ value: Double) -> Double {
-            min(RemoteViewportSettings.maximumZoom, max(RemoteViewportSettings.minimumZoom, value))
-        }
-
-        private func clampedPanOffset(_ offset: CGSize, in view: UIView?) -> CGSize {
-            guard let view, let image = parent.image, parent.zoom > 1.01 else {
-                return .zero
-            }
-
-            let imageRect = imageFrame(in: view.bounds.size, image: image)
-            let horizontalLimit = max(0, (imageRect.width - view.bounds.width) / 2 + 44)
-            let verticalLimit = max(0, (imageRect.height - view.bounds.height) / 2 + 44)
-
-            return CGSize(
-                width: min(horizontalLimit, max(-horizontalLimit, offset.width)),
-                height: min(verticalLimit, max(-verticalLimit, offset.height))
-            )
-        }
     }
 }
 
@@ -1384,12 +1917,14 @@ private struct RemoteMonitorStageFrame: Identifiable {
     let id: String
     let monitor: RemoteMonitorDescriptor
     let rect: CGRect
+    var desktopRect: CGRect = .zero
 }
 
 struct RemoteTopOverlay: View {
     let telemetry: RemoteTelemetrySnapshot
     @Binding var mode: RemoteMode
     @Binding var profile: RemoteStreamProfile
+    @Binding var gestureMode: RemoteGestureMode
     let compact: Bool
     let onConnect: () -> Void
     let onDisconnect: () -> Void
@@ -1418,6 +1953,9 @@ struct RemoteTopOverlay: View {
                     .pickerStyle(.segmented)
 
                 streamPicker
+                    .pickerStyle(.menu)
+
+                gesturePicker
                     .pickerStyle(.menu)
             }
         }
@@ -1491,6 +2029,15 @@ struct RemoteTopOverlay: View {
             onProfileChange(newProfile)
         }
     }
+
+    private var gesturePicker: some View {
+        Picker("Gesture", selection: $gestureMode) {
+            ForEach(RemoteGestureMode.allCases) { mode in
+                Label(mode.title, systemImage: mode.systemImage).tag(mode)
+            }
+        }
+    }
+
     private var compactOptionsMenu: some View {
         Menu {
             Picker("Mode", selection: $mode) {
@@ -1509,6 +2056,12 @@ struct RemoteTopOverlay: View {
             }
             .onChange(of: profile) { _, newProfile in
                 onProfileChange(newProfile)
+            }
+
+            Picker("Gesture", selection: $gestureMode) {
+                ForEach(RemoteGestureMode.allCases) { mode in
+                    Label(mode.title, systemImage: mode.systemImage).tag(mode)
+                }
             }
         } label: {
             Image(systemName: "ellipsis.circle")
@@ -1535,6 +2088,30 @@ struct RemoteTopOverlay: View {
     private var compactStatusLine: String {
         let latencyText = telemetry.latency.map { " • \(Int($0)) ms" } ?? ""
         return "\(String(format: "%.1f", telemetry.fps)) fps\(latencyText)"
+    }
+}
+
+struct RemoteDiagnosticsOverlay: View {
+    let telemetry: RemoteTelemetrySnapshot
+
+    var body: some View {
+        HStack(spacing: 8) {
+            diagnostic("RX", telemetry.receivedFps, suffix: "fps")
+            diagnostic("Draw", telemetry.presentedFps, suffix: "fps")
+            diagnostic("Dec", telemetry.decodeMs, suffix: "ms")
+            diagnostic("Layer", telemetry.renderMs, suffix: "ms")
+            Text("Drop \(telemetry.droppedFrames)")
+            Text("Input \(telemetry.droppedInputEvents)")
+        }
+        .font(.caption2.monospacedDigit().weight(.semibold))
+        .foregroundStyle(.white.opacity(0.88))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(.black.opacity(0.62), in: Capsule())
+    }
+
+    private func diagnostic(_ label: String, _ value: Double, suffix: String) -> Text {
+        Text("\(label) \(String(format: "%.1f", value))\(suffix)")
     }
 }
 
@@ -2087,8 +2664,6 @@ struct FloatingRemoteControls: View {
                 transaction.animation = nil
                 transaction.disablesAnimations = true
             }
-            .compositingGroup()
-            .shadow(color: dragState.isActive ? .clear : .black.opacity(0.22), radius: 18, x: 0, y: 8)
             .fixedSize(horizontal: true, vertical: true)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: anchor.alignment)

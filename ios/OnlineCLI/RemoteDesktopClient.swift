@@ -1,4 +1,5 @@
 import Foundation
+import ImageIO
 import Observation
 import UIKit
 
@@ -22,10 +23,49 @@ enum RemoteConnectionState: Equatable {
     }
 }
 
+struct RemoteFrameRenderUpdate {
+    let image: CGImage?
+    let pixelSize: CGSize
+    let sequence: UInt64
+    let decodeMs: Double
+    let receivedAt: TimeInterval
+}
+
+struct RemoteRenderDiagnostics: Equatable {
+    var decodeMs: Double = 0
+    var renderMs: Double = 0
+    var droppedFrames = 0
+    var receivedFps: Double = 0
+    var presentedFps: Double = 0
+    var frameBytes = 0
+    var captureLatencyMs: Double?
+    var inputQueueMax: Int?
+    var droppedInputEvents = 0
+}
+
+private struct CompressedRemoteFrame {
+    let data: Data
+    let receivedAt: TimeInterval
+}
+
+private struct DecodedRemoteFrame {
+    let image: CGImage
+    let pixelSize: CGSize
+    let decodeMs: Double
+    let byteCount: Int
+    let receivedAt: TimeInterval
+}
+
 @MainActor
 @Observable
 final class RemoteDesktopClient {
-    var frameImage: UIImage?
+    @ObservationIgnored private(set) var frameImage: CGImage?
+    @ObservationIgnored private(set) var remoteCursor: CGPoint?
+    @ObservationIgnored private(set) var frameSequence: UInt64 = 0
+    @ObservationIgnored private(set) var desktopSize = CGSize(width: 1280, height: 720)
+    @ObservationIgnored var frameSink: ((RemoteFrameRenderUpdate) -> Void)?
+    @ObservationIgnored var cursorSink: ((CGPoint?) -> Void)?
+
     var connectionState: RemoteConnectionState = .disconnected
     var mode: RemoteMode = .view
     var streamProfile: RemoteStreamProfile = .balanced
@@ -33,14 +73,13 @@ final class RemoteDesktopClient {
     var frameFps: Double = 0
     var frameLatencyMs: Double?
     var frameBytes = 0
-    var desktopSize = CGSize(width: 1280, height: 720)
     var displayInfo: RemoteDisplayInfo?
     var monitors: [RemoteMonitorDescriptor] = []
-    var remoteCursor: CGPoint?
     var lastPointer = CGPoint(x: 0.5, y: 0.5)
     var inputRateLimitPerSec: Int?
     var inputQueueMax: Int?
     var droppedEvents = 0
+    var renderDiagnostics = RemoteRenderDiagnostics()
     var gatewayStatus: RemoteGatewayStatus?
     var statusText = "Remote idle"
 
@@ -52,6 +91,21 @@ final class RemoteDesktopClient {
     private var lastPointerSendAt: TimeInterval = 0
     private var pendingPointer: CGPoint?
     private var pointerFlushTask: Task<Void, Never>?
+    @ObservationIgnored private var frameDecodeTask: Task<Void, Never>?
+    @ObservationIgnored private var pendingFrameData: CompressedRemoteFrame?
+    @ObservationIgnored private var pendingDecodedFrame: DecodedRemoteFrame?
+    @ObservationIgnored private var framePresentationTask: Task<Void, Never>?
+    @ObservationIgnored private var lastFramePresentationAt: TimeInterval = 0
+    @ObservationIgnored private var diagnosticsDraft = RemoteRenderDiagnostics()
+    @ObservationIgnored private var lastDiagnosticsPublishAt: TimeInterval = 0
+    @ObservationIgnored private var receivedFrameCount = 0
+    @ObservationIgnored private var receivedFpsWindowStartedAt: TimeInterval = 0
+    @ObservationIgnored private var presentedFrameCount = 0
+    @ObservationIgnored private var presentedFpsWindowStartedAt: TimeInterval = 0
+    @ObservationIgnored private var adaptiveCooldownUntil: TimeInterval = 0
+    @ObservationIgnored private var adaptiveGoodSince: TimeInterval?
+    @ObservationIgnored private var adaptiveDroppedFrameBaseline = 0
+    @ObservationIgnored private var adaptiveDroppedInputBaseline = 0
     private var lastControlPromptAt: TimeInterval = 0
     private let monitorLayoutSendInterval: TimeInterval = 1.0 / 30.0
     private var lastMonitorLayoutSendAt: TimeInterval = 0
@@ -114,12 +168,31 @@ final class RemoteDesktopClient {
         receiveTask = nil
         pointerFlushTask?.cancel()
         pointerFlushTask = nil
+        frameDecodeTask?.cancel()
+        frameDecodeTask = nil
+        framePresentationTask?.cancel()
+        framePresentationTask = nil
         monitorLayoutFlushTask?.cancel()
         monitorLayoutFlushTask = nil
         pendingPointer = nil
+        pendingFrameData = nil
+        pendingDecodedFrame = nil
         pendingMonitorLayoutOffsets = nil
         webSocketTask?.cancel(with: .goingAway, reason: nil)
         webSocketTask = nil
+        frameImage = nil
+        remoteCursor = nil
+        diagnosticsDraft = RemoteRenderDiagnostics()
+        renderDiagnostics = diagnosticsDraft
+        frameSequence &+= 1
+        frameSink?(RemoteFrameRenderUpdate(
+            image: nil,
+            pixelSize: desktopSize,
+            sequence: frameSequence,
+            decodeMs: 0,
+            receivedAt: ProcessInfo.processInfo.systemUptime
+        ))
+        cursorSink?(nil)
         if isConnected || connectionState == .connecting {
             connectionState = .disconnected
         }
@@ -134,12 +207,20 @@ final class RemoteDesktopClient {
     }
 
     func setStreamProfile(_ nextProfile: RemoteStreamProfile) {
+        setStreamProfile(nextProfile, adaptive: false)
+    }
+
+    private func setStreamProfile(_ nextProfile: RemoteStreamProfile, adaptive: Bool) {
+        guard nextProfile != streamProfile else { return }
         streamProfile = nextProfile
         sendEnvelope([
             "type": "set-stream",
             "fps": nextProfile.fps,
             "quality": nextProfile.jpegQuality
         ])
+        if adaptive {
+            setStatusText("Stream adapted to \(nextProfile.title)")
+        }
     }
 
     func setVisibleMonitors(_ monitorIds: Set<String>) {
@@ -173,6 +254,7 @@ final class RemoteDesktopClient {
     func sendPointerMove(_ point: CGPoint) {
         let normalized = normalizedPoint(point)
         lastPointer = normalized
+        publishPredictedCursor(normalized)
         guard canSendInput(reportBlocked: false) else { return }
 
         let now = ProcessInfo.processInfo.systemUptime
@@ -285,13 +367,7 @@ final class RemoteDesktopClient {
     private func handle(_ message: URLSessionWebSocketTask.Message) async {
         switch message {
         case .data(let data):
-            if let image = UIImage(data: data) {
-                frameImage = image
-                desktopSize = image.size
-                if connectionState != .connected {
-                    connectionState = .connected
-                }
-            }
+            enqueueFrameData(data)
         case .string(let text):
             handleControlText(text)
         @unknown default:
@@ -315,9 +391,9 @@ final class RemoteDesktopClient {
             controlAllowed = payload["controlAllowed"] as? Bool ?? false
             inputRateLimitPerSec = intValue(payload["inputRateLimitPerSec"]) ?? inputRateLimitPerSec
             inputQueueMax = intValue(payload["inputQueueMax"]) ?? inputQueueMax
-            displayInfo = decodeObject(RemoteDisplayInfo.self, from: payload["display"]) ?? displayInfo
-            monitors = decodeObject([RemoteMonitorDescriptor].self, from: payload["monitors"]) ?? monitors
-            gatewayStatus = decodeObject(RemoteGatewayStatus.self, from: payload["gateway"]) ?? gatewayStatus
+            updateDisplayInfo(decodeObject(RemoteDisplayInfo.self, from: payload["display"]))
+            updateMonitors(decodeObject([RemoteMonitorDescriptor].self, from: payload["monitors"]))
+            updateGatewayStatus(decodeObject(RemoteGatewayStatus.self, from: payload["gateway"]))
             if let stream = payload["stream"] as? [String: Any] {
                 frameFps = doubleValue(stream["fps"]) ?? frameFps
             }
@@ -330,25 +406,40 @@ final class RemoteDesktopClient {
             connectionState = .connected
             setStatusText("Stream connected")
         case "remote-stream-config":
-            monitors = decodeObject([RemoteMonitorDescriptor].self, from: payload["monitors"]) ?? monitors
+            updateMonitors(decodeObject([RemoteMonitorDescriptor].self, from: payload["monitors"]))
             setStatusText("Stream tuned to \(streamProfile.title)")
         case "remote-monitor-config":
-            monitors = decodeObject([RemoteMonitorDescriptor].self, from: payload["monitors"]) ?? monitors
+            updateMonitors(decodeObject([RemoteMonitorDescriptor].self, from: payload["monitors"]))
+            setStatusText("Monitor view updated")
+        case "remote-monitor-layout":
             setStatusText("Monitor view updated")
         case "remote-stats":
             frameFps = doubleValue(payload["fps"]) ?? frameFps
             frameBytes = intValue(payload["frameBytes"]) ?? frameBytes
             frameLatencyMs = doubleValue(payload["captureLatencyMs"])
-            displayInfo = decodeObject(RemoteDisplayInfo.self, from: payload["display"]) ?? displayInfo
-            monitors = decodeObject([RemoteMonitorDescriptor].self, from: payload["monitors"]) ?? monitors
+            diagnosticsDraft.frameBytes = frameBytes
+            diagnosticsDraft.captureLatencyMs = frameLatencyMs
+            diagnosticsDraft.inputQueueMax = inputQueueMax
+            diagnosticsDraft.droppedInputEvents = droppedEvents
+            publishDiagnosticsIfNeeded()
+            updateDisplayInfo(decodeObject(RemoteDisplayInfo.self, from: payload["display"]))
+            updateMonitors(decodeObject([RemoteMonitorDescriptor].self, from: payload["monitors"]))
+            considerAdaptiveStream()
         case "remote-cursor":
             if let x = doubleValue(payload["x"]), let y = doubleValue(payload["y"]) {
-                remoteCursor = CGPoint(x: x, y: y)
+                let point = CGPoint(x: x, y: y)
+                if remoteCursor != point {
+                    remoteCursor = point
+                    cursorSink?(point)
+                }
             }
         case "remote-input-throttled":
             setStatusText("Input throttled")
         case "remote-input-backpressure":
             droppedEvents = intValue(payload["droppedEvents"]) ?? droppedEvents
+            diagnosticsDraft.droppedInputEvents = droppedEvents
+            diagnosticsDraft.inputQueueMax = inputQueueMax
+            publishDiagnosticsIfNeeded(force: true)
             setStatusText("Input queue is saturated")
         case "remote-input-error":
             setStatusText(payload["message"] as? String ?? "Input error")
@@ -365,6 +456,225 @@ final class RemoteDesktopClient {
         }
     }
 
+    private func enqueueFrameData(_ data: Data) {
+        let now = ProcessInfo.processInfo.systemUptime
+        if pendingFrameData != nil {
+            diagnosticsDraft.droppedFrames += 1
+        }
+        pendingFrameData = CompressedRemoteFrame(data: data, receivedAt: now)
+        recordReceivedFrame(byteCount: data.count, at: now)
+        guard frameDecodeTask == nil else { return }
+        frameDecodeTask = Task { [weak self] in
+            await self?.decodePendingFrames()
+        }
+    }
+
+    private func decodePendingFrames() async {
+        while !Task.isCancelled {
+            guard let compressedFrame = pendingFrameData else {
+                frameDecodeTask = nil
+                return
+            }
+
+            pendingFrameData = nil
+            guard let decodedFrame = await Self.decodeFrameImage(from: compressedFrame), !Task.isCancelled else {
+                continue
+            }
+            enqueueDecodedFrame(decodedFrame)
+        }
+    }
+
+    private func enqueueDecodedFrame(_ frame: DecodedRemoteFrame) {
+        let now = ProcessInfo.processInfo.systemUptime
+        let interval = targetPresentationInterval
+        let elapsed = now - lastFramePresentationAt
+
+        if lastFramePresentationAt == 0 || elapsed >= interval {
+            framePresentationTask?.cancel()
+            framePresentationTask = nil
+            pendingDecodedFrame = nil
+            publishFrame(frame)
+            return
+        }
+
+        if pendingDecodedFrame != nil {
+            diagnosticsDraft.droppedFrames += 1
+        }
+        pendingDecodedFrame = frame
+        scheduleFramePresentation(after: interval - elapsed)
+    }
+
+    private func scheduleFramePresentation(after delay: TimeInterval) {
+        guard framePresentationTask == nil else { return }
+        let nanoseconds = UInt64(max(0, delay) * 1_000_000_000)
+        framePresentationTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            self?.flushPendingDecodedFrame()
+        }
+    }
+
+    private func flushPendingDecodedFrame() {
+        framePresentationTask = nil
+        guard let frame = pendingDecodedFrame else { return }
+        pendingDecodedFrame = nil
+        publishFrame(frame)
+    }
+
+    private func publishFrame(_ frame: DecodedRemoteFrame) {
+        frameSequence &+= 1
+        frameImage = frame.image
+        desktopSize = frame.pixelSize
+        lastFramePresentationAt = ProcessInfo.processInfo.systemUptime
+        diagnosticsDraft.decodeMs = frame.decodeMs
+        diagnosticsDraft.frameBytes = frame.byteCount
+        publishDiagnosticsIfNeeded()
+        frameSink?(RemoteFrameRenderUpdate(
+            image: frame.image,
+            pixelSize: frame.pixelSize,
+            sequence: frameSequence,
+            decodeMs: frame.decodeMs,
+            receivedAt: frame.receivedAt
+        ))
+        if connectionState != .connected {
+            connectionState = .connected
+        }
+        considerAdaptiveStream()
+    }
+
+    private nonisolated static func decodeFrameImage(from frame: CompressedRemoteFrame) async -> DecodedRemoteFrame? {
+        await Task.detached(priority: .userInitiated) {
+            let startedAt = ProcessInfo.processInfo.systemUptime
+            let options: [CFString: Any] = [
+                kCGImageSourceShouldCache: true,
+                kCGImageSourceShouldCacheImmediately: true
+            ]
+            guard
+                let source = CGImageSourceCreateWithData(frame.data as CFData, options as CFDictionary),
+                let cgImage = CGImageSourceCreateImageAtIndex(source, 0, options as CFDictionary)
+            else {
+                return nil
+            }
+            let decodeMs = (ProcessInfo.processInfo.systemUptime - startedAt) * 1_000
+            return DecodedRemoteFrame(
+                image: cgImage,
+                pixelSize: CGSize(width: cgImage.width, height: cgImage.height),
+                decodeMs: decodeMs,
+                byteCount: frame.data.count,
+                receivedAt: frame.receivedAt
+            )
+        }.value
+    }
+
+    func recordFramePresented(renderMs: Double) {
+        let now = ProcessInfo.processInfo.systemUptime
+        diagnosticsDraft.renderMs = renderMs
+        if presentedFpsWindowStartedAt == 0 {
+            presentedFpsWindowStartedAt = now
+        }
+        presentedFrameCount += 1
+        let elapsed = now - presentedFpsWindowStartedAt
+        if elapsed >= 1 {
+            diagnosticsDraft.presentedFps = Double(presentedFrameCount) / elapsed
+            presentedFrameCount = 0
+            presentedFpsWindowStartedAt = now
+        }
+        publishDiagnosticsIfNeeded()
+    }
+
+    private var targetPresentationInterval: TimeInterval {
+        let fps = max(1, min(30, streamProfile.fps))
+        return 1.0 / Double(fps)
+    }
+
+    private func recordReceivedFrame(byteCount: Int, at now: TimeInterval) {
+        frameBytes = byteCount
+        diagnosticsDraft.frameBytes = byteCount
+        diagnosticsDraft.inputQueueMax = inputQueueMax
+        diagnosticsDraft.droppedInputEvents = droppedEvents
+        if receivedFpsWindowStartedAt == 0 {
+            receivedFpsWindowStartedAt = now
+        }
+        receivedFrameCount += 1
+        let elapsed = now - receivedFpsWindowStartedAt
+        if elapsed >= 1 {
+            diagnosticsDraft.receivedFps = Double(receivedFrameCount) / elapsed
+            receivedFrameCount = 0
+            receivedFpsWindowStartedAt = now
+        }
+        publishDiagnosticsIfNeeded()
+    }
+
+    private func publishDiagnosticsIfNeeded(force: Bool = false) {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard force || now - lastDiagnosticsPublishAt >= 0.33 else { return }
+        lastDiagnosticsPublishAt = now
+        diagnosticsDraft.captureLatencyMs = frameLatencyMs
+        diagnosticsDraft.inputQueueMax = inputQueueMax
+        diagnosticsDraft.droppedInputEvents = droppedEvents
+        if renderDiagnostics != diagnosticsDraft {
+            renderDiagnostics = diagnosticsDraft
+        }
+    }
+
+    private func considerAdaptiveStream() {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now >= adaptiveCooldownUntil else { return }
+
+        let latency = frameLatencyMs ?? diagnosticsDraft.captureLatencyMs ?? 0
+        let pressureIsHigh = latency > 220
+            || diagnosticsDraft.decodeMs > 24
+            || diagnosticsDraft.droppedFrames > adaptiveDroppedFrameBaseline
+            || droppedEvents > adaptiveDroppedInputBaseline
+
+        if pressureIsHigh {
+            adaptiveGoodSince = nil
+            adaptiveDroppedFrameBaseline = diagnosticsDraft.droppedFrames
+            adaptiveDroppedInputBaseline = droppedEvents
+            guard let lower = streamProfile.nextLowerPressureProfile else {
+                adaptiveCooldownUntil = now + 3
+                return
+            }
+            setStreamProfile(lower, adaptive: true)
+            adaptiveCooldownUntil = now + 4
+            return
+        }
+
+        let pressureIsLow = latency > 0
+            && latency < 90
+            && diagnosticsDraft.decodeMs > 0
+            && diagnosticsDraft.decodeMs < 8
+            && diagnosticsDraft.droppedFrames == adaptiveDroppedFrameBaseline
+            && droppedEvents == adaptiveDroppedInputBaseline
+
+        if pressureIsLow {
+            adaptiveGoodSince = adaptiveGoodSince ?? now
+            if now - (adaptiveGoodSince ?? now) >= 8, let higher = streamProfile.nextHigherQualityProfile {
+                setStreamProfile(higher, adaptive: true)
+                adaptiveGoodSince = nil
+                adaptiveCooldownUntil = now + 10
+            }
+        } else {
+            adaptiveGoodSince = nil
+            adaptiveDroppedFrameBaseline = diagnosticsDraft.droppedFrames
+            adaptiveDroppedInputBaseline = droppedEvents
+        }
+    }
+
+    private func updateDisplayInfo(_ next: RemoteDisplayInfo?) {
+        guard let next, next != displayInfo else { return }
+        displayInfo = next
+    }
+
+    private func updateMonitors(_ next: [RemoteMonitorDescriptor]?) {
+        guard let next, next != monitors else { return }
+        monitors = next
+    }
+
+    private func updateGatewayStatus(_ next: RemoteGatewayStatus?) {
+        guard let next, next != gatewayStatus else { return }
+        gatewayStatus = next
+    }
+
     private func sendInput(_ event: [String: Any], reportBlocked: Bool = true) {
         guard canSendInput(reportBlocked: reportBlocked) else { return }
         sendEnvelope(["type": "input", "event": event])
@@ -373,6 +683,7 @@ final class RemoteDesktopClient {
     private func sendMouseButton(button: String, action: String, at point: CGPoint?) {
         let target = point.map(normalizedPoint) ?? lastPointer
         lastPointer = target
+        publishPredictedCursor(target)
         cancelPendingPointerMove()
         sendInput([
             "type": "mouse_button",
@@ -381,6 +692,14 @@ final class RemoteDesktopClient {
             "x": target.x,
             "y": target.y
         ])
+    }
+
+    private func publishPredictedCursor(_ point: CGPoint) {
+        guard mode == .control else { return }
+        if remoteCursor != point {
+            remoteCursor = point
+            cursorSink?(point)
+        }
     }
 
     private func canSendInput(reportBlocked: Bool = true) -> Bool {
