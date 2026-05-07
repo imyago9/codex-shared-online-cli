@@ -1081,10 +1081,14 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         imageView.layer.contents = nil
         videoActive = true
         desktopSize = update.pixelSize
-        if videoLayer.sampleBufferRenderer.status == .failed {
+        let renderer = videoLayer.sampleBufferRenderer
+        if renderer.status == .failed || renderer.requiresFlushToResumeDecoding {
             flushVideoLayer(removeImage: false)
         }
-        videoLayer.sampleBufferRenderer.enqueue(sampleBuffer)
+        if !renderer.isReadyForMoreMediaData {
+            renderer.flush()
+        }
+        renderer.enqueue(sampleBuffer)
         placeholderView.isHidden = true
         cursorView.isHidden = remoteCursor == nil
         setNeedsLayout()

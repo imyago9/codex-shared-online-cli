@@ -2114,6 +2114,7 @@ const config = {
   videoBitrateKbps: clampInteger(parseInteger(process.env.REMOTE_VIDEO_BITRATE_KBPS, 20_000), 500, 50_000),
   videoMaxWidth: clampInteger(parseInteger(process.env.REMOTE_VIDEO_MAX_WIDTH, 4096), 640, 7680),
   videoMaxHeight: clampInteger(parseInteger(process.env.REMOTE_VIDEO_MAX_HEIGHT, 2304), 360, 4320),
+  videoScaleFlags: process.env.REMOTE_VIDEO_SCALE_FLAGS || 'bicubic',
   videoEncoder: process.env.REMOTE_VIDEO_ENCODER || 'libx264',
   videoFfmpegPath: process.env.REMOTE_VIDEO_FFMPEG_PATH || bundledFfmpegPath || 'ffmpeg',
   inputEnabled: parseBoolean(process.env.REMOTE_INPUT_ENABLED, true),
@@ -2150,6 +2151,7 @@ const streamState = {
 const videoState = {
   clients: new Set(),
   process: null,
+  framer: null,
   cursorTimer: null,
   statsTimer: null,
   activeFps: config.videoFps,
@@ -2166,7 +2168,10 @@ const videoState = {
   restartTimer: null,
   processStartedAt: 0,
   lastStderr: '',
-  activePlan: null
+  activePlan: null,
+  failureCount: 0,
+  firstFrameAt: 0,
+  lastAccessUnitAt: 0
 };
 
 const captureDisplayCatalog = {
@@ -2665,11 +2670,132 @@ function getSelectedVideoDisplays() {
       selectedDisplays = nextDisplays;
     }
   }
-  return applyMonitorLayout(selectedDisplays, videoState.activeMonitorLayout);
+  return selectedDisplays;
 }
 
 function evenVideoDimension(value) {
   return Math.max(2, Math.floor(Math.max(2, value) / 2) * 2);
+}
+
+function h264NalType(unit) {
+  return unit && unit.length > 0 ? (unit[0] & 0x1F) : -1;
+}
+
+function findAnnexBStartCodes(buffer) {
+  const starts = [];
+  let index = 0;
+  while (index + 3 < buffer.length) {
+    if (buffer[index] === 0 && buffer[index + 1] === 0) {
+      if (buffer[index + 2] === 1) {
+        starts.push({ index, length: 3 });
+        index += 3;
+        continue;
+      }
+      if (buffer[index + 2] === 0 && buffer[index + 3] === 1) {
+        starts.push({ index, length: 4 });
+        index += 4;
+        continue;
+      }
+    }
+    index += 1;
+  }
+  return starts;
+}
+
+class H264AccessUnitFramer {
+  constructor(onAccessUnit) {
+    this.onAccessUnit = onAccessUnit;
+    this.buffer = Buffer.alloc(0);
+    this.currentAccessUnit = [];
+    this.startCode = Buffer.from([0, 0, 0, 1]);
+  }
+
+  append(chunk) {
+    if (!Buffer.isBuffer(chunk) || chunk.length === 0) {
+      return;
+    }
+
+    this.buffer = this.buffer.length > 0 ? Buffer.concat([this.buffer, chunk]) : chunk;
+    for (const unit of this.drainCompleteNALUnits()) {
+      this.processNALUnit(unit);
+    }
+  }
+
+  flush() {
+    for (const unit of this.drainCompleteNALUnits(true)) {
+      this.processNALUnit(unit);
+    }
+    this.flushAccessUnit();
+    this.buffer = Buffer.alloc(0);
+    this.currentAccessUnit = [];
+  }
+
+  drainCompleteNALUnits(flushRemainder = false) {
+    if (this.buffer.length < 5) {
+      return [];
+    }
+
+    const starts = findAnnexBStartCodes(this.buffer);
+    if (starts.length === 0) {
+      if (this.buffer.length > 4_000_000) {
+        this.buffer = Buffer.alloc(0);
+      }
+      return [];
+    }
+
+    if (starts[0].index > 0) {
+      this.buffer = this.buffer.subarray(starts[0].index);
+      return this.drainCompleteNALUnits(flushRemainder);
+    }
+
+    if (starts.length < 2 && !flushRemainder) {
+      return [];
+    }
+
+    const units = [];
+    const limit = flushRemainder ? starts.length : starts.length - 1;
+    for (let unitIndex = 0; unitIndex < limit; unitIndex += 1) {
+      const start = starts[unitIndex].index + starts[unitIndex].length;
+      const end = unitIndex + 1 < starts.length ? starts[unitIndex + 1].index : this.buffer.length;
+      if (end > start) {
+        units.push(this.buffer.subarray(start, end));
+      }
+    }
+
+    if (flushRemainder) {
+      this.buffer = Buffer.alloc(0);
+    } else {
+      this.buffer = this.buffer.subarray(starts[starts.length - 1].index);
+    }
+    return units;
+  }
+
+  processNALUnit(unit) {
+    const type = h264NalType(unit);
+    if (type === 9) {
+      this.flushAccessUnit();
+      this.currentAccessUnit = [unit];
+      return;
+    }
+
+    if (type === 7 || type === 8 || type === 6 || type === 5 || type === 1 || this.currentAccessUnit.length > 0) {
+      this.currentAccessUnit.push(unit);
+    }
+  }
+
+  flushAccessUnit() {
+    const accessUnit = this.currentAccessUnit;
+    this.currentAccessUnit = [];
+    if (!accessUnit.some((unit) => {
+      const type = h264NalType(unit);
+      return type === 1 || type === 5;
+    })) {
+      return;
+    }
+
+    const packet = Buffer.concat(accessUnit.flatMap((unit) => [this.startCode, unit]));
+    this.onAccessUnit(packet);
+  }
 }
 
 function fitVideoOutputSize(width, height) {
@@ -2727,7 +2853,7 @@ function buildFfmpegVideoArgs(plan) {
   const keyframeInterval = Math.max(1, Math.min(120, fps));
   const filters = [];
   if (plan.output.width !== plan.bounds.width || plan.output.height !== plan.bounds.height) {
-    filters.push(`scale=${plan.output.width}:${plan.output.height}:flags=fast_bilinear`);
+    filters.push(`scale=${plan.output.width}:${plan.output.height}:flags=${config.videoScaleFlags}`);
   }
   filters.push('format=yuv420p');
 
@@ -2735,6 +2861,9 @@ function buildFfmpegVideoArgs(plan) {
     '-hide_banner',
     '-loglevel', 'warning',
     '-fflags', 'nobuffer',
+    '-probesize', '32',
+    '-analyzeduration', '0',
+    '-rtbufsize', '256M',
     '-f', 'gdigrab',
     '-framerate', String(fps),
     '-draw_mouse', '1',
@@ -2745,7 +2874,8 @@ function buildFfmpegVideoArgs(plan) {
     '-an',
     '-sn',
     '-vf', filters.join(','),
-    '-c:v', config.videoEncoder
+    '-c:v', config.videoEncoder,
+    '-flags', 'low_delay'
   ];
 
   if (config.videoEncoder === 'libx264') {
@@ -2761,7 +2891,7 @@ function buildFfmpegVideoArgs(plan) {
       '-b:v', `${bitrateKbps}k`,
       '-maxrate', `${bitrateKbps}k`,
       '-bufsize', `${Math.max(500, Math.round(bitrateKbps / 2))}k`,
-      '-x264-params', 'repeat-headers=1:scenecut=0:aud=1'
+      '-x264-params', 'repeat-headers=1:scenecut=0:aud=1:force-cfr=1'
     );
   } else {
     args.push(
@@ -2773,7 +2903,7 @@ function buildFfmpegVideoArgs(plan) {
     );
   }
 
-  args.push('-f', 'h264', 'pipe:1');
+  args.push('-flush_packets', '1', '-f', 'h264', 'pipe:1');
   return args;
 }
 
@@ -2786,11 +2916,13 @@ function sendVideoReady(socket, plan) {
     transport: 'video',
     codec: 'h264',
     format: 'annexb',
+    framing: 'access-unit',
     fps: videoState.activeFps,
     bitrateKbps: videoState.activeBitrateKbps,
     video: {
       codec: 'h264',
       format: 'annexb',
+      framing: 'access-unit',
       encoder: config.videoEncoder,
       width: plan.output.width,
       height: plan.output.height,
@@ -2834,21 +2966,23 @@ function broadcastVideoCursor() {
 
 function broadcastVideoStats() {
   const bytes = videoState.bytesInWindow;
-  const chunks = videoState.chunksInWindow;
+  const frames = videoState.chunksInWindow;
   videoState.bytesInWindow = 0;
   videoState.chunksInWindow = 0;
   videoState.currentBitrateKbps = Number(((bytes * 8) / 1000).toFixed(2));
-  videoState.currentFps = videoState.activeFps;
-  videoState.lastFrameBytes = videoState.activeFps > 0
-    ? Math.round(bytes / videoState.activeFps)
+  videoState.currentFps = frames;
+  videoState.lastFrameBytes = frames > 0
+    ? Math.round(bytes / frames)
     : bytes;
 
   broadcastVideoControl({
     type: 'stats',
     transport: 'video',
     codec: 'h264',
+    framing: 'access-unit',
     fps: videoState.currentFps,
-    chunks,
+    chunks: frames,
+    frames,
     frameBytes: videoState.lastFrameBytes,
     bitrateKbps: videoState.currentBitrateKbps,
     clients: getOpenVideoClientCount(),
@@ -2872,6 +3006,7 @@ function stopVideoProcess(reason) {
     clearInterval(videoState.statsTimer);
     videoState.statsTimer = null;
   }
+  videoState.framer = null;
   if (videoState.process) {
     const child = videoState.process;
     videoState.process = null;
@@ -2886,7 +3021,7 @@ function stopVideoProcess(reason) {
   }
 }
 
-function scheduleVideoRestart(reason) {
+function scheduleVideoRestart(reason, delayMs = 120) {
   stopVideoProcess(reason);
   if (getOpenVideoClientCount() === 0 || videoState.restartTimer) {
     return;
@@ -2894,7 +3029,7 @@ function scheduleVideoRestart(reason) {
   videoState.restartTimer = setTimeout(() => {
     videoState.restartTimer = null;
     startVideoStream(reason);
-  }, 120);
+  }, Math.max(50, delayMs));
   videoState.restartTimer.unref();
 }
 
@@ -2902,7 +3037,6 @@ function recomputeVideoSettings() {
   let nextFps = config.videoFps;
   let nextBitrateKbps = config.videoBitrateKbps;
   let nextMonitorIds = [];
-  let nextMonitorLayout = [];
 
   for (const client of videoState.clients) {
     if (!isWsOpen(client)) {
@@ -2917,25 +3051,46 @@ function recomputeVideoSettings() {
     if (Array.isArray(client.requestedMonitorIds) && client.requestedMonitorIds.length > 0) {
       nextMonitorIds = client.requestedMonitorIds.slice(0, 16);
     }
-    if (Array.isArray(client.requestedMonitorLayout)) {
-      nextMonitorLayout = client.requestedMonitorLayout.slice(0, 16);
-    }
   }
 
   const changed = nextFps !== videoState.activeFps
     || nextBitrateKbps !== videoState.activeBitrateKbps
-    || JSON.stringify(nextMonitorIds) !== JSON.stringify(videoState.activeMonitorIds)
-    || JSON.stringify(nextMonitorLayout) !== JSON.stringify(videoState.activeMonitorLayout);
+    || JSON.stringify(nextMonitorIds) !== JSON.stringify(videoState.activeMonitorIds);
 
   videoState.activeFps = nextFps;
   videoState.activeBitrateKbps = nextBitrateKbps;
   videoState.activeMonitorIds = nextMonitorIds;
-  videoState.activeMonitorLayout = nextMonitorLayout;
   streamState.activeMonitorIds = nextMonitorIds;
-  streamState.activeMonitorLayout = nextMonitorLayout;
+  streamState.activeMonitorLayout = [];
 
   if (changed && videoState.process) {
     scheduleVideoRestart('video-settings-changed');
+  }
+}
+
+function broadcastVideoAccessUnit(packet) {
+  if (!Buffer.isBuffer(packet) || packet.length === 0) {
+    return;
+  }
+
+  const now = Date.now();
+  if (!videoState.firstFrameAt) {
+    videoState.firstFrameAt = now;
+    videoState.failureCount = 0;
+  }
+  videoState.lastAccessUnitAt = now;
+  videoState.bytesInWindow += packet.length;
+  videoState.chunksInWindow += 1;
+
+  for (const client of videoState.clients) {
+    if (!isWsOpen(client)) {
+      continue;
+    }
+    try {
+      client.send(packet, { binary: true });
+    } catch (_error) {
+      // Ignore send races.
+    }
   }
 }
 
@@ -2964,6 +3119,9 @@ function startVideoStream(reason) {
   videoState.bytesInWindow = 0;
   videoState.chunksInWindow = 0;
   videoState.processStartedAt = Date.now();
+  videoState.firstFrameAt = 0;
+  videoState.lastAccessUnitAt = 0;
+  videoState.framer = new H264AccessUnitFramer(broadcastVideoAccessUnit);
 
   for (const client of videoState.clients) {
     sendVideoReady(client, plan);
@@ -2989,18 +3147,7 @@ function startVideoStream(reason) {
     if (!Buffer.isBuffer(chunk) || chunk.length === 0) {
       return;
     }
-    videoState.bytesInWindow += chunk.length;
-    videoState.chunksInWindow += 1;
-    for (const client of videoState.clients) {
-      if (!isWsOpen(client)) {
-        continue;
-      }
-      try {
-        client.send(chunk, { binary: true });
-      } catch (_error) {
-        // Ignore send races.
-      }
-    }
+    videoState.framer?.append(chunk);
   });
 
   child.stderr.on('data', (chunk) => {
@@ -3017,15 +3164,23 @@ function startVideoStream(reason) {
       return;
     }
     videoState.process = null;
+    videoState.framer = null;
     stopVideoProcess('video-spawn-error');
     videoState.lastError = error && error.message ? error.message : 'ffmpeg-spawn-failed';
+    videoState.failureCount += 1;
     logger.warn('Failed to start video stream', {
-      message: videoState.lastError
+      message: videoState.lastError,
+      failureCount: videoState.failureCount
     });
-    broadcastVideoControl({
-      type: 'error',
-      message: videoState.lastError
-    });
+    if (getOpenVideoClientCount() > 0) {
+      broadcastVideoControl({
+        type: 'restarting',
+        message: videoState.lastError,
+        failureCount: videoState.failureCount
+      });
+      const delayMs = Math.min(2_000, 120 + (videoState.failureCount * 180));
+      scheduleVideoRestart('video-spawn-error', delayMs);
+    }
   });
 
   child.on('close', (code, signal) => {
@@ -3033,19 +3188,26 @@ function startVideoStream(reason) {
       return;
     }
     videoState.process = null;
+    videoState.framer?.flush();
+    videoState.framer = null;
     stopVideoProcess('video-process-closed');
     const message = videoState.lastStderr || `ffmpeg exited (${code ?? 'null'} ${signal || ''})`.trim();
     videoState.lastError = message;
+    videoState.failureCount += 1;
     logger.warn('Video stream stopped', {
       code,
       signal,
-      message
+      message,
+      failureCount: videoState.failureCount
     });
     if (getOpenVideoClientCount() > 0) {
       broadcastVideoControl({
-        type: 'error',
-        message
+        type: 'restarting',
+        message,
+        failureCount: videoState.failureCount
       });
+      const delayMs = Math.min(2_000, 120 + (videoState.failureCount * 180));
+      scheduleVideoRestart('video-process-closed', delayMs);
     }
   });
 
@@ -3084,6 +3246,7 @@ app.get('/health', (_req, res) => {
       transport: 'websocket',
       codec: 'h264',
       format: 'annexb',
+      framing: 'access-unit',
       targetFps: videoState.activeFps,
       fps: Number(videoState.currentFps.toFixed(2)),
       bitrateKbps: videoState.currentBitrateKbps,
@@ -3094,7 +3257,10 @@ app.get('/health', (_req, res) => {
       clients: getOpenVideoClientCount(),
       processRunning: Boolean(videoState.process),
       lastFrameBytes: videoState.lastFrameBytes,
-      lastError: videoState.lastError
+      lastError: videoState.lastError,
+      failureCount: videoState.failureCount,
+      firstFrameAt: videoState.firstFrameAt || null,
+      lastAccessUnitAt: videoState.lastAccessUnitAt || null
     },
     input: {
       available: inputController.available === true,

@@ -123,6 +123,7 @@ final class RemoteDesktopClient {
     @ObservationIgnored private var adaptiveDroppedFrameBaseline = 0
     @ObservationIgnored private var adaptiveDroppedInputBaseline = 0
     @ObservationIgnored private var streamTransport: RemoteStreamTransport = .video
+    @ObservationIgnored private var videoUsesAccessUnitFraming = false
     @ObservationIgnored private var h264Decoder = RemoteH264AnnexBDecoder()
     private var lastControlPromptAt: TimeInterval = 0
     private let monitorLayoutSendInterval: TimeInterval = 1.0 / 30.0
@@ -199,6 +200,7 @@ final class RemoteDesktopClient {
         pendingMonitorLayoutOffsets = nil
         h264Decoder.reset()
         streamTransport = .video
+        videoUsesAccessUnitFraming = false
         webSocketTask?.cancel(with: .goingAway, reason: nil)
         webSocketTask = nil
         frameImage = nil
@@ -448,6 +450,11 @@ final class RemoteDesktopClient {
                 }
                 streamTransport = transport
             }
+            let nextFraming = videoFramingValue(payload) == "access-unit"
+            if nextFraming != videoUsesAccessUnitFraming {
+                h264Decoder.reset()
+                videoUsesAccessUnitFraming = nextFraming
+            }
             updateDisplayInfo(decodeObject(RemoteDisplayInfo.self, from: payload["display"]))
             updateMonitors(decodeObject([RemoteMonitorDescriptor].self, from: payload["monitors"]))
             setStatusText(streamTransport == .video ? "Live video stream active" : "JPEG fallback stream active")
@@ -492,6 +499,8 @@ final class RemoteDesktopClient {
             setStatusText("Input disconnected")
         case "remote-stream-error":
             connectionState = .failed(payload["message"] as? String ?? "Stream error")
+        case "remote-stream-restarting":
+            setStatusText("Restarting live video")
         case "remote-stream-disconnected":
             connectionState = .failed("Remote stream disconnected")
         default:
@@ -502,7 +511,9 @@ final class RemoteDesktopClient {
     private func handleVideoData(_ data: Data) {
         let receivedAt = ProcessInfo.processInfo.systemUptime
         recordReceivedFrame(byteCount: data.count, at: receivedAt)
-        let samples = h264Decoder.append(data, receivedAt: receivedAt)
+        let samples = videoUsesAccessUnitFraming
+            ? h264Decoder.appendAccessUnit(data, receivedAt: receivedAt)
+            : h264Decoder.append(data, receivedAt: receivedAt)
         for sample in samples {
             publishVideoFrame(sample)
         }
@@ -914,6 +925,16 @@ final class RemoteDesktopClient {
         }
     }
 
+    private func videoFramingValue(_ payload: [String: Any]) -> String? {
+        if let framing = payload["framing"] as? String {
+            return framing.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }
+        if let video = payload["video"] as? [String: Any], let framing = video["framing"] as? String {
+            return framing.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }
+        return nil
+    }
+
     private func intValue(_ value: Any?) -> Int? {
         if let value = value as? Int {
             return value
@@ -983,13 +1004,63 @@ private final class RemoteH264AnnexBDecoder {
         let units = drainCompleteNALUnits()
         guard !units.isEmpty else { return [] }
 
+        return processNALUnits(units, receivedAt: receivedAt, flushAtEnd: false)
+    }
+
+    func appendAccessUnit(_ data: Data, receivedAt: TimeInterval) -> [RemoteVideoSample] {
+        guard !data.isEmpty else { return [] }
+        let units = nalUnits(in: data)
+        guard !units.isEmpty else { return [] }
+
+        return processNALUnits(units, receivedAt: receivedAt, flushAtEnd: true)
+    }
+
+    private func processNALUnits(
+        _ units: [Data],
+        receivedAt: TimeInterval,
+        flushAtEnd: Bool
+    ) -> [RemoteVideoSample] {
         var samples: [RemoteVideoSample] = []
         for unit in units {
             if let sample = processNALUnit(unit, receivedAt: receivedAt) {
                 samples.append(sample)
             }
         }
+        if flushAtEnd, let sample = flushAccessUnit(receivedAt: receivedAt) {
+            samples.append(sample)
+        }
         return samples
+    }
+
+    private func nalUnits(in data: Data) -> [Data] {
+        guard data.count >= 5 else { return [] }
+        let bytes = [UInt8](data)
+        var starts: [(index: Int, length: Int)] = []
+        var index = 0
+
+        while index + 3 < bytes.count {
+            if bytes[index] == 0, bytes[index + 1] == 0 {
+                if bytes[index + 2] == 1 {
+                    starts.append((index, 3))
+                    index += 3
+                    continue
+                }
+                if bytes[index + 2] == 0, bytes[index + 3] == 1 {
+                    starts.append((index, 4))
+                    index += 4
+                    continue
+                }
+            }
+            index += 1
+        }
+
+        guard !starts.isEmpty else { return [data] }
+        return starts.enumerated().compactMap { offset, startCode in
+            let start = startCode.index + startCode.length
+            let end = offset + 1 < starts.count ? starts[offset + 1].index : data.count
+            guard end > start else { return nil }
+            return data.subdata(in: start..<end)
+        }
     }
 
     private func drainCompleteNALUnits() -> [Data] {

@@ -1016,6 +1016,7 @@ function createRemoteGateway(server, remoteClient, options = {}) {
             transport: payload.transport || transport,
             codec: payload.codec || null,
             format: payload.format || null,
+            framing: payload.framing || null,
             video: payload.video || null,
             fps: Number(payload.fps) || connectionSettings.streamFps,
             jpegQuality: Number(payload.jpegQuality) || connectionSettings.jpegQuality,
@@ -1064,11 +1065,20 @@ function createRemoteGateway(server, remoteClient, options = {}) {
         }
 
         if (payload.type === 'error') {
-          if (fallbackToJpeg(payload.message || 'video-stream-error')) {
+          if (payload.fatal !== false && fallbackToJpeg(payload.message || 'video-stream-error')) {
             return;
           }
           sendControl('remote-stream-error', {
             message: payload.message || 'stream-error'
+          });
+          return;
+        }
+
+        if (payload.type === 'restarting') {
+          sendControl('remote-stream-restarting', {
+            transport,
+            message: payload.message || 'video-stream-restarting',
+            failureCount: Number(payload.failureCount) || 0
           });
           return;
         }
