@@ -1148,6 +1148,36 @@ function createNutInputController(nut, displayBounds, logger) {
     return createUnavailableInputController('nut-js api incomplete');
   }
 
+  const inputDelayMs = clampInteger(parseInteger(process.env.REMOTE_INPUT_AUTO_DELAY_MS, 0), 0, 1_000);
+  const mouseSpeed = clampInteger(parseInteger(process.env.REMOTE_INPUT_MOUSE_SPEED, 100_000), 100, 1_000_000);
+
+  if (mouse.config && typeof mouse.config === 'object') {
+    mouse.config.autoDelayMs = inputDelayMs;
+    mouse.config.mouseSpeed = mouseSpeed;
+  }
+  if (keyboard.config && typeof keyboard.config === 'object') {
+    keyboard.config.autoDelayMs = inputDelayMs;
+  }
+  try {
+    const registry = nut.providerRegistry;
+    const mouseProvider = registry && typeof registry.getMouse === 'function' ? registry.getMouse() : null;
+    const keyboardProvider = registry && typeof registry.getKeyboard === 'function' ? registry.getKeyboard() : null;
+    if (mouseProvider && typeof mouseProvider.setMouseDelay === 'function') {
+      mouseProvider.setMouseDelay(inputDelayMs);
+    }
+    if (keyboardProvider && typeof keyboardProvider.setKeyboardDelay === 'function') {
+      keyboardProvider.setKeyboardDelay(inputDelayMs);
+    }
+  } catch (_error) {
+    // Provider-level delay tuning is best-effort; the public config still removes wrapper sleeps.
+  }
+
+  logger.info('Native input controller configured for low latency', {
+    backend: 'nut-js',
+    autoDelayMs: inputDelayMs,
+    mouseSpeed
+  });
+
   const keyMapByCode = {
     Enter: ['Enter', 'Return'],
     Escape: ['Escape'],
@@ -1477,6 +1507,8 @@ function createNutInputController(nut, displayBounds, logger) {
   return {
     available: true,
     reason: null,
+    backend: 'nut-js',
+    autoDelayMs: inputDelayMs,
     async handleEvent(event) {
       if (!event || typeof event !== 'object') {
         throw new Error('invalid-input-event');
@@ -1903,15 +1935,15 @@ function Invoke-TextInput([string]$base64) {
       return;
     }
 
-    state.moveTimer = setTimeout(() => {
+    state.moveTimer = setImmediate(() => {
       state.moveTimer = null;
       try {
         flushPendingMove();
       } catch (error) {
         markUnavailable(error && error.message ? error.message : 'powershell-move-failed');
       }
-    }, 4);
-    state.moveTimer.unref();
+    });
+    state.moveTimer.unref?.();
   }
 
   function moveCursor(event, coalesce) {
@@ -1934,6 +1966,8 @@ function Invoke-TextInput([string]$base64) {
     get reason() {
       return state.reason;
     },
+    backend: 'powershell',
+    autoDelayMs: 0,
     async handleEvent(event) {
       if (!state.available) {
         throw new Error(state.reason || 'powershell-input-unavailable');
@@ -2028,7 +2062,7 @@ function Invoke-TextInput([string]$base64) {
     close() {
       state.closed = true;
       if (state.moveTimer) {
-        clearTimeout(state.moveTimer);
+        clearImmediate(state.moveTimer);
         state.moveTimer = null;
       }
       state.pendingMove = null;
@@ -3264,7 +3298,9 @@ app.get('/health', (_req, res) => {
     },
     input: {
       available: inputController.available === true,
-      reason: inputController.reason || null
+      reason: inputController.reason || null,
+      backend: inputController.backend || null,
+      autoDelayMs: Number.isFinite(inputController.autoDelayMs) ? inputController.autoDelayMs : null
     },
     cursor: {
       available: cursorTracker.available === true,
@@ -3486,14 +3522,14 @@ inputWss.on('connection', (socket) => {
   function clearPendingMove() {
     pendingMove = null;
     if (moveFlushTimer) {
-      clearTimeout(moveFlushTimer);
+      clearImmediate(moveFlushTimer);
       moveFlushTimer = null;
     }
   }
 
   function flushPendingMove() {
     if (moveFlushTimer) {
-      clearTimeout(moveFlushTimer);
+      clearImmediate(moveFlushTimer);
       moveFlushTimer = null;
     }
     if (!pendingMove || releasedInputState) {
@@ -3509,8 +3545,8 @@ inputWss.on('connection', (socket) => {
     if (moveFlushTimer || releasedInputState) {
       return;
     }
-    moveFlushTimer = setTimeout(flushPendingMove, 1);
-    moveFlushTimer.unref();
+    moveFlushTimer = setImmediate(flushPendingMove);
+    moveFlushTimer.unref?.();
   }
 
   function enqueueSocketInputEvent(event) {

@@ -103,7 +103,7 @@ final class RemoteDesktopClient {
     private var receiveTask: Task<Void, Never>?
     private let feedback = UIImpactFeedbackGenerator(style: .light)
     private var currentURL: URL?
-    private let pointerSendInterval: TimeInterval = 1.0 / 180.0
+    private let pointerSendInterval: TimeInterval = 1.0 / 120.0
     private var lastPointerSendAt: TimeInterval = 0
     private var pendingPointer: CGPoint?
     private var pointerFlushTask: Task<Void, Never>?
@@ -844,7 +844,8 @@ final class RemoteDesktopClient {
         else {
             return
         }
-        webSocketTask.send(.string(text)) { _ in }
+        let message = URLSessionWebSocketTask.Message.string(text)
+        webSocketTask.send(message) { _ in }
     }
 
     private func sendMonitorLayoutEnvelope(_ offsets: [String: CGSize]) {
