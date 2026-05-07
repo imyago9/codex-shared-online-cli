@@ -34,8 +34,12 @@ struct OnlineCLIAPI {
         try await request("api/sessions")
     }
 
-    func createSession() async throws -> SessionMutationResponse {
-        try await request("api/sessions", method: "POST", body: EmptyBody())
+    func createSession(name: String? = nil, terminalProfile: TerminalProfile? = nil) async throws -> SessionMutationResponse {
+        try await request(
+            "api/sessions",
+            method: "POST",
+            body: CreateSessionRequest(name: name, terminalProfile: terminalProfile)
+        )
     }
 
     func restartSession(_ id: String) async throws -> SessionMutationResponse {
@@ -51,6 +55,14 @@ struct OnlineCLIAPI {
             "api/sessions/\(sessionId)/command",
             method: "POST",
             body: CommandRequest(command: command)
+        )
+    }
+
+    func scrollSession(_ sessionId: String, lines: Int) async throws {
+        _ = try await requestData(
+            "api/sessions/\(sessionId)/scroll",
+            method: "POST",
+            body: ScrollRequest(lines: lines)
         )
     }
 
@@ -150,8 +162,17 @@ struct OnlineCLIAPI {
 
 private struct EmptyBody: Encodable {}
 
+private struct CreateSessionRequest: Encodable {
+    let name: String?
+    let terminalProfile: TerminalProfile?
+}
+
 private struct CommandRequest: Encodable {
     let command: String
+}
+
+private struct ScrollRequest: Encodable {
+    let lines: Int
 }
 
 private struct ResumeRequest: Encodable {

@@ -132,6 +132,16 @@ final class RemoteDesktopClient {
         ])
     }
 
+    func sendDoubleClick(at point: CGPoint? = nil) {
+        sendClick(button: "left", at: point)
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 70_000_000)
+            await MainActor.run {
+                self?.sendClick(button: "left", at: point)
+            }
+        }
+    }
+
     func sendWheel(deltaY: Int) {
         sendInput([
             "type": "mouse_wheel",

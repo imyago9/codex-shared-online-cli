@@ -2,9 +2,29 @@ import Foundation
 
 struct ServerSettings: Codable, Equatable {
     var baseURLString = "https://desktop-cguakc2.tailbca5e0.ts.net"
+    var defaultTerminalProfile: TerminalProfile = .powershell
     var defaultRemoteMode: RemoteMode = .view
     var remoteStreamProfile: RemoteStreamProfile = .balanced
     var preferNativeRemote = true
+
+    enum CodingKeys: String, CodingKey {
+        case baseURLString
+        case defaultTerminalProfile
+        case defaultRemoteMode
+        case remoteStreamProfile
+        case preferNativeRemote
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        baseURLString = try container.decodeIfPresent(String.self, forKey: .baseURLString) ?? baseURLString
+        defaultTerminalProfile = try container.decodeIfPresent(TerminalProfile.self, forKey: .defaultTerminalProfile) ?? defaultTerminalProfile
+        defaultRemoteMode = try container.decodeIfPresent(RemoteMode.self, forKey: .defaultRemoteMode) ?? defaultRemoteMode
+        remoteStreamProfile = try container.decodeIfPresent(RemoteStreamProfile.self, forKey: .remoteStreamProfile) ?? remoteStreamProfile
+        preferNativeRemote = try container.decodeIfPresent(Bool.self, forKey: .preferNativeRemote) ?? preferNativeRemote
+    }
 
     var normalizedBaseURL: URL? {
         let trimmed = baseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -20,6 +40,47 @@ struct ServerSettings: Codable, Equatable {
         components.query = nil
         components.fragment = nil
         return components.url
+    }
+}
+
+enum TerminalProfile: String, Codable, CaseIterable, Identifiable {
+    case powershell
+    case wsl
+    case system
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .powershell:
+            return "PowerShell"
+        case .wsl:
+            return "WSL"
+        case .system:
+            return "System"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .powershell:
+            return "Native Windows shell"
+        case .wsl:
+            return "Linux shell via tmux"
+        case .system:
+            return "Host default shell"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .powershell:
+            return "terminal"
+        case .wsl:
+            return "shippingbox"
+        case .system:
+            return "terminal"
+        }
     }
 }
 
@@ -106,12 +167,16 @@ struct HealthResponse: Codable {
     let totalSessions: Int
     let defaultSessionId: String?
     let singleConsoleMode: Bool
+    let defaultTerminalProfile: TerminalProfile?
+    let terminalProfiles: [TerminalProfile]?
 }
 
 struct SessionsResponse: Codable {
     let sessions: [TerminalSessionSnapshot]
     let defaultSessionId: String?
     let singleConsoleMode: Bool
+    let defaultTerminalProfile: TerminalProfile?
+    let terminalProfiles: [TerminalProfile]?
 }
 
 struct SessionMutationResponse: Codable {
@@ -122,6 +187,10 @@ struct SessionMutationResponse: Codable {
 struct TerminalSessionSnapshot: Codable, Identifiable, Hashable {
     let id: String
     let name: String
+    let status: String?
+    let terminalProfile: TerminalProfile?
+    let shellType: TerminalProfile?
+    let backend: String?
     let shell: String?
     let cwd: String?
     let cols: Int?
@@ -133,6 +202,21 @@ struct TerminalSessionSnapshot: Codable, Identifiable, Hashable {
 
     var displayName: String {
         name.isEmpty ? String(id.prefix(8)) : name
+    }
+
+    var effectiveProfile: TerminalProfile {
+        terminalProfile ?? shellType ?? .powershell
+    }
+
+    var profileLabel: String {
+        effectiveProfile.title
+    }
+
+    var backendLabel: String {
+        guard let backend, !backend.isEmpty else {
+            return effectiveProfile.subtitle
+        }
+        return backend == "tmux" ? "tmux-backed" : "direct PTY"
     }
 }
 
@@ -260,8 +344,23 @@ struct CodexSessionsResponse: Codable {
 
 struct CodexSummary: Codable {
     let totalSessions: Int?
+    let sessionCount: Int?
+    let scannedAt: String?
+    let storeCount: Int?
+    let uniqueDirectories: Int?
     let totalTokens: Int?
     let totalToolCalls: Int?
+    let totalUserMessages: Int?
+    let totalAssistantMessages: Int?
+    let resumableSessionCount: Int?
+    let nonResumableSessionCount: Int?
+    let unknownResumableSessionCount: Int?
+    let completeMetricsSessionCount: Int?
+    let partialMetricsSessionCount: Int?
+    let estimatedMetricsSessionCount: Int?
+    let duplicateSessionEntries: Int?
+    let historyAvailable: Bool?
+    let historyPartiallyAvailable: Bool?
 }
 
 struct CodexSessionSummary: Codable, Identifiable, Hashable {
@@ -269,10 +368,19 @@ struct CodexSessionSummary: Codable, Identifiable, Hashable {
     let cwd: String?
     let model: String?
     let startedAt: String?
+    let endedAt: String?
     let lastPromptAt: String?
+    let cliVersion: String?
+    let fileName: String?
+    let storeCodexHome: String?
     let isResumable: Bool?
     let resumeStatus: String?
+    let resumeReason: String?
     let resumeCommand: String?
+    let metricsQuality: String?
+    let durationMs: Int?
+    let elapsedDurationMs: Int?
+    let activeDurationMs: Int?
     let metrics: CodexMetrics?
 
     var title: String {
@@ -286,7 +394,11 @@ struct CodexSessionSummary: Codable, Identifiable, Hashable {
 }
 
 struct CodexMetrics: Codable, Hashable {
+    let userMessages: Int?
+    let assistantMessages: Int?
     let toolCalls: Int?
+    let reasoningEvents: Int?
+    let tokenCountEvents: Int?
     let totalTokenUsage: TokenUsage?
 }
 

@@ -93,10 +93,46 @@ function resolveDefaultShell() {
   }
 
   if (process.platform === 'win32') {
-    return 'wsl.exe';
+    return 'powershell.exe';
   }
 
   return process.env.SHELL || '/bin/bash';
+}
+
+function parseTerminalProfile(rawValue, fallback) {
+  const normalized = typeof rawValue === 'string' ? rawValue.trim().toLowerCase() : '';
+  if (['powershell', 'pwsh', 'ps'].includes(normalized)) {
+    return 'powershell';
+  }
+  if (['wsl', 'linux'].includes(normalized)) {
+    return 'wsl';
+  }
+  if (['system', 'shell', 'default'].includes(normalized)) {
+    return 'system';
+  }
+  return fallback;
+}
+
+function resolvePowerShellCommand() {
+  return process.env.POWERSHELL_COMMAND || (process.platform === 'win32' ? 'powershell.exe' : 'pwsh');
+}
+
+function resolvePowerShellArgs() {
+  if (process.env.POWERSHELL_ARGS) {
+    return parseArgs(process.env.POWERSHELL_ARGS);
+  }
+  return ['-NoLogo'];
+}
+
+function resolveWslCommand() {
+  return process.env.WSL_COMMAND || 'wsl.exe';
+}
+
+function resolveWslArgs() {
+  if (process.env.WSL_ARGS) {
+    return parseArgs(process.env.WSL_ARGS);
+  }
+  return [];
 }
 
 // Load .env once so repo-shared defaults work without a dependency.
@@ -113,6 +149,14 @@ const config = {
   wsHeartbeatMs: Math.max(parseInteger(process.env.WS_HEARTBEAT_MS, 30_000), 10_000),
   defaultShell: resolveDefaultShell(),
   defaultShellArgs: parseArgs(process.env.PTY_ARGS),
+  defaultTerminalProfile: parseTerminalProfile(
+    process.env.DEFAULT_TERMINAL_PROFILE || process.env.TERMINAL_DEFAULT_PROFILE,
+    process.platform === 'win32' ? 'powershell' : 'system'
+  ),
+  powerShellCommand: resolvePowerShellCommand(),
+  powerShellArgs: resolvePowerShellArgs(),
+  wslCommand: resolveWslCommand(),
+  wslArgs: resolveWslArgs(),
   defaultCwd: process.env.PTY_CWD || resolveDefaultCwd(),
   tmuxCommand: process.env.TMUX_COMMAND || (process.platform === 'win32' ? 'wsl.exe' : 'tmux'),
   tmuxArgs: parseArgs(process.env.TMUX_ARGS),

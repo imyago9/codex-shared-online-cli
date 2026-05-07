@@ -7,6 +7,11 @@ function isSafeSessionId(value) {
 
 function createSessionRoutes(sessionManager, codexSessionIndex) {
   const router = express.Router();
+  const terminalProfiles = () => (
+    sessionManager.defaultTerminalProfile === 'system'
+      ? ['system', 'powershell', 'wsl']
+      : ['powershell', 'wsl']
+  );
 
   router.get('/health', (_req, res) => {
     res.json({
@@ -14,7 +19,9 @@ function createSessionRoutes(sessionManager, codexSessionIndex) {
       timestamp: new Date().toISOString(),
       totalSessions: sessionManager.listSessions().length,
       defaultSessionId: sessionManager.defaultSessionId,
-      singleConsoleMode: sessionManager.singleConsoleMode === true
+      singleConsoleMode: sessionManager.singleConsoleMode === true,
+      defaultTerminalProfile: sessionManager.defaultTerminalProfile,
+      terminalProfiles: terminalProfiles()
     });
   });
 
@@ -22,7 +29,9 @@ function createSessionRoutes(sessionManager, codexSessionIndex) {
     res.json({
       sessions: sessionManager.listSessions(),
       defaultSessionId: sessionManager.defaultSessionId,
-      singleConsoleMode: sessionManager.singleConsoleMode === true
+      singleConsoleMode: sessionManager.singleConsoleMode === true,
+      defaultTerminalProfile: sessionManager.defaultTerminalProfile,
+      terminalProfiles: terminalProfiles()
     });
   });
 
@@ -42,9 +51,13 @@ function createSessionRoutes(sessionManager, codexSessionIndex) {
     try {
       const body = req.body || {};
       const name = typeof body.name === 'string' ? body.name.trim() : '';
+      const terminalProfile = typeof body.terminalProfile === 'string'
+        ? body.terminalProfile.trim()
+        : (typeof body.shellType === 'string' ? body.shellType.trim() : '');
 
       const session = sessionManager.createSession({
-        name: name || undefined
+        name: name || undefined,
+        terminalProfile: terminalProfile || undefined
       });
 
       return res.status(201).json({

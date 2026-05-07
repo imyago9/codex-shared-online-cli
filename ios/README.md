@@ -16,7 +16,9 @@ This is a native SwiftUI shell for the Tailscale-only Online CLI server.
    https://desktop-cguakc2.tailbca5e0.ts.net
    ```
 
-The Console tab wraps the existing web terminal in a native `WKWebView`. The Remote tab uses the `/ws/remote` stream directly from Swift for a native desktop-control surface with stream profiles, live cursor position, gateway diagnostics, and one-tap desktop shortcuts.
+The Console tab is a native terminal client. It connects to `/ws?sessionId=...`, sends PTY input/resize messages directly, and supports PowerShell by default with WSL available per terminal. Codex history appears in the Threads tab so terminal sessions and Codex threads are no longer mixed together.
+
+The Remote tab uses the `/ws/remote` stream directly from Swift for a native desktop-control surface with stream profiles, live cursor position, gateway diagnostics, sensitivity controls, and one-tap desktop shortcuts.
 
 ## Remote Desktop
 

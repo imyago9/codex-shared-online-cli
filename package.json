@@ -2,7 +2,7 @@
   "name": "online-cli-2",
   "version": "0.1.0",
   "private": true,
-  "description": "Webview for a shared WSL terminal",
+  "description": "Tailscale console for shared PowerShell, WSL, Codex, and remote desktop sessions",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"

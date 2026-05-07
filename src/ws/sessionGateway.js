@@ -76,6 +76,8 @@ function createSessionGateway(server, sessionManager, options) {
         channel: 'control',
         type: 'session-ready',
         sessionId: session.id,
+        terminalProfile: session.terminalProfile,
+        backend: session.backend,
         cols: session.cols,
         rows: session.rows
       }));

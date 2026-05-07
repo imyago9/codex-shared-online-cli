@@ -1,13 +1,14 @@
-# Local Codex WSL Console
+# Local Codex Native Console
 
-A Tailscale-first web console for WSL with tmux-backed sessions, Codex session browsing, and optional remote desktop streaming.
+A Tailscale-first console for PowerShell and WSL terminals, Codex thread browsing, native iOS control surfaces, and optional remote desktop streaming.
 
 ## What is included
-- Per-session tmux-backed terminal state (refresh-safe attach/detach semantics)
-- Direct tmux attach streaming per web client (desktop terminal + desktop web + iPhone web all read/write the same tmux session)
-- Multi-session mode by default: each session is an independent tmux console with its own attach command
+- PowerShell is the default terminal profile on Windows
+- WSL remains available per terminal session with the existing tmux-backed attach/detach semantics
+- Direct persistent PTY sessions for PowerShell and other host shells
+- Multi-session mode by default: each terminal is an independent console with its own selected profile
 - REST API for session lifecycle (`/api/sessions`)
-- Device-wide Codex session index + one-click resume into terminal sessions
+- Device-wide Codex thread index + one-click resume into terminal sessions
   - Resume safety: sessions are marked resumable using local `~/.codex/history.jsonl`
   - WSL-only source selection to avoid Windows store resume mismatches
   - Duplicate session ids across stores are deduped before serving API results
@@ -17,10 +18,10 @@ A Tailscale-first web console for WSL with tmux-backed sessions, Codex session b
   - Browser stream via proxied WS (`/ws/remote`) over the same tailnet access boundary
   - View-only by default, with explicit control enable toggle
   - Touch controls for iOS (tap/long-press/drag/two-finger wheel)
-  - Native iOS stream presets, remote cursor relay, live gateway stats, and desktop shortcut actions
+- Native iOS console, Codex Threads, metrics dashboard, stream presets, remote cursor relay, live gateway stats, and desktop shortcut actions
 - Idle session cleanup + max session guardrails
 - Graceful shutdown persistence:
-  - Server shutdown detaches web clients but keeps tmux sessions alive
+  - Server shutdown detaches web clients; WSL tmux sessions survive while direct PTY sessions are recreated from saved metadata
   - Active sessions are saved and restored on next server start
 - Structured server modules (`src/config`, `src/http`, `src/sessions`, `src/ws`, `src/codex`)
 - iOS touch scroll stability update in the frontend (no private xterm monkey-patching)
@@ -50,10 +51,10 @@ A Tailscale-first web console for WSL with tmux-backed sessions, Codex session b
 ![Calendar and metrics on desktop](docs/screenshots/image-7.jpg)
 
 ## Requirements
-- Windows with WSL installed and a default distro configured
+- Windows with PowerShell available; WSL is optional but required for WSL terminal sessions
 - Node.js 18+
 - Tailscale installed, signed in, and running on the host
-- `tmux` installed inside the runtime environment (usually your WSL distro)
+- `tmux` installed inside WSL when you use WSL terminal sessions
 
 ## Run
 From the project root on the host where the `tailscale` CLI is available:
@@ -86,7 +87,9 @@ Tailscale is required. Startup fails if `tailscale status --json` cannot prove t
 HTTP and WebSocket requests are accepted only when they arrive through Tailscale Serve identity headers or from Tailscale source ranges (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`). Local browser requests to `localhost` are blocked.
 
 ## Native iOS App
-The SwiftUI iPhone app lives in `ios/OnlineCLI.xcodeproj`. It keeps the existing terminal intact by wrapping the Tailscale-served console in a native `WKWebView`, and it adds a native remote desktop tab that talks directly to `/ws/remote` over the same tailnet URL.
+The SwiftUI iPhone app lives in `ios/OnlineCLI.xcodeproj`. The Console tab is native SwiftUI/UIKit and talks directly to `/ws?sessionId=...`; it no longer embeds the browser console. It supports PowerShell and WSL terminal creation, hardware/software keyboard input, resize messages, scrollback, paste/copy, and terminal control keys.
+
+The old Sessions tab is now Threads. Terminal sessions are managed from Console; Codex threads are indexed and resumed from Threads or Metrics.
 
 Run `npm start` first, keep Tailscale connected on the iPhone, then open the Xcode project and build the `OnlineCLI` scheme. The app defaults to the printed tailnet URL and can be changed in Settings.
 
@@ -132,9 +135,9 @@ npm start
 
 ## Multi-Session Mirror Workflow (Web + Local)
 - Keep `SINGLE_CONSOLE_MODE=false` (default).
-- Use `New` to create separate sessions (for example Session A/B/C).
-- In each desktop terminal, run the selected session's `Copy Attach Cmd`.
-- On iPhone, choose the matching session in the picker to mirror that same console.
+- Use `New PowerShell` or `New WSL` to create separate terminal sessions.
+- For WSL tmux sessions, run the selected session's `Copy Attach Cmd` in a desktop terminal when you want a local mirror. Direct PowerShell sessions are managed through the app/web socket.
+- On iPhone, choose the matching terminal in the Console controller to mirror that same console.
 
 ## Private Remote Access Over Tailscale
 - Setup guide: `docs/tailscale-setup.md`
@@ -155,9 +158,10 @@ npm install
 ## API
 - `GET /api/health`
 - `GET /api/sessions`
-  - Response includes `singleConsoleMode`; each session snapshot includes `localAttachCommand`
+  - Response includes `singleConsoleMode`, `defaultTerminalProfile`, and `terminalProfiles`; each terminal snapshot includes `terminalProfile`, `backend`, and WSL-only `localAttachCommand`
 - `GET /api/sessions/:sessionId`
 - `POST /api/sessions`
+  - Optional body: `{ "terminalProfile": "powershell" | "wsl" }`
 - `POST /api/sessions/:sessionId/restart`
 - `DELETE /api/sessions/:sessionId`
 - `POST /api/sessions/:sessionId/command`
@@ -187,7 +191,12 @@ npm install
 - `SESSION_SWEEP_INTERVAL_MS` (default: `60000`)
 - `DEFAULT_COLS` (default: `120`)
 - `DEFAULT_ROWS` (default: `30`)
-- `PTY_COMMAND` (default on Windows: `wsl.exe`)
+- `DEFAULT_TERMINAL_PROFILE` (`powershell|wsl|system`; default on Windows: `powershell`)
+- `POWERSHELL_COMMAND` (default on Windows: `powershell.exe`, elsewhere: `pwsh`)
+- `POWERSHELL_ARGS` (default: `-NoLogo`)
+- `WSL_COMMAND` (default: `wsl.exe`)
+- `WSL_ARGS` (optional args before `-e tmux`)
+- `PTY_COMMAND` (fallback system shell override)
 - `PTY_ARGS` (space-delimited args)
 - `PTY_CWD` (working directory for new sessions)
 - `TMUX_COMMAND` (default: `tmux`)
@@ -210,7 +219,7 @@ npm install
 - `src/config.js`: runtime config parsing
 - `src/network/tailscaleAccess.js`: loopback/Tailscale source and same-origin access checks
 - `src/http/remoteRoutes.js`: remote status/capability endpoints
-- `src/sessions/`: tmux-backed session runtime and manager
+- `src/sessions/`: direct PTY + WSL tmux terminal runtime and manager
 - `src/codex/codexSessionIndex.js`: parses local Codex JSONL sessions and metrics
 - `src/ws/sessionGateway.js`: WebSocket routing and heartbeats
 - `src/ws/remoteGateway.js`: tailnet-gated remote stream/control websocket proxy

@@ -3,6 +3,20 @@ const fs = require('fs');
 const path = require('path');
 const { TerminalSession } = require('./terminalSession');
 
+function normalizeTerminalProfile(value, fallback = 'powershell') {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (['powershell', 'pwsh', 'ps'].includes(normalized)) {
+    return 'powershell';
+  }
+  if (['wsl', 'linux'].includes(normalized)) {
+    return 'wsl';
+  }
+  if (['system', 'shell', 'default'].includes(normalized)) {
+    return 'system';
+  }
+  return fallback;
+}
+
 class SessionManager {
   constructor(options) {
     this.logger = options.logger;
@@ -11,6 +25,11 @@ class SessionManager {
     this.defaultRows = options.defaultRows;
     this.defaultShell = options.defaultShell;
     this.defaultShellArgs = options.defaultShellArgs;
+    this.defaultTerminalProfile = normalizeTerminalProfile(options.defaultTerminalProfile, 'powershell');
+    this.powerShellCommand = options.powerShellCommand || (process.platform === 'win32' ? 'powershell.exe' : 'pwsh');
+    this.powerShellArgs = Array.isArray(options.powerShellArgs) ? options.powerShellArgs : ['-NoLogo'];
+    this.wslCommand = options.wslCommand || 'wsl.exe';
+    this.wslArgs = Array.isArray(options.wslArgs) ? options.wslArgs : [];
     this.defaultCwd = options.defaultCwd;
     this.sessionIdleTimeoutMs = options.sessionIdleTimeoutMs;
     this.sessionSweepIntervalMs = options.sessionSweepIntervalMs;
@@ -68,6 +87,60 @@ class SessionManager {
     return `Session ${this.sessions.size + 1}`;
   }
 
+  _resolveSessionRuntime(options = {}) {
+    const requestedProfile = options.terminalProfile || options.shellType || options.kind;
+    let inferredProfile = this.defaultTerminalProfile;
+    if (!requestedProfile && typeof options.shell === 'string') {
+      const shell = options.shell.toLowerCase();
+      if (shell.includes('wsl')) {
+        inferredProfile = 'wsl';
+      } else if (shell.includes('powershell') || shell.includes('pwsh')) {
+        inferredProfile = 'powershell';
+      }
+    }
+    const terminalProfile = normalizeTerminalProfile(
+      requestedProfile,
+      inferredProfile
+    );
+
+    if (terminalProfile === 'powershell') {
+      return {
+        terminalProfile,
+        backend: 'direct',
+        shell: options.shell || this.powerShellCommand,
+        shellArgs: Array.isArray(options.shellArgs) ? options.shellArgs : this.powerShellArgs,
+        tmuxCommand: this.tmuxCommand,
+        tmuxArgs: this.tmuxArgs
+      };
+    }
+
+    if (terminalProfile === 'wsl') {
+      const tmuxCommand = process.platform === 'win32' ? this.wslCommand : this.tmuxCommand;
+      let tmuxArgs = process.platform === 'win32' ? this.wslArgs.slice() : this.tmuxArgs.slice();
+      const hasTmux = tmuxArgs.some((arg) => String(arg).toLowerCase() === 'tmux');
+      if (process.platform === 'win32' && !hasTmux) {
+        tmuxArgs = [...tmuxArgs, '-e', 'tmux'];
+      }
+      return {
+        terminalProfile,
+        backend: 'tmux',
+        shell: options.shell || this.wslCommand,
+        shellArgs: Array.isArray(options.shellArgs) ? options.shellArgs : this.wslArgs,
+        tmuxCommand,
+        tmuxArgs
+      };
+    }
+
+    return {
+      terminalProfile,
+      backend: 'direct',
+      shell: options.shell || this.defaultShell,
+      shellArgs: Array.isArray(options.shellArgs) ? options.shellArgs : this.defaultShellArgs,
+      tmuxCommand: this.tmuxCommand,
+      tmuxArgs: this.tmuxArgs
+    };
+  }
+
   createSession(options = {}) {
     const bypassSingleConsole = options.allowSingleConsoleBypass === true;
     if (this.singleConsoleMode && this.sessions.size >= 1 && !bypassSingleConsole) {
@@ -90,11 +163,15 @@ class SessionManager {
       throw error;
     }
 
+    const runtime = this._resolveSessionRuntime(options);
+
     const session = new TerminalSession({
       id,
       name: options.name || this._nextName(),
-      shell: options.shell || this.defaultShell,
-      shellArgs: Array.isArray(options.shellArgs) ? options.shellArgs : this.defaultShellArgs,
+      terminalProfile: runtime.terminalProfile,
+      backend: runtime.backend,
+      shell: runtime.shell,
+      shellArgs: runtime.shellArgs,
       cwd: options.cwd || this.defaultCwd,
       env: process.env,
       defaultCols: options.defaultCols || this.defaultCols,
@@ -103,8 +180,8 @@ class SessionManager {
       rows: options.rows,
       createdAt: options.createdAt,
       lastActivityAt: options.lastActivityAt,
-      tmuxCommand: this.tmuxCommand,
-      tmuxArgs: this.tmuxArgs,
+      tmuxCommand: runtime.tmuxCommand,
+      tmuxArgs: runtime.tmuxArgs,
       tmuxHistoryLimit: this.tmuxHistoryLimit,
       tmuxMouseMode: this.tmuxMouseMode,
       tmuxSessionName: options.tmuxSessionName,
@@ -262,6 +339,8 @@ class SessionManager {
     const sessions = Array.from(this.sessions.values()).map((session) => ({
       id: session.id,
       name: session.name,
+      terminalProfile: session.terminalProfile,
+      backend: session.backend,
       shell: session.shell,
       shellArgs: Array.isArray(session.shellArgs) ? session.shellArgs : [],
       cwd: session.cwd,
@@ -361,6 +440,10 @@ class SessionManager {
         const session = this.createSession({
           id,
           name: typeof candidate.name === 'string' && candidate.name.trim() ? candidate.name : undefined,
+          terminalProfile: typeof candidate.terminalProfile === 'string' && candidate.terminalProfile.trim()
+            ? candidate.terminalProfile
+            : candidate.shellType,
+          backend: typeof candidate.backend === 'string' && candidate.backend.trim() ? candidate.backend : undefined,
           shell: typeof candidate.shell === 'string' && candidate.shell.trim() ? candidate.shell : undefined,
           shellArgs: Array.isArray(candidate.shellArgs) ? candidate.shellArgs : undefined,
           cwd: typeof candidate.cwd === 'string' && candidate.cwd.trim() ? candidate.cwd : undefined,

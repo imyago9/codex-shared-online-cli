@@ -12,8 +12,8 @@ struct RootView: View {
             RemoteDesktopView()
                 .tabItem { Label("Remote", systemImage: "desktopcomputer") }
 
-            SessionsView()
-                .tabItem { Label("Sessions", systemImage: "rectangle.stack") }
+            ThreadsView()
+                .tabItem { Label("Threads", systemImage: "bubble.left.and.text.bubble.right") }
 
             MetricsView()
                 .tabItem { Label("Metrics", systemImage: "chart.bar.xaxis") }
@@ -29,14 +29,33 @@ struct RootView: View {
 
 struct ConsoleTabView: View {
     @Environment(AppModel.self) private var app
-    @State private var reloadToken = 0
+    @State private var client = NativeTerminalClient()
+    @State private var selectedProfile: TerminalProfile = .powershell
+    @State private var fullScreen = false
 
     var body: some View {
         NavigationStack {
             Group {
-                if let url = app.settings.normalizedBaseURL {
-                    ConsoleWebView(url: url, reloadToken: reloadToken)
-                        .ignoresSafeArea(.keyboard, edges: .bottom)
+                if app.settings.normalizedBaseURL != nil {
+                    VStack(spacing: 0) {
+                        if !fullScreen {
+                            TerminalSessionController(
+                                selectedProfile: $selectedProfile,
+                                onReconnect: connectActiveTerminal
+                            )
+                        }
+
+                        if app.activeTerminalSession != nil {
+                            NativeTerminalView(client: client)
+                                .ignoresSafeArea(.keyboard, edges: .bottom)
+                        } else {
+                            ContentUnavailableView(
+                                "Create a terminal",
+                                systemImage: "terminal",
+                                description: Text("No active terminal is selected.")
+                            )
+                        }
+                    }
                 } else {
                     ContentUnavailableView("Set a tailnet URL", systemImage: "network.slash")
                 }
@@ -49,14 +68,151 @@ struct ConsoleTabView: View {
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
-                        reloadToken += 1
+                        fullScreen.toggle()
                     } label: {
-                        Image(systemName: "arrow.clockwise")
+                        Image(systemName: fullScreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
                     }
-                    .accessibilityLabel("Reload terminal")
+                    .accessibilityLabel(fullScreen ? "Exit terminal fullscreen" : "Enter terminal fullscreen")
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        if client.connectionState.isConnected {
+                            client.disconnect()
+                        } else {
+                            connectActiveTerminal()
+                        }
+                    } label: {
+                        Image(systemName: client.connectionState.isConnected ? "stop.fill" : "play.fill")
+                    }
+                    .accessibilityLabel(client.connectionState.isConnected ? "Disconnect terminal" : "Connect terminal")
                 }
             }
+            .task {
+                selectedProfile = app.settings.defaultTerminalProfile
+                await app.refreshSessions()
+                connectActiveTerminal()
+            }
+            .onChange(of: app.activeTerminalSessionId) { _, _ in
+                connectActiveTerminal()
+            }
+            .onChange(of: app.settings.baseURLString) { _, _ in
+                Task { await app.refreshSessions() }
+                connectActiveTerminal()
+            }
         }
+    }
+
+    private func connectActiveTerminal() {
+        guard let url = app.settings.normalizedBaseURL, let session = app.activeTerminalSession else {
+            client.disconnect()
+            return
+        }
+        client.connect(baseURL: url, session: session)
+    }
+}
+
+struct TerminalSessionController: View {
+    @Environment(AppModel.self) private var app
+    @Binding var selectedProfile: TerminalProfile
+    let onReconnect: () -> Void
+
+    var body: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 10) {
+                Menu {
+                    ForEach(app.sessions) { session in
+                        Button {
+                            app.selectTerminalSession(session.id)
+                            onReconnect()
+                        } label: {
+                            Label(session.displayName, systemImage: session.effectiveProfile.systemImage)
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: app.activeTerminalSession?.effectiveProfile.systemImage ?? "terminal")
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(app.activeTerminalSession?.displayName ?? "No terminal")
+                                .font(.subheadline.weight(.semibold))
+                            Text(activeTerminalDetail)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Image(systemName: "chevron.up.chevron.down")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .nativeGlass(cornerRadius: 8, interactive: true)
+                }
+
+                Picker("Terminal profile", selection: $selectedProfile) {
+                    ForEach(app.availableTerminalProfiles) { profile in
+                        Label(profile.title, systemImage: profile.systemImage).tag(profile)
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(maxWidth: 150)
+            }
+
+            HStack(spacing: 8) {
+                Button {
+                    Task {
+                        await app.createSession(profile: selectedProfile)
+                        onReconnect()
+                    }
+                } label: {
+                    Label("New \(selectedProfile.title)", systemImage: "plus")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(app.api == nil)
+
+                Button {
+                    guard let session = app.activeTerminalSession else { return }
+                    Task {
+                        await app.restartSession(session)
+                        onReconnect()
+                    }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.bordered)
+                .accessibilityLabel("Restart terminal")
+                .disabled(app.activeTerminalSession == nil)
+
+                Button(role: .destructive) {
+                    guard let session = app.activeTerminalSession else { return }
+                    Task {
+                        await app.deleteSession(session)
+                        onReconnect()
+                    }
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.bordered)
+                .accessibilityLabel("End terminal")
+                .disabled(app.sessions.count <= 1)
+
+                Spacer()
+
+                Text("\(app.sessions.count) terminals")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(.bar)
+    }
+
+    private var activeTerminalDetail: String {
+        guard let session = app.activeTerminalSession else {
+            return "PowerShell default"
+        }
+        let cwd = session.cwd ?? "home"
+        return "\(session.profileLabel) • \(session.backendLabel) • \(cwd)"
     }
 }
 
@@ -68,6 +224,7 @@ struct RemoteDesktopView: View {
     @State private var zoom = 1.0
     @State private var panOffset = CGSize.zero
     @State private var panMode = false
+    @State private var joystickSensitivity = 1.0
     @State private var keyboardText = ""
     @FocusState private var keyboardFocused: Bool
 
@@ -120,6 +277,7 @@ struct RemoteDesktopView: View {
                         client: client,
                         zoom: $zoom,
                         panOffset: $panOffset,
+                        joystickSensitivity: $joystickSensitivity,
                         diagnosticsText: diagnosticsText,
                         actions: app.remoteCapabilities?.actions ?? [],
                         keyboardFocused: $keyboardFocused
@@ -382,6 +540,7 @@ struct RemoteControlDeck: View {
     let client: RemoteDesktopClient
     @Binding var zoom: Double
     @Binding var panOffset: CGSize
+    @Binding var joystickSensitivity: Double
     let diagnosticsText: String
     let actions: [RemoteActionDescriptor]
     var keyboardFocused: FocusState<Bool>.Binding
@@ -418,19 +577,22 @@ struct RemoteControlDeck: View {
 
             HStack(alignment: .center, spacing: 14) {
                 RemoteJoystick { dx, dy in
-                    client.nudgePointer(dx: dx, dy: dy)
+                    client.nudgePointer(dx: dx * joystickSensitivity, dy: dy * joystickSensitivity)
                 }
 
                 VStack(spacing: 8) {
                     HStack(spacing: 8) {
                         Button("Left") { client.sendClick(button: "left") }
                         Button("Right") { client.sendClick(button: "right") }
+                        Button("Double") { client.sendDoubleClick() }
                     }
                     .buttonStyle(.borderedProminent)
 
                     HStack(spacing: 8) {
                         RemoteIconButton("arrow.up") { client.sendKey("ArrowUp", code: "ArrowUp") }
                         RemoteIconButton("arrow.down") { client.sendKey("ArrowDown", code: "ArrowDown") }
+                        RemoteIconButton("arrow.left") { client.sendKey("ArrowLeft", code: "ArrowLeft") }
+                        RemoteIconButton("arrow.right") { client.sendKey("ArrowRight", code: "ArrowRight") }
                         RemoteIconButton("arrow.up.arrow.down") { client.sendWheel(deltaY: -360) }
                         RemoteIconButton("arrow.down.arrow.up") { client.sendWheel(deltaY: 360) }
                     }
@@ -438,10 +600,21 @@ struct RemoteControlDeck: View {
                     HStack(spacing: 8) {
                         Button("Tab") { client.sendKey("Tab", code: "Tab") }
                         Button("Enter") { client.sendKey("Enter", code: "Enter") }
+                        Button("Bksp") { client.sendKey("Backspace", code: "Backspace") }
                         Button("Space") { client.sendKey(" ", code: "Space") }
                     }
                     .buttonStyle(.bordered)
                     .font(.caption.weight(.semibold))
+
+                    HStack(spacing: 8) {
+                        Image(systemName: "speedometer")
+                            .foregroundStyle(.secondary)
+                        Slider(value: $joystickSensitivity, in: 0.45...1.8)
+                        Text("\(Int(joystickSensitivity * 100))%")
+                            .font(.caption2.monospacedDigit().weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 42, alignment: .trailing)
+                    }
                 }
             }
         }
@@ -559,133 +732,247 @@ struct RemoteIconButton: View {
     }
 }
 
-struct SessionsView: View {
+struct ThreadsView: View {
     @Environment(AppModel.self) private var app
-    @State private var command = ""
+    @State private var search = ""
+    @State private var statusFilter: ThreadStatusFilter = .all
 
     var body: some View {
         NavigationStack {
-            List {
-                Section {
-                    ForEach(app.sessions) { session in
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack {
-                                VStack(alignment: .leading) {
-                                    Text(session.displayName)
-                                        .font(.headline)
-                                    Text(session.cwd ?? "No working directory")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
-                                }
-                                Spacer()
-                                if session.id == app.defaultSessionId {
-                                    Text("Default")
-                                        .font(.caption2.weight(.bold))
-                                        .padding(.horizontal, 8)
-                                        .padding(.vertical, 4)
-                                        .nativeGlass(cornerRadius: 10)
-                                }
-                            }
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 14) {
+                    ThreadSummaryStrip(summary: app.codexSummary, threads: app.codexSessions)
 
-                            HStack {
-                                Button("Restart") { Task { await app.restartSession(session) } }
-                                Button("Delete", role: .destructive) { Task { await app.deleteSession(session) } }
+                    VStack(spacing: 10) {
+                        TextField("Search threads, cwd, model", text: $search)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .textFieldStyle(.roundedBorder)
+
+                        Picker("Resume status", selection: $statusFilter) {
+                            ForEach(ThreadStatusFilter.allCases) { filter in
+                                Text(filter.title).tag(filter)
                             }
-                            .buttonStyle(.bordered)
                         }
-                        .padding(.vertical, 4)
+                        .pickerStyle(.segmented)
                     }
-                }
 
-                Section("Send Command") {
-                    Picker("Session", selection: .constant(app.defaultSessionId ?? "")) {
-                        ForEach(app.sessions) { session in
-                            Text(session.displayName).tag(session.id)
+                    if filteredThreads.isEmpty {
+                        ContentUnavailableView(
+                            "No threads found",
+                            systemImage: "bubble.left.and.text.bubble.right",
+                            description: Text("The current filters have no matching Codex threads.")
+                        )
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 40)
+                    } else {
+                        ForEach(filteredThreads) { thread in
+                            CodexThreadCard(thread: thread)
                         }
                     }
-                    TextField("Command", text: $command)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    Button("Send to Default Session") {
-                        guard let session = app.sessions.first(where: { $0.id == app.defaultSessionId }) else { return }
-                        let value = command
-                        command = ""
-                        Task { await app.sendCommand(value, to: session) }
-                    }
-                    .disabled(command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
+                .padding(16)
             }
-            .navigationTitle("Sessions")
+            .navigationTitle("Threads")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button {
-                        Task { await app.createSession() }
-                    } label: {
-                        Label("New", systemImage: "plus")
-                    }
+                    ConnectionBadge(text: app.connectionMessage)
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
-                        Task { await app.refreshSessions() }
+                        Task { await app.refreshCodexSessions() }
                     } label: {
                         Image(systemName: "arrow.clockwise")
                     }
+                    .accessibilityLabel("Refresh Codex threads")
                 }
             }
+            .task {
+                await app.refreshCodexSessions()
+                await app.refreshSessions()
+            }
+        }
+    }
+
+    private var filteredThreads: [CodexSessionSummary] {
+        let query = search.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return app.codexSessions.filter { thread in
+            statusFilter.includes(thread)
+            && (query.isEmpty || thread.searchText.contains(query))
+        }
+    }
+}
+
+struct ThreadSummaryStrip: View {
+    let summary: CodexSummary?
+    let threads: [CodexSessionSummary]
+
+    var body: some View {
+        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+            MetricTile(title: "Threads", value: "\(summary?.sessionCount ?? summary?.totalSessions ?? threads.count)", systemImage: "bubble.left.and.text.bubble.right")
+            MetricTile(title: "Tokens", value: (summary?.totalTokens ?? threadTokens).formatted(.number.notation(.compactName)), systemImage: "number")
+            MetricTile(title: "Tool Calls", value: (summary?.totalToolCalls ?? threadTools).formatted(.number.notation(.compactName)), systemImage: "wrench.and.screwdriver")
+            MetricTile(title: "Resumable", value: "\(summary?.resumableSessionCount ?? threads.filter(\.isThreadResumable).count)", systemImage: "arrow.uturn.backward")
+        }
+    }
+
+    private var threadTokens: Int {
+        threads.reduce(0) { $0 + $1.tokenCount }
+    }
+
+    private var threadTools: Int {
+        threads.reduce(0) { $0 + $1.toolCallCount }
+    }
+}
+
+struct CodexThreadCard: View {
+    @Environment(AppModel.self) private var app
+    let thread: CodexSessionSummary
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: thread.isThreadResumable ? "checkmark.circle.fill" : "exclamationmark.circle")
+                    .foregroundStyle(thread.isThreadResumable ? .green : .orange)
+                    .font(.title3)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(thread.title)
+                        .font(.headline)
+                    Text(thread.id)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer()
+            }
+
+            HStack(spacing: 6) {
+                Chip(text: thread.resumeLabel)
+                Chip(text: thread.metricsQualityLabel)
+                Chip(text: "\(thread.tokenCount.formatted(.number.notation(.compactName))) tokens")
+                Chip(text: "\(thread.toolCallCount.formatted(.number.notation(.compactName))) tools")
+            }
+
+            Text(thread.metadataLine)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(3)
+
+            HStack {
+                Button {
+                    Task {
+                        await app.resumeCodexSession(thread, into: app.fallbackTerminalSessionId)
+                    }
+                } label: {
+                    Label("Resume in Terminal", systemImage: "arrow.uturn.backward")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!thread.isThreadResumable || app.fallbackTerminalSessionId == nil)
+
+                Button {
+                    UIPasteboard.general.string = thread.resumeCommand ?? "codex resume \(thread.id)"
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                }
+                .buttonStyle(.bordered)
+                .accessibilityLabel("Copy resume command")
+                .disabled(!thread.isThreadResumable)
+            }
+        }
+        .padding(14)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+enum ThreadStatusFilter: String, CaseIterable, Identifiable {
+    case all
+    case resumable
+    case blocked
+    case unknown
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .all:
+            return "All"
+        case .resumable:
+            return "Resumable"
+        case .blocked:
+            return "Blocked"
+        case .unknown:
+            return "Unknown"
+        }
+    }
+
+    func includes(_ thread: CodexSessionSummary) -> Bool {
+        switch self {
+        case .all:
+            return true
+        case .resumable:
+            return thread.resumeStatusValue == .resumable
+        case .blocked:
+            return thread.resumeStatusValue == .blocked
+        case .unknown:
+            return thread.resumeStatusValue == .unknown
         }
     }
 }
 
 struct MetricsView: View {
     @Environment(AppModel.self) private var app
-
-    var totalTokens: Int {
-        app.codexSessions.reduce(0) { partial, session in
-            partial + (session.metrics?.totalTokenUsage?.totalTokens ?? 0)
-        }
-    }
-
-    var totalTools: Int {
-        app.codexSessions.reduce(0) { partial, session in
-            partial + (session.metrics?.toolCalls ?? 0)
-        }
-    }
+    @State private var search = ""
+    @State private var statusFilter: ThreadStatusFilter = .all
+    @State private var modelFilter = ""
+    @State private var cwdFilter = ""
+    @State private var month = Date()
+    @State private var selectedDay: String?
 
     var body: some View {
         NavigationStack {
-            List {
-                Section {
-                    MetricRow(title: "Codex Sessions", value: "\(app.codexSessions.count)", systemImage: "rectangle.stack")
-                    MetricRow(title: "Tokens", value: totalTokens.formatted(), systemImage: "number")
-                    MetricRow(title: "Tool Calls", value: totalTools.formatted(), systemImage: "wrench.and.screwdriver")
-                }
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 16) {
+                    MetricsFilterPanel(
+                        search: $search,
+                        statusFilter: $statusFilter,
+                        modelFilter: $modelFilter,
+                        cwdFilter: $cwdFilter,
+                        month: $month,
+                        models: modelOptions,
+                        cwds: cwdOptions,
+                        onClear: clearFilters
+                    )
 
-                Section("Recent Codex Sessions") {
-                    ForEach(app.codexSessions) { session in
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text(session.title)
+                    MetricsSummaryGrid(threads: filteredThreads)
+
+                    MetricsCalendarView(
+                        month: month,
+                        threads: filteredBeforeSelectedDay,
+                        selectedDay: $selectedDay
+                    )
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Label("Filtered Threads", systemImage: "line.3.horizontal.decrease.circle")
                                 .font(.headline)
-                            Text(session.model ?? "Unknown model")
-                                .font(.caption)
+                            Spacer()
+                            Text("\(filteredThreads.count) results")
+                                .font(.caption.weight(.semibold))
                                 .foregroundStyle(.secondary)
-                            HStack {
-                                Text(session.resumeStatus ?? (session.isResumable == true ? "resumable" : "unknown"))
-                                Spacer()
-                                Button("Resume") {
-                                    Task {
-                                        await app.resumeCodexSession(session, into: app.defaultSessionId)
-                                    }
-                                }
-                                .disabled(session.isResumable == false)
-                            }
-                            .font(.caption)
                         }
-                        .padding(.vertical, 4)
+
+                        ForEach(filteredThreads.prefix(160)) { thread in
+                            MetricsThreadRow(thread: thread)
+                        }
                     }
                 }
+                .padding(16)
             }
             .navigationTitle("Metrics")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
@@ -695,7 +982,320 @@ struct MetricsView: View {
                     }
                 }
             }
+            .task {
+                await app.refreshCodexSessions()
+                if let newest = app.codexSessions.compactMap(\.metricDate).max() {
+                    month = newest
+                }
+            }
         }
+    }
+
+    private var filteredBeforeSelectedDay: [CodexSessionSummary] {
+        filteredThreads(includeSelectedDay: false)
+    }
+
+    private var filteredThreads: [CodexSessionSummary] {
+        filteredThreads(includeSelectedDay: true)
+    }
+
+    private func filteredThreads(includeSelectedDay: Bool) -> [CodexSessionSummary] {
+        let query = search.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return app.codexSessions.filter { thread in
+            guard statusFilter.includes(thread) else { return false }
+            if !modelFilter.isEmpty && thread.model != modelFilter { return false }
+            if !cwdFilter.isEmpty && thread.cwd != cwdFilter { return false }
+            if includeSelectedDay, let selectedDay, thread.metricDayKey != selectedDay { return false }
+            if !query.isEmpty && !thread.searchText.contains(query) { return false }
+            return true
+        }
+    }
+
+    private var modelOptions: [String] {
+        uniqueSorted(app.codexSessions.compactMap(\.model))
+    }
+
+    private var cwdOptions: [String] {
+        uniqueSorted(app.codexSessions.compactMap(\.cwd))
+    }
+
+    private func uniqueSorted(_ values: [String]) -> [String] {
+        Array(Set(values.filter { !$0.isEmpty })).sorted()
+    }
+
+    private func clearFilters() {
+        search = ""
+        statusFilter = .all
+        modelFilter = ""
+        cwdFilter = ""
+        selectedDay = nil
+    }
+}
+
+struct MetricsFilterPanel: View {
+    @Binding var search: String
+    @Binding var statusFilter: ThreadStatusFilter
+    @Binding var modelFilter: String
+    @Binding var cwdFilter: String
+    @Binding var month: Date
+    let models: [String]
+    let cwds: [String]
+    let onClear: () -> Void
+
+    var body: some View {
+        VStack(spacing: 12) {
+            TextField("Search id, cwd, model, store", text: $search)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .textFieldStyle(.roundedBorder)
+
+            Picker("Status", selection: $statusFilter) {
+                ForEach(ThreadStatusFilter.allCases) { filter in
+                    Text(filter.title).tag(filter)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            HStack(spacing: 10) {
+                Menu {
+                    Button("All models") { modelFilter = "" }
+                    ForEach(models, id: \.self) { model in
+                        Button(model) { modelFilter = model }
+                    }
+                } label: {
+                    Label(modelFilter.isEmpty ? "All Models" : modelFilter, systemImage: "cpu")
+                        .lineLimit(1)
+                }
+                .buttonStyle(.bordered)
+
+                Menu {
+                    Button("All directories") { cwdFilter = "" }
+                    ForEach(cwds, id: \.self) { cwd in
+                        Button(cwd) { cwdFilter = cwd }
+                    }
+                } label: {
+                    Label(cwdFilter.isEmpty ? "All CWDs" : URL(fileURLWithPath: cwdFilter).lastPathComponent, systemImage: "folder")
+                        .lineLimit(1)
+                }
+                .buttonStyle(.bordered)
+            }
+
+            HStack {
+                DatePicker("Calendar", selection: $month, displayedComponents: .date)
+                    .datePickerStyle(.compact)
+                Spacer()
+                Button("Clear", action: onClear)
+                    .buttonStyle(.bordered)
+            }
+        }
+        .padding(14)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+struct MetricsSummaryGrid: View {
+    let threads: [CodexSessionSummary]
+
+    var body: some View {
+        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+            MetricTile(title: "Threads", value: "\(threads.count)", systemImage: "rectangle.stack")
+            MetricTile(title: "Tokens", value: totalTokens.formatted(.number.notation(.compactName)), systemImage: "number")
+            MetricTile(title: "Tool Calls", value: totalTools.formatted(.number.notation(.compactName)), systemImage: "wrench.and.screwdriver")
+            MetricTile(title: "Avg Active", value: formatDuration(averageActiveMs), systemImage: "timer")
+        }
+    }
+
+    private var totalTokens: Int {
+        threads.reduce(0) { $0 + $1.tokenCount }
+    }
+
+    private var totalTools: Int {
+        threads.reduce(0) { $0 + $1.toolCallCount }
+    }
+
+    private var averageActiveMs: Int {
+        guard !threads.isEmpty else { return 0 }
+        return threads.reduce(0) { $0 + $1.activeMs } / threads.count
+    }
+}
+
+struct MetricsCalendarView: View {
+    let month: Date
+    let threads: [CodexSessionSummary]
+    @Binding var selectedDay: String?
+
+    private let columns = Array(repeating: GridItem(.flexible(), spacing: 6), count: 7)
+    private let calendar = Calendar.current
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label(monthTitle, systemImage: "calendar")
+                    .font(.headline)
+                Spacer()
+                Text(selectedDay ?? "Tap a day")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+
+            LazyVGrid(columns: columns, spacing: 6) {
+                ForEach(calendar.shortWeekdaySymbols, id: \.self) { weekday in
+                    Text(weekday)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity)
+                }
+
+                ForEach(leadingBlankDays, id: \.self) { index in
+                    Color.clear
+                        .frame(height: 46)
+                        .accessibilityHidden(true)
+                        .id("blank-\(index)")
+                }
+
+                ForEach(days, id: \.self) { day in
+                    let key = dayKey(day)
+                    let stats = dayStats[key] ?? DayStats()
+                    Button {
+                        guard stats.count > 0 else { return }
+                        selectedDay = selectedDay == key ? nil : key
+                    } label: {
+                        VStack(spacing: 3) {
+                            Text("\(day)")
+                                .font(.caption.weight(.bold))
+                            Text(stats.count > 0 ? "\(stats.count)" : "")
+                                .font(.caption2.monospacedDigit())
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 46)
+                        .background(dayBackground(stats: stats, key: key), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(stats.count == 0)
+                }
+            }
+        }
+        .padding(14)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private var monthTitle: String {
+        month.formatted(.dateTime.month(.wide).year())
+    }
+
+    private var monthStart: Date {
+        let components = calendar.dateComponents([.year, .month], from: month)
+        return calendar.date(from: components) ?? month
+    }
+
+    private var days: [Int] {
+        let range = calendar.range(of: .day, in: .month, for: monthStart) ?? 1..<1
+        return Array(range)
+    }
+
+    private var leadingBlankDays: [Int] {
+        let weekday = calendar.component(.weekday, from: monthStart)
+        return Array(0..<max(0, weekday - 1))
+    }
+
+    private var dayStats: [String: DayStats] {
+        threads.reduce(into: [:]) { partial, thread in
+            guard let key = thread.metricDayKey, key.hasPrefix(monthStart.monthKey) else { return }
+            var stats = partial[key] ?? DayStats()
+            stats.count += 1
+            stats.tokens += thread.tokenCount
+            partial[key] = stats
+        }
+    }
+
+    private var maxCount: Int {
+        dayStats.values.map(\.count).max() ?? 0
+    }
+
+    private func dayKey(_ day: Int) -> String {
+        "\(monthStart.monthKey)-\(String(format: "%02d", day))"
+    }
+
+    private func dayBackground(stats: DayStats, key: String) -> Color {
+        guard stats.count > 0, maxCount > 0 else {
+            return Color.secondary.opacity(0.08)
+        }
+        let intensity = Double(stats.count) / Double(maxCount)
+        if selectedDay == key {
+            return Color.green.opacity(0.55)
+        }
+        return Color.orange.opacity(0.18 + (intensity * 0.48))
+    }
+}
+
+struct MetricsThreadRow: View {
+    let thread: CodexSessionSummary
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(thread.id)
+                    .font(.caption.monospaced().weight(.semibold))
+                    .lineLimit(1)
+                Spacer()
+                Text(thread.metricDayKey ?? "unknown")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 6) {
+                Chip(text: thread.resumeLabel)
+                Chip(text: "\(thread.tokenCount.formatted(.number.notation(.compactName))) tok")
+                Chip(text: "\(thread.toolCallCount.formatted(.number.notation(.compactName))) tools")
+                Chip(text: formatDuration(thread.activeMs))
+            }
+
+            Text(thread.metadataLine)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+        }
+        .padding(12)
+        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+struct DayStats: Hashable {
+    var count = 0
+    var tokens = 0
+}
+
+struct MetricTile: View {
+    let title: String
+    let value: String
+    let systemImage: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label(title, systemImage: systemImage)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.title3.monospacedDigit().weight(.bold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+struct Chip: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.caption2.weight(.semibold))
+            .lineLimit(1)
+            .minimumScaleFactor(0.75)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
     }
 }
 
@@ -714,9 +1314,181 @@ struct MetricRow: View {
     }
 }
 
+enum CodexResumeStatus {
+    case resumable
+    case blocked
+    case unknown
+}
+
+extension CodexSessionSummary {
+    var isThreadResumable: Bool {
+        isResumable != false && resumeStatusValue != .blocked
+    }
+
+    var resumeStatusValue: CodexResumeStatus {
+        if resumeStatus == "unknown" {
+            return .unknown
+        }
+        if resumeStatus == "not_resumable" || isResumable == false {
+            return .blocked
+        }
+        if isResumable == true || resumeStatus == "resumable" {
+            return .resumable
+        }
+        return .unknown
+    }
+
+    var resumeLabel: String {
+        switch resumeStatusValue {
+        case .resumable:
+            return "resumable"
+        case .blocked:
+            return "blocked"
+        case .unknown:
+            return "unknown"
+        }
+    }
+
+    var metricsQualityLabel: String {
+        switch metricsQuality {
+        case "complete":
+            return "metrics complete"
+        case "partial":
+            return "metrics partial"
+        case "estimated":
+            return "metrics estimated"
+        default:
+            return metrics == nil ? "metrics estimated" : "metrics partial"
+        }
+    }
+
+    var tokenCount: Int {
+        metrics?.totalTokenUsage?.totalTokens ?? 0
+    }
+
+    var toolCallCount: Int {
+        metrics?.toolCalls ?? 0
+    }
+
+    var activeMs: Int {
+        if let activeDurationMs, activeDurationMs > 0 {
+            return activeDurationMs
+        }
+        return elapsedMs
+    }
+
+    var elapsedMs: Int {
+        if let elapsedDurationMs, elapsedDurationMs > 0 {
+            return elapsedDurationMs
+        }
+        return durationMs ?? 0
+    }
+
+    var metricDate: Date? {
+        [lastPromptAt, endedAt, startedAt]
+            .compactMap { $0 }
+            .compactMap(Self.parseDate(_:))
+            .first
+    }
+
+    var metricDayKey: String? {
+        metricDate?.dayKey
+    }
+
+    var searchText: String {
+        [
+            id,
+            cwd,
+            model,
+            cliVersion,
+            fileName,
+            storeCodexHome,
+            resumeStatus,
+            resumeReason
+        ]
+        .compactMap { $0 }
+        .joined(separator: " ")
+        .lowercased()
+    }
+
+    var metadataLine: String {
+        var parts = [
+            "cwd: \(cwd ?? "Unknown")",
+            "model: \(model ?? "Unknown")",
+            "time: \(formattedThreadTime)"
+        ]
+        if let storeCodexHome, !storeCodexHome.isEmpty {
+            parts.append("store: \(storeCodexHome)")
+        }
+        if let resumeReason, !resumeReason.isEmpty {
+            parts.append("resume: \(resumeReason)")
+        }
+        return parts.joined(separator: " | ")
+    }
+
+    private var formattedThreadTime: String {
+        guard let metricDate else { return "Unknown" }
+        return metricDate.formatted(date: .abbreviated, time: .shortened)
+    }
+
+    private static func parseDate(_ value: String) -> Date? {
+        isoFormatterWithFractions.date(from: value) ?? isoFormatter.date(from: value)
+    }
+
+    private static let isoFormatterWithFractions: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    private static let isoFormatter = ISO8601DateFormatter()
+}
+
+extension Date {
+    var dayKey: String {
+        Self.dayFormatter.string(from: self)
+    }
+
+    var monthKey: String {
+        Self.monthFormatter.string(from: self)
+    }
+
+    private static let dayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
+
+    private static let monthFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM"
+        return formatter
+    }()
+}
+
+func formatDuration(_ milliseconds: Int) -> String {
+    guard milliseconds > 0 else { return "0m" }
+    let seconds = milliseconds / 1_000
+    let hours = seconds / 3_600
+    let minutes = (seconds % 3_600) / 60
+    let remainingSeconds = seconds % 60
+    if hours > 0 {
+        return "\(hours)h \(minutes)m"
+    }
+    if minutes > 0 {
+        return "\(minutes)m \(remainingSeconds)s"
+    }
+    return "\(remainingSeconds)s"
+}
+
 struct SettingsView: View {
     @Environment(AppModel.self) private var app
     @State private var draftURL = ""
+    @State private var draftTerminalProfile: TerminalProfile = .powershell
     @State private var draftRemoteMode: RemoteMode = .view
     @State private var draftStreamProfile: RemoteStreamProfile = .balanced
     @State private var preferNativeRemote = true
@@ -736,6 +1508,17 @@ struct SettingsView: View {
                     }
 
                     LabeledContent("Status", value: app.connectionMessage)
+                }
+
+                Section("Console") {
+                    Picker("New Terminal Default", selection: $draftTerminalProfile) {
+                        ForEach(app.availableTerminalProfiles) { profile in
+                            Label(profile.title, systemImage: profile.systemImage).tag(profile)
+                        }
+                    }
+                    .onChange(of: draftTerminalProfile) { _, newValue in
+                        app.settings.defaultTerminalProfile = newValue
+                    }
                 }
 
                 Section("Remote") {
@@ -781,6 +1564,7 @@ struct SettingsView: View {
             .navigationTitle("Settings")
             .onAppear {
                 draftURL = app.settings.baseURLString
+                draftTerminalProfile = app.settings.defaultTerminalProfile
                 draftRemoteMode = app.settings.defaultRemoteMode
                 draftStreamProfile = app.settings.remoteStreamProfile
                 preferNativeRemote = app.settings.preferNativeRemote

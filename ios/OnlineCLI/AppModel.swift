@@ -13,7 +13,10 @@ final class AppModel {
     var health: HealthResponse?
     var sessions: [TerminalSessionSnapshot] = []
     var defaultSessionId: String?
+    var activeTerminalSessionId: String?
+    var availableTerminalProfiles: [TerminalProfile] = [.powershell, .wsl]
     var codexSessions: [CodexSessionSummary] = []
+    var codexSummary: CodexSummary?
     var remoteStatus: RemoteStatus?
     var remoteCapabilities: RemoteCapabilities?
     var connectionMessage = "Not checked"
@@ -49,6 +52,12 @@ final class AppModel {
 
         do {
             health = try await api.health()
+            if let defaultProfile = health?.defaultTerminalProfile {
+                settings.defaultTerminalProfile = defaultProfile
+            }
+            if let profiles = health?.terminalProfiles, !profiles.isEmpty {
+                availableTerminalProfiles = profiles
+            }
             connectionMessage = "Connected"
         } catch {
             connectionMessage = error.localizedDescription
@@ -61,16 +70,25 @@ final class AppModel {
             let response = try await api.sessions()
             sessions = response.sessions
             defaultSessionId = response.defaultSessionId
+            if let responseDefaultProfile = response.defaultTerminalProfile {
+                settings.defaultTerminalProfile = responseDefaultProfile
+            }
+            if let profiles = response.terminalProfiles, !profiles.isEmpty {
+                availableTerminalProfiles = profiles
+            }
+            reconcileActiveTerminal()
         } catch {
             connectionMessage = error.localizedDescription
         }
     }
 
-    func createSession() async {
+    func createSession(profile: TerminalProfile? = nil) async {
         guard let api else { return }
         do {
-            let response = try await api.createSession()
+            let targetProfile = profile ?? settings.defaultTerminalProfile
+            let response = try await api.createSession(terminalProfile: targetProfile)
             defaultSessionId = response.defaultSessionId
+            activeTerminalSessionId = response.session.id
             await refreshSessions()
         } catch {
             connectionMessage = error.localizedDescription
@@ -109,7 +127,9 @@ final class AppModel {
     func refreshCodexSessions() async {
         guard let api else { return }
         do {
-            codexSessions = try await api.codexSessions(limit: 80).sessions
+            let response = try await api.codexSessions(limit: 200)
+            codexSessions = response.sessions
+            codexSummary = response.summary
         } catch {
             connectionMessage = error.localizedDescription
         }
@@ -140,6 +160,26 @@ final class AppModel {
         } catch {
             remoteCapabilities = nil
         }
+    }
+
+    func selectTerminalSession(_ id: String?) {
+        activeTerminalSessionId = id
+        reconcileActiveTerminal()
+    }
+
+    var activeTerminalSession: TerminalSessionSnapshot? {
+        sessions.first { $0.id == activeTerminalSessionId }
+    }
+
+    var fallbackTerminalSessionId: String? {
+        activeTerminalSessionId ?? defaultSessionId ?? sessions.first?.id
+    }
+
+    private func reconcileActiveTerminal() {
+        if let activeTerminalSessionId, sessions.contains(where: { $0.id == activeTerminalSessionId }) {
+            return
+        }
+        activeTerminalSessionId = defaultSessionId ?? sessions.first?.id
     }
 }
 

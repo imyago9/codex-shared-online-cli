@@ -57,6 +57,11 @@ function startServer(options = {}) {
     defaultRows: config.defaultRows,
     defaultShell: config.defaultShell,
     defaultShellArgs: config.defaultShellArgs,
+    defaultTerminalProfile: config.defaultTerminalProfile,
+    powerShellCommand: config.powerShellCommand,
+    powerShellArgs: config.powerShellArgs,
+    wslCommand: config.wslCommand,
+    wslArgs: config.wslArgs,
     defaultCwd: config.defaultCwd,
     sessionIdleTimeoutMs: config.sessionIdleTimeoutMs,
     sessionSweepIntervalMs: config.sessionSweepIntervalMs,
@@ -123,9 +128,10 @@ function startServer(options = {}) {
   });
 
   server.listen(config.port, config.host, () => {
-    logger.info('WSL terminal server listening', {
+    logger.info('Terminal server listening', {
       url: `http://${config.host}:${config.port}`,
-      defaultSessionId: sessionManager.defaultSessionId
+      defaultSessionId: sessionManager.defaultSessionId,
+      defaultTerminalProfile: config.defaultTerminalProfile
     });
 
     if (typeof options.onListening === 'function') {

@@ -20,10 +20,23 @@ function quoteCommandArg(value) {
   return `'${String(value).replace(/'/g, `'\"'\"'`)}'`;
 }
 
+function normalizeTerminalProfile(value) {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (['powershell', 'pwsh', 'ps'].includes(normalized)) {
+    return 'powershell';
+  }
+  if (['wsl', 'linux'].includes(normalized)) {
+    return 'wsl';
+  }
+  return 'system';
+}
+
 class TerminalSession {
   constructor(options) {
     this.id = options.id;
     this.name = options.name;
+    this.terminalProfile = normalizeTerminalProfile(options.terminalProfile || options.shellType || options.kind);
+    this.backend = options.backend || (this.terminalProfile === 'wsl' ? 'tmux' : 'direct');
     this.shell = options.shell;
     this.shellArgs = options.shellArgs;
     this.cwd = options.cwd;
@@ -44,6 +57,11 @@ class TerminalSession {
     this.tmuxCwd = this._resolveTmuxCwd(this.cwd);
 
     this.clients = new Map();
+    this.directPty = null;
+    this.ptyGeneration = 0;
+    this.replayChunks = [];
+    this.replayBytes = 0;
+    this.maxReplayBytes = Math.max(Number.parseInt(options.maxReplayBytes, 10) || 512_000, 64_000);
     this.serverCopyModeActive = false;
     this.isTerminating = false;
     const nowIso = new Date().toISOString();
@@ -58,7 +76,11 @@ class TerminalSession {
     this.exitCode = null;
     this.status = 'starting';
 
-    this._ensureTmuxSession();
+    if (this.backend === 'direct') {
+      this._spawnPersistentPty();
+    } else {
+      this._ensureTmuxSession();
+    }
     this.status = 'running';
   }
 
@@ -121,6 +143,104 @@ class TerminalSession {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe']
     });
+  }
+
+  _spawnPersistentPty() {
+    if (this.directPty) {
+      return;
+    }
+
+    const shellArgs = Array.isArray(this.shellArgs) ? this.shellArgs : [];
+    this.ptyGeneration += 1;
+    const ptyGeneration = this.ptyGeneration;
+    const directPty = pty.spawn(this.shell, shellArgs, {
+      name: 'xterm-256color',
+      cols: this.cols,
+      rows: this.rows,
+      cwd: this.cwd,
+      env: {
+        ...this.env,
+        TERM: 'xterm-256color',
+        COLORTERM: 'truecolor'
+      }
+    });
+    this.directPty = directPty;
+
+    directPty.onData((data) => {
+      if (this.directPty !== directPty || this.ptyGeneration !== ptyGeneration) {
+        return;
+      }
+      this._appendReplay(data);
+      this._broadcast(data);
+      this._touch();
+    });
+
+    directPty.onExit((event) => {
+      if (this.directPty !== directPty || this.ptyGeneration !== ptyGeneration) {
+        return;
+      }
+      this.directPty = null;
+      this.lastExitAt = new Date().toISOString();
+      this.exitCode = event.exitCode;
+      this.status = this.isTerminating ? 'terminated' : 'exited';
+      this._touch();
+
+      const message = `\r\n[${this.name} exited with code ${event.exitCode}]\r\n`;
+      this._appendReplay(message);
+      this._broadcast(message);
+
+      this.logger.info('Direct terminal PTY exited', {
+        sessionId: this.id,
+        profile: this.terminalProfile,
+        exitCode: event.exitCode
+      });
+    });
+
+    this.logger.info('Direct terminal PTY ready', {
+      sessionId: this.id,
+      profile: this.terminalProfile,
+      shell: this.shell
+    });
+  }
+
+  _appendReplay(data) {
+    const text = String(data || '');
+    if (!text) {
+      return;
+    }
+
+    this.replayChunks.push(text);
+    this.replayBytes += Buffer.byteLength(text, 'utf8');
+    while (this.replayBytes > this.maxReplayBytes && this.replayChunks.length > 1) {
+      const removed = this.replayChunks.shift();
+      this.replayBytes -= Buffer.byteLength(removed, 'utf8');
+    }
+  }
+
+  _broadcast(data) {
+    for (const ws of this.clients.keys()) {
+      if (isWsOpen(ws)) {
+        ws.send(data);
+      }
+    }
+  }
+
+  _resizeDirectPty(cols, rows) {
+    this.cols = coercePositiveInt(cols, this.cols);
+    this.rows = coercePositiveInt(rows, this.rows);
+    if (!this.directPty) {
+      return;
+    }
+    try {
+      this.directPty.resize(this.cols, this.rows);
+    } catch (error) {
+      this.logger.warn('Failed to resize direct terminal PTY', {
+        sessionId: this.id,
+        cols: this.cols,
+        rows: this.rows,
+        message: error.message
+      });
+    }
   }
 
   _assertTmux(result, context) {
@@ -296,6 +416,10 @@ class TerminalSession {
   }
 
   scrollHistory(lines) {
+    if (this.backend === 'direct') {
+      return false;
+    }
+
     const parsed = Number.parseInt(lines, 10);
     if (!Number.isFinite(parsed) || parsed === 0) {
       return false;
@@ -414,11 +538,24 @@ class TerminalSession {
   }
 
   _buildLocalAttachCommand() {
+    if (this.backend === 'direct') {
+      return '';
+    }
+
     const spec = this.getLocalAttachSpec();
     return [spec.command, ...spec.args].map((part) => quoteCommandArg(part)).join(' ');
   }
 
   getLocalAttachSpec() {
+    if (this.backend === 'direct') {
+      return {
+        command: this.shell,
+        args: Array.isArray(this.shellArgs) ? this.shellArgs : [],
+        cwd: this.cwd,
+        displayCommand: ''
+      };
+    }
+
     return {
       command: this.tmuxCommand,
       args: [
@@ -435,6 +572,33 @@ class TerminalSession {
   }
 
   attachClient(ws) {
+    if (this.backend === 'direct') {
+      if (this.clients.has(ws)) {
+        this.detachClient(ws);
+      }
+
+      const client = {
+        cols: this.cols,
+        rows: this.rows,
+        pty: null
+      };
+      this.clients.set(ws, client);
+      if (!this.directPty && this.status !== 'terminated') {
+        this._spawnPersistentPty();
+      }
+      const replay = this.replayChunks.join('');
+      if (replay && isWsOpen(ws)) {
+        ws.send(replay);
+      }
+
+      this.logger.info('Client attached to direct terminal session', {
+        sessionId: this.id,
+        profile: this.terminalProfile,
+        clientCount: this.clients.size
+      });
+      return;
+    }
+
     this._ensureTmuxSession();
 
     if (this.clients.has(ws)) {
@@ -455,6 +619,16 @@ class TerminalSession {
     if (!client) return;
 
     this.clients.delete(ws);
+    if (this.backend === 'direct') {
+      this._touch();
+      this.logger.info('Client detached from direct terminal session', {
+        sessionId: this.id,
+        profile: this.terminalProfile,
+        clientCount: this.clients.size
+      });
+      return;
+    }
+
     this._killClientPty(client);
     this._touch();
 
@@ -485,6 +659,11 @@ class TerminalSession {
       const rows = coercePositiveInt(payload.rows, client.rows);
       client.cols = cols;
       client.rows = rows;
+
+      if (this.backend === 'direct') {
+        this._resizeDirectPty(cols, rows);
+        return;
+      }
 
       if (client.pty) {
         try {
@@ -519,6 +698,24 @@ class TerminalSession {
       return false;
     }
 
+    if (this.backend === 'direct') {
+      if (!this.directPty || this.status === 'exited' || this.status === 'terminated') {
+        return false;
+      }
+
+      try {
+        this.directPty.write(data);
+        this._touch();
+        return true;
+      } catch (error) {
+        this.logger.warn('Failed to write input to direct terminal PTY', {
+          sessionId: this.id,
+          message: error.message
+        });
+        return false;
+      }
+    }
+
     const targetClient = ws ? this.clients.get(ws) : this.clients.values().next().value;
     if (!targetClient || !targetClient.pty) {
       return false;
@@ -544,6 +741,10 @@ class TerminalSession {
       return false;
     }
 
+    if (this.backend === 'direct') {
+      return this.writeInput(`${command}\r`);
+    }
+
     this._ensureTmuxSession();
     this._cancelServerCopyMode();
     const result = this._runTmux(['send-keys', '-t', this.tmuxSessionName, command, 'C-m']);
@@ -566,10 +767,38 @@ class TerminalSession {
     this.clients.clear();
 
     for (const [ws, client] of activeClients) {
-      this._killClientPty(client);
+      if (this.backend !== 'direct') {
+        this._killClientPty(client);
+      }
       if (isWsActive(ws)) {
         ws.close(1012, 'Session restarted');
       }
+    }
+
+    if (this.backend === 'direct') {
+      const existingPty = this.directPty;
+      this.directPty = null;
+      if (existingPty) {
+        try {
+          existingPty.kill();
+        } catch (error) {
+          this.logger.warn('Failed to terminate direct terminal PTY during restart', {
+            sessionId: this.id,
+            message: error.message
+          });
+        }
+      }
+
+      this.replayChunks = [];
+      this.replayBytes = 0;
+      this.status = 'starting';
+      this.exitCode = null;
+      this.lastExitAt = null;
+      this.isTerminating = false;
+      this._spawnPersistentPty();
+      this.status = 'running';
+      this._touch();
+      return;
     }
 
     this._killTmuxSession();
@@ -592,7 +821,9 @@ class TerminalSession {
     this.clients.clear();
 
     for (const [ws, client] of activeClients) {
-      this._killClientPty(client);
+      if (this.backend !== 'direct') {
+        this._killClientPty(client);
+      }
 
       if (closeClients) {
         if (isWsActive(ws)) {
@@ -601,6 +832,32 @@ class TerminalSession {
       } else if (isWsOpen(ws)) {
         ws.send(`\r\n${reason}\r\n`);
       }
+    }
+
+    if (this.backend === 'direct') {
+      const existingPty = this.directPty;
+      this.directPty = null;
+      if (existingPty) {
+        try {
+          existingPty.kill();
+        } catch (error) {
+          this.logger.warn('Failed to terminate direct terminal PTY', {
+            sessionId: this.id,
+            message: error.message
+          });
+        }
+      }
+
+      this.status = 'terminated';
+      this.lastExitAt = new Date().toISOString();
+      this._touch();
+
+      this.logger.info('Direct terminal session terminated', {
+        sessionId: this.id,
+        profile: this.terminalProfile,
+        closeClients
+      });
+      return;
     }
 
     this._killTmuxSession();
@@ -625,7 +882,9 @@ class TerminalSession {
     this.clients.clear();
 
     for (const [ws, client] of activeClients) {
-      this._killClientPty(client);
+      if (this.backend !== 'direct') {
+        this._killClientPty(client);
+      }
 
       if (closeSockets) {
         if (isWsActive(ws)) {
@@ -638,6 +897,15 @@ class TerminalSession {
 
     this.serverCopyModeActive = false;
     this._touch();
+
+    if (this.backend === 'direct') {
+      this.logger.info('Direct terminal session detached from web clients', {
+        sessionId: this.id,
+        profile: this.terminalProfile,
+        remainingClients: this.clients.size
+      });
+      return;
+    }
 
     this.logger.info('tmux-backed session detached from web clients', {
       sessionId: this.id,
@@ -666,13 +934,16 @@ class TerminalSession {
       lastExitAt: this.lastExitAt,
       exitCode: this.exitCode,
       clientCount: this.clients.size,
+      terminalProfile: this.terminalProfile,
+      shellType: this.terminalProfile,
+      backend: this.backend,
       shell: this.shell,
       shellArgs: this.shellArgs,
       cwd: this.cwd,
       cols: this.cols,
       rows: this.rows,
       tmuxSession: this.tmuxSessionName,
-      replayBytes: 0,
+      replayBytes: this.replayBytes,
       localAttachCommand: this._buildLocalAttachCommand()
     };
   }
