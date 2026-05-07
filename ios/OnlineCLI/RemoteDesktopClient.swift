@@ -103,7 +103,7 @@ final class RemoteDesktopClient {
     private var receiveTask: Task<Void, Never>?
     private let feedback = UIImpactFeedbackGenerator(style: .light)
     private var currentURL: URL?
-    private let pointerSendInterval: TimeInterval = 1.0 / 120.0
+    private let pointerSendInterval: TimeInterval = 1.0 / 180.0
     private var lastPointerSendAt: TimeInterval = 0
     private var pendingPointer: CGPoint?
     private var pointerFlushTask: Task<Void, Never>?

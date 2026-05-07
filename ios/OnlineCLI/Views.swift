@@ -937,16 +937,20 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     private weak var longPressRecognizer: UILongPressGestureRecognizer?
     private weak var trackedTouch: UITouch?
     private var touchStartLocation = CGPoint.zero
+    private var touchStartUptime: TimeInterval = 0
     private var touchStartPoint: CGPoint?
     private var touchLastPoint: CGPoint?
     private var trackpadStartCursor: CGPoint?
     private var longPressConsumed = false
+    private var touchMovedBeyondLongPress = false
     private var singleFingerViewportPanActive = false
     private var remoteDragActive = false
     private var initialPanOffset = CGSize.zero
     private var initialZoom = RemoteViewportSettings.minimumZoom
     private var initialPinchLocation = CGPoint.zero
     private let dragActivationDistance: CGFloat = 4
+    private let longPressMinimumDuration: TimeInterval = 0.60
+    private let longPressMovementLimit: CGFloat = 6
     private var hasRenderableFrame: Bool {
         latestImage != nil || videoActive
     }
@@ -1172,18 +1176,19 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     @objc private func handleLongPress(_ recognizer: UILongPressGestureRecognizer) {
         guard recognizer.state == .began else { return }
         guard isUserInteractionEnabled, controlMode, gestureMode != .viewport, hasRenderableFrame else { return }
+        guard let trackedTouch else { return }
+        guard !touchMovedBeyondLongPress, !singleFingerViewportPanActive, !remoteDragActive else { return }
 
-        let location = recognizer.location(in: self)
+        let location = trackedTouch.location(in: self)
+        guard distance(from: touchStartLocation, to: location) <= longPressMovementLimit else { return }
+        guard ProcessInfo.processInfo.systemUptime - touchStartUptime >= longPressMinimumDuration - 0.03 else { return }
+
         let target = gestureMode == .trackpad
             ? (remoteCursor ?? touchLastPoint ?? trackpadStartCursor ?? normalizedPoint(for: location))
             : (normalizedPoint(for: location) ?? touchLastPoint ?? touchStartPoint)
         guard let target else { return }
 
         longPressConsumed = true
-        if remoteDragActive {
-            onDragEnd?(target)
-            remoteDragActive = false
-        }
         onRightClick?(target)
     }
 
@@ -1241,11 +1246,16 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
 
         trackedTouch = touch
         touchStartLocation = touch.location(in: self)
+        touchStartUptime = ProcessInfo.processInfo.systemUptime
         touchStartPoint = normalizedPoint(for: touchStartLocation)
         touchLastPoint = touchStartPoint
         trackpadStartCursor = remoteCursor ?? touchStartPoint ?? CGPoint(x: 0.5, y: 0.5)
+        if controlMode, gestureMode == .direct, let touchStartPoint {
+            onPointerMove?(touchStartPoint)
+        }
         initialPanOffset = panOffsetValue
         longPressConsumed = false
+        touchMovedBeyondLongPress = false
         singleFingerViewportPanActive = false
         remoteDragActive = false
     }
@@ -1262,6 +1272,9 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
             return
         }
         let location = trackedTouch.location(in: self)
+        if distance(from: touchStartLocation, to: location) > longPressMovementLimit {
+            touchMovedBeyondLongPress = true
+        }
 
         guard controlMode else {
             handleOneFingerViewportPan(to: location)
@@ -1336,7 +1349,11 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
             }
         }
         if gestureRecognizer === longPressRecognizer {
-            return controlMode && gestureMode != .viewport && hasRenderableFrame
+            return controlMode
+                && gestureMode != .viewport
+                && hasRenderableFrame
+                && trackedTouch != nil
+                && !touchMovedBeyondLongPress
         }
         return true
     }
@@ -1416,12 +1433,11 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         let doubleTap = UITapGestureRecognizer(target: self, action: #selector(handleDoubleTap(_:)))
         doubleTap.numberOfTapsRequired = 2
         doubleTap.delegate = self
-        singleTap.require(toFail: doubleTap)
 
         let longPress = UILongPressGestureRecognizer(target: self, action: #selector(handleLongPress(_:)))
-        longPress.minimumPressDuration = 0.48
-        longPress.allowableMovement = 10
-        longPress.cancelsTouchesInView = false
+        longPress.minimumPressDuration = longPressMinimumDuration
+        longPress.allowableMovement = longPressMovementLimit
+        longPress.cancelsTouchesInView = true
         longPress.delegate = self
 
         addGestureRecognizer(singleTap)
@@ -1788,8 +1804,10 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         trackedTouch = nil
         touchStartPoint = nil
         touchLastPoint = nil
+        touchStartUptime = 0
         trackpadStartCursor = nil
         longPressConsumed = false
+        touchMovedBeyondLongPress = false
         singleFingerViewportPanActive = false
         remoteDragActive = false
     }
@@ -1925,15 +1943,25 @@ struct RemoteKeyboardInputCapture: UIViewRepresentable {
         }
 
         override func insertText(_ text: String) {
+            var bufferedText = ""
+            func flushBufferedText() {
+                guard !bufferedText.isEmpty else { return }
+                onText?(bufferedText)
+                bufferedText = ""
+            }
+
             for scalar in text.unicodeScalars {
                 if scalar.value == 10 || scalar.value == 13 {
+                    flushBufferedText()
                     onEnter?()
                 } else if scalar.value == 9 {
+                    flushBufferedText()
                     onTab?()
                 } else {
-                    onText?(String(scalar))
+                    bufferedText.append(String(scalar))
                 }
             }
+            flushBufferedText()
             self.text = ""
         }
 

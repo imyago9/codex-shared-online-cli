@@ -69,6 +69,20 @@ function videoBitrateForQuality(rawQuality, fallbackQuality = 62) {
   return toSafeInteger(Math.round(8_000 + ratio * 24_000), 20_000, 500, 50_000);
 }
 
+function preferLowLatency(socket) {
+  socket.on('open', () => {
+    const transport = socket && socket._socket;
+    if (transport && typeof transport.setNoDelay === 'function') {
+      try {
+        transport.setNoDelay(true);
+      } catch (_error) {
+        // Best-effort TCP tuning.
+      }
+    }
+  });
+  return socket;
+}
+
 function serializeMonitorLayout(layout) {
   if (!Array.isArray(layout) || layout.length === 0) {
     return null;
@@ -120,8 +134,8 @@ class RemoteClient {
     this.defaultMode = normalizeMode(options.defaultMode, 'view');
     this.streamFps = toSafeInteger(options.streamFps, 10, 1, 20);
     this.jpegQuality = toSafeInteger(options.jpegQuality, 62, 20, 95);
-    this.inputRateLimitPerSec = toSafeInteger(options.inputRateLimitPerSec, 120, 10, 600);
-    this.inputMaxQueue = toSafeInteger(options.inputMaxQueue, 300, 20, 2_000);
+    this.inputRateLimitPerSec = toSafeInteger(options.inputRateLimitPerSec, 360, 10, 600);
+    this.inputMaxQueue = toSafeInteger(options.inputMaxQueue, 120, 20, 2_000);
     this.healthTimeoutMs = toSafeInteger(options.healthTimeoutMs, 2_500, 500, 10_000);
 
     this.healthCache = {
@@ -367,9 +381,9 @@ class RemoteClient {
       layout: serializeMonitorLayout(options.layout)
     });
 
-    return new WebSocket(wsUrl, {
+    return preferLowLatency(new WebSocket(wsUrl, {
       perMessageDeflate: false
-    });
+    }));
   }
 
   openVideoSocket(options = {}) {
@@ -384,16 +398,16 @@ class RemoteClient {
       layout: serializeMonitorLayout(options.layout)
     });
 
-    return new WebSocket(wsUrl, {
+    return preferLowLatency(new WebSocket(wsUrl, {
       perMessageDeflate: false
-    });
+    }));
   }
 
   openInputSocket() {
     const wsUrl = this.buildSidecarWsUrl('/input');
-    return new WebSocket(wsUrl, {
+    return preferLowLatency(new WebSocket(wsUrl, {
       perMessageDeflate: false
-    });
+    }));
   }
 
   close() {

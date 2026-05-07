@@ -7,6 +7,17 @@ function isWsOpen(socket) {
   return socket && socket.readyState === WebSocket.OPEN;
 }
 
+function preferLowLatency(socket) {
+  const transport = socket && (socket._socket || socket);
+  if (transport && typeof transport.setNoDelay === 'function') {
+    try {
+      transport.setNoDelay(true);
+    } catch (_error) {
+      // Best-effort TCP tuning.
+    }
+  }
+}
+
 function decodeWsText(rawValue) {
   if (typeof rawValue === 'string') {
     return rawValue;
@@ -292,6 +303,25 @@ function sanitizeInputEvent(rawValue) {
   return null;
 }
 
+function inputEventType(event) {
+  return event && typeof event.type === 'string'
+    ? event.type.trim().toLowerCase()
+    : '';
+}
+
+function isMouseMoveEvent(event) {
+  return inputEventType(event) === 'mouse_move';
+}
+
+function isLatencyCriticalInput(event) {
+  const type = inputEventType(event);
+  return type === 'mouse_button'
+    || type === 'mouse_wheel'
+    || type === 'key'
+    || type === 'text'
+    || type === 'release_all';
+}
+
 function controlEnvelope(type, payload = {}) {
   return JSON.stringify({
     __onlineCliControl: true,
@@ -329,6 +359,9 @@ function createRemoteGateway(server, remoteClient, options = {}) {
   }
 
   wss.on('connection', async (clientSocket, req) => {
+    preferLowLatency(req.socket);
+    preferLowLatency(clientSocket);
+
     const access = accessManager ? accessManager.checkRequest(req) : { allowed: true };
     if (!access.allowed) {
       clientSocket.close(1008, access.message || 'Tailscale connection required');
@@ -673,7 +706,11 @@ function createRemoteGateway(server, remoteClient, options = {}) {
       sendMonitorLayoutToStream();
     }
 
-    function consumeRateBudget() {
+    function consumeRateBudget(event) {
+      if (isLatencyCriticalInput(event)) {
+        return true;
+      }
+
       const now = Date.now();
       if ((now - context.rateWindowStartedAt) >= 1000) {
         context.rateWindowStartedAt = now;
@@ -702,12 +739,55 @@ function createRemoteGateway(server, remoteClient, options = {}) {
       context.inputFlushTimer = setTimeout(() => {
         context.inputFlushTimer = null;
         flushInputQueue();
-      }, 8);
+      }, 1);
+    }
+
+    function dropQueuedMouseMoves() {
+      let writeIndex = 0;
+      for (const event of context.inputQueue) {
+        if (!isMouseMoveEvent(event)) {
+          context.inputQueue[writeIndex] = event;
+          writeIndex += 1;
+        }
+      }
+      context.inputQueue.length = writeIndex;
+    }
+
+    function queueInputForSocketOpen(event) {
+      if (isMouseMoveEvent(event)) {
+        dropQueuedMouseMoves();
+      } else if (isLatencyCriticalInput(event)) {
+        dropQueuedMouseMoves();
+      }
+
+      if (context.inputQueue.length >= inputQueueMax) {
+        if (isMouseMoveEvent(event)) {
+          context.droppedEvents += 1;
+          return false;
+        }
+        context.inputQueue.shift();
+      }
+
+      context.inputQueue.push(event);
+      scheduleInputFlush();
+      return true;
     }
 
     function enqueueInputEvent(event) {
-      if (context.inputQueue.length >= inputQueueMax) {
-        context.droppedEvents += 1;
+      ensureInputSocket();
+
+      if (context.inputSocket && context.inputSocket.readyState === WebSocket.OPEN) {
+        if (isLatencyCriticalInput(event)) {
+          context.inputQueue.length = 0;
+        } else if (context.inputQueue.length > 0) {
+          flushInputQueue();
+        }
+        clearInputFlushTimer();
+        return sendInputEventDirect(event);
+      }
+
+      const queued = queueInputForSocketOpen(event);
+      if (!queued) {
         const now = Date.now();
         if ((now - context.lastBackpressureNoticeAt) >= 1_200) {
           context.lastBackpressureNoticeAt = now;
@@ -716,12 +796,8 @@ function createRemoteGateway(server, remoteClient, options = {}) {
             droppedEvents: context.droppedEvents
           });
         }
-        return false;
       }
-
-      context.inputQueue.push(event);
-      scheduleInputFlush();
-      return true;
+      return queued;
     }
 
     function flushInputQueue() {
@@ -771,6 +847,7 @@ function createRemoteGateway(server, remoteClient, options = {}) {
       context.inputSocket = inputSocket;
 
       inputSocket.on('open', () => {
+        preferLowLatency(inputSocket);
         if (context.closed || context.inputSocket !== inputSocket) {
           return;
         }
@@ -888,6 +965,7 @@ function createRemoteGateway(server, remoteClient, options = {}) {
       }
 
       streamSocket.on('open', () => {
+        preferLowLatency(streamSocket);
         if (context.closed || context.streamSocket !== streamSocket) {
           return;
         }
@@ -1109,15 +1187,15 @@ function createRemoteGateway(server, remoteClient, options = {}) {
         return;
       }
 
-      if (!consumeRateBudget()) {
-        return;
-      }
-
       const sanitizedEvent = sanitizeInputEvent(payload.event);
       if (!sanitizedEvent) {
         sendControl('remote-input-rejected', {
           reason: 'invalid-event-payload'
         });
+        return;
+      }
+
+      if (!consumeRateBudget(sanitizedEvent)) {
         return;
       }
 

@@ -121,8 +121,8 @@ const config = {
   remoteDefaultMode: parseRemoteMode(process.env.REMOTE_DEFAULT_MODE, 'view'),
   remoteStreamFps: clampInteger(parseInteger(process.env.REMOTE_STREAM_FPS, 10), 1, 20),
   remoteJpegQuality: clampInteger(parseInteger(process.env.REMOTE_JPEG_QUALITY, 62), 20, 95),
-  remoteInputRateLimitPerSec: clampInteger(parseInteger(process.env.REMOTE_INPUT_RATE_LIMIT_PER_SEC, 120), 10, 600),
-  remoteInputMaxQueue: clampInteger(parseInteger(process.env.REMOTE_INPUT_MAX_QUEUE, 300), 20, 2_000),
+  remoteInputRateLimitPerSec: clampInteger(parseInteger(process.env.REMOTE_INPUT_RATE_LIMIT_PER_SEC, 360), 10, 600),
+  remoteInputMaxQueue: clampInteger(parseInteger(process.env.REMOTE_INPUT_MAX_QUEUE, 120), 20, 2_000),
   remoteHealthTimeoutMs: clampInteger(parseInteger(process.env.REMOTE_HEALTH_TIMEOUT_MS, 2_500), 500, 10_000),
   sessionStateFile: process.env.SESSION_STATE_FILE
     ? path.resolve(process.env.SESSION_STATE_FILE)

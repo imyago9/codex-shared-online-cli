@@ -105,6 +105,27 @@ function isWsOpen(socket) {
   return socket && socket.readyState === WebSocket.OPEN;
 }
 
+function preferLowLatency(socket) {
+  const transport = socket && (socket._socket || socket);
+  if (transport && typeof transport.setNoDelay === 'function') {
+    try {
+      transport.setNoDelay(true);
+    } catch (_error) {
+      // Best-effort TCP tuning.
+    }
+  }
+}
+
+function inputEventType(event) {
+  return event && typeof event.type === 'string'
+    ? event.type.trim().toLowerCase()
+    : '';
+}
+
+function isMouseMoveEvent(event) {
+  return inputEventType(event) === 'mouse_move';
+}
+
 function parseRequestQuery(req) {
   try {
     const parsed = new URL(req.url, 'http://localhost');
@@ -1889,7 +1910,7 @@ function Invoke-TextInput([string]$base64) {
       } catch (error) {
         markUnavailable(error && error.message ? error.message : 'powershell-move-failed');
       }
-    }, 16);
+    }, 4);
     state.moveTimer.unref();
   }
 
@@ -3094,6 +3115,8 @@ const server = http.createServer(app);
 
 const streamWss = new WebSocketServer({ noServer: true });
 streamWss.on('connection', (socket, req) => {
+  preferLowLatency(socket);
+
   const query = parseRequestQuery(req);
   socket.requestedFps = clampInteger(parseInteger(query.get('fps'), config.streamFps), 1, 20);
   socket.requestedQuality = clampInteger(parseInteger(query.get('quality'), config.jpegQuality), 20, 95);
@@ -3164,6 +3187,8 @@ function qualityToVideoBitrateKbps(rawQuality) {
 
 const videoWss = new WebSocketServer({ noServer: true });
 videoWss.on('connection', (socket, req) => {
+  preferLowLatency(socket);
+
   const query = parseRequestQuery(req);
   socket.requestedFps = clampInteger(parseInteger(query.get('fps'), config.videoFps), 1, 120);
   socket.requestedBitrateKbps = clampInteger(
@@ -3246,6 +3271,8 @@ videoWss.on('connection', (socket, req) => {
 
 const inputWss = new WebSocketServer({ noServer: true });
 inputWss.on('connection', (socket) => {
+  preferLowLatency(socket);
+
   if (inputController.available !== true) {
     if (isWsOpen(socket)) {
       socket.send(JSON.stringify({
@@ -3264,13 +3291,83 @@ inputWss.on('connection', (socket) => {
   }
 
   let pending = Promise.resolve();
+  let pendingMove = null;
+  let moveFlushTimer = null;
   let releasedInputState = false;
+
+  function handleInputError(error) {
+    const message = error && error.message ? error.message : 'input-execution-failed';
+    logger.warn('Input event failed', {
+      message
+    });
+
+    if (isWsOpen(socket)) {
+      socket.send(JSON.stringify({
+        type: 'error',
+        message
+      }));
+    }
+  }
+
+  function enqueueControllerEvent(event) {
+    pending = pending
+      .then(async () => {
+        await inputController.handleEvent(event);
+      })
+      .catch(handleInputError);
+  }
+
+  function clearPendingMove() {
+    pendingMove = null;
+    if (moveFlushTimer) {
+      clearTimeout(moveFlushTimer);
+      moveFlushTimer = null;
+    }
+  }
+
+  function flushPendingMove() {
+    if (moveFlushTimer) {
+      clearTimeout(moveFlushTimer);
+      moveFlushTimer = null;
+    }
+    if (!pendingMove || releasedInputState) {
+      pendingMove = null;
+      return;
+    }
+    const event = pendingMove;
+    pendingMove = null;
+    enqueueControllerEvent(event);
+  }
+
+  function schedulePendingMoveFlush() {
+    if (moveFlushTimer || releasedInputState) {
+      return;
+    }
+    moveFlushTimer = setTimeout(flushPendingMove, 1);
+    moveFlushTimer.unref();
+  }
+
+  function enqueueSocketInputEvent(event) {
+    if (releasedInputState) {
+      return;
+    }
+
+    if (isMouseMoveEvent(event)) {
+      pendingMove = event;
+      schedulePendingMoveFlush();
+      return;
+    }
+
+    clearPendingMove();
+    enqueueControllerEvent(event);
+  }
 
   function releaseSocketInputState(reason) {
     if (releasedInputState || inputController.available !== true) {
       return;
     }
     releasedInputState = true;
+    clearPendingMove();
     pending = pending
       .then(async () => {
         if (typeof inputController.releaseAll === 'function') {
@@ -3318,23 +3415,7 @@ inputWss.on('connection', (socket) => {
       return;
     }
 
-    pending = pending
-      .then(async () => {
-        await inputController.handleEvent(event);
-      })
-      .catch((error) => {
-        const message = error && error.message ? error.message : 'input-execution-failed';
-        logger.warn('Input event failed', {
-          message
-        });
-
-        if (isWsOpen(socket)) {
-          socket.send(JSON.stringify({
-            type: 'error',
-            message
-          }));
-        }
-      });
+    enqueueSocketInputEvent(event);
   });
 
   socket.on('error', (error) => {
