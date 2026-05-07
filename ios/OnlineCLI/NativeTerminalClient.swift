@@ -34,30 +34,55 @@ final class NativeTerminalBuffer {
     var displayText = ""
 
     private var history: [String] = []
-    private var currentLine: [Character] = []
+    private var screen: [[Character]] = []
     private var cursorX = 0
+    private var cursorY = 0
+    private var savedCursorX = 0
+    private var savedCursorY = 0
     private var cols = 80
+    private var rows = 24
     private var parseMode: ParseMode = .normal
     private var csiBuffer = ""
-    private var pendingCarriageReturn = false
     private let maxLines: Int
 
     init(maxLines: Int = 8_000) {
         self.maxLines = maxLines
+        screen = Self.makeBlankScreen(cols: cols, rows: rows)
     }
 
     func reset() {
         history = []
-        currentLine = []
+        screen = Self.makeBlankScreen(cols: cols, rows: rows)
         cursorX = 0
+        cursorY = 0
+        savedCursorX = 0
+        savedCursorY = 0
         parseMode = .normal
         csiBuffer = ""
-        pendingCarriageReturn = false
         displayText = ""
     }
 
-    func resize(cols: Int) {
-        self.cols = max(20, cols)
+    func resize(cols: Int, rows: Int) {
+        let nextCols = max(20, cols)
+        let nextRows = max(6, rows)
+        guard nextCols != self.cols || nextRows != self.rows else { return }
+
+        let oldScreen = screen
+        let oldCols = self.cols
+        self.cols = nextCols
+        self.rows = nextRows
+        screen = oldScreen.prefix(self.rows).map { oldLine in
+            var line = Array(oldLine.prefix(self.cols))
+            if line.count < self.cols {
+                line.append(contentsOf: Array(repeating: " ", count: self.cols - line.count))
+            }
+            return line
+        }
+        while screen.count < self.rows {
+            screen.append(blankLine())
+        }
+        cursorX = min(cursorX, max(0, min(oldCols, self.cols) - 1))
+        cursorY = min(cursorY, self.rows - 1)
         rebuildDisplayText()
     }
 
@@ -107,110 +132,161 @@ final class NativeTerminalBuffer {
         case 0x1B:
             parseMode = .escape
         case 0x0D:
-            pendingCarriageReturn = true
+            cursorX = 0
         case 0x0A:
-            commitLine()
-            pendingCarriageReturn = false
+            lineFeed()
         case 0x08, 0x7F:
-            pendingCarriageReturn = false
             cursorX = max(0, cursorX - 1)
         case 0x09:
-            applyPendingCarriageReturn()
             let spaces = 4 - (cursorX % 4)
             for _ in 0..<spaces {
-                append(Character(" "))
+                put(Character(" "))
             }
         case 0x00...0x1F:
             break
         default:
-            applyPendingCarriageReturn()
-            append(Character(scalar))
-        }
-    }
-
-    private func applyPendingCarriageReturn() {
-        if pendingCarriageReturn {
-            cursorX = 0
-            pendingCarriageReturn = false
+            put(Character(scalar))
         }
     }
 
     private func handleCSI(final: Character, parameters: String) {
+        let params = parsedParameters(parameters)
         switch final {
         case "J":
-            history.removeAll(keepingCapacity: true)
-            currentLine = []
-            cursorX = 0
-            pendingCarriageReturn = false
+            eraseInDisplay(mode: params.first ?? 0)
         case "K":
-            pendingCarriageReturn = false
-            eraseInLine(parameters: parameters)
+            eraseInLine(mode: params.first ?? 0)
+        case "H", "f":
+            let row = max(1, params.first ?? 1) - 1
+            let col = max(1, params.dropFirst().first ?? 1) - 1
+            cursorY = min(rows - 1, row)
+            cursorX = min(cols - 1, col)
+        case "A":
+            cursorY = max(0, cursorY - max(1, params.first ?? 1))
+        case "B":
+            cursorY = min(rows - 1, cursorY + max(1, params.first ?? 1))
         case "G":
-            cursorX = max(0, min(cols - 1, firstParameter(parameters, defaultValue: 1) - 1))
+            cursorX = max(0, min(cols - 1, max(1, params.first ?? 1) - 1))
         case "C":
-            cursorX = max(0, min(cols - 1, cursorX + firstParameter(parameters, defaultValue: 1)))
-            padLine(to: cursorX)
+            cursorX = max(0, min(cols - 1, cursorX + max(1, params.first ?? 1)))
         case "D":
-            cursorX = max(0, cursorX - firstParameter(parameters, defaultValue: 1))
-        case "m":
+            cursorX = max(0, cursorX - max(1, params.first ?? 1))
+        case "E":
+            cursorY = min(rows - 1, cursorY + max(1, params.first ?? 1))
+            cursorX = 0
+        case "F":
+            cursorY = max(0, cursorY - max(1, params.first ?? 1))
+            cursorX = 0
+        case "S":
+            scrollUp(max(1, params.first ?? 1), recordHistory: true)
+        case "T":
+            scrollDown(max(1, params.first ?? 1))
+        case "X":
+            eraseCharacters(max(1, params.first ?? 1))
+        case "s":
+            savedCursorX = cursorX
+            savedCursorY = cursorY
+        case "u":
+            cursorX = min(cols - 1, max(0, savedCursorX))
+            cursorY = min(rows - 1, max(0, savedCursorY))
+        case "m", "h", "l", "r":
             break
         default:
             _ = parameters
         }
     }
 
-    private func append(_ character: Character) {
+    private func put(_ character: Character) {
         if cursorX >= cols {
-            commitLine()
+            cursorX = 0
+            lineFeed()
         }
-        padLine(to: cursorX)
-        if cursorX < currentLine.count {
-            currentLine[cursorX] = character
-        } else {
-            currentLine.append(character)
-        }
+        screen[cursorY][cursorX] = character
         cursorX += 1
     }
 
-    private func padLine(to index: Int) {
-        while currentLine.count < index {
-            currentLine.append(" ")
+    private func lineFeed() {
+        if cursorY >= rows - 1 {
+            scrollUp(1, recordHistory: true)
+        } else {
+            cursorY += 1
         }
     }
 
-    private func eraseInLine(parameters: String) {
-        let mode = firstParameter(parameters, defaultValue: 0)
+    private func scrollUp(_ count: Int, recordHistory: Bool) {
+        guard count > 0 else { return }
+        for _ in 0..<min(count, rows) {
+            if recordHistory {
+                history.append(lineString(screen[0]))
+            }
+            screen.removeFirst()
+            screen.append(blankLine())
+        }
+        trimLinesIfNeeded()
+    }
+
+    private func scrollDown(_ count: Int) {
+        guard count > 0 else { return }
+        for _ in 0..<min(count, rows) {
+            screen.removeLast()
+            screen.insert(blankLine(), at: 0)
+        }
+    }
+
+    private func eraseInDisplay(mode: Int) {
         switch mode {
         case 1:
-            if cursorX > 0 {
-                for index in 0..<min(cursorX, currentLine.count) {
-                    currentLine[index] = " "
+            for row in 0...cursorY {
+                let end = row == cursorY ? cursorX : cols - 1
+                guard end >= 0 else { continue }
+                for col in 0...min(end, cols - 1) {
+                    screen[row][col] = " "
                 }
             }
-        case 2:
-            currentLine = []
-            cursorX = 0
+        case 2, 3:
+            screen = Self.makeBlankScreen(cols: cols, rows: rows)
+            if mode == 3 {
+                history.removeAll(keepingCapacity: true)
+            }
         default:
-            if cursorX < currentLine.count {
-                currentLine.removeSubrange(cursorX..<currentLine.count)
+            for row in cursorY..<rows {
+                let start = row == cursorY ? cursorX : 0
+                guard start < cols else { continue }
+                for col in start..<cols {
+                    screen[row][col] = " "
+                }
             }
         }
     }
 
-    private func firstParameter(_ parameters: String, defaultValue: Int) -> Int {
-        let sanitized = parameters
-            .replacingOccurrences(of: "?", with: "")
-            .split(separator: ";")
-            .first
-            .flatMap { Int($0) }
-        return max(0, sanitized ?? defaultValue)
+    private func eraseInLine(mode: Int) {
+        switch mode {
+        case 1:
+            for col in 0...min(cursorX, cols - 1) {
+                screen[cursorY][col] = " "
+            }
+        case 2:
+            screen[cursorY] = blankLine()
+        default:
+            guard cursorX < cols else { return }
+            for col in cursorX..<cols {
+                screen[cursorY][col] = " "
+            }
+        }
     }
 
-    private func commitLine() {
-        history.append(String(currentLine).trimmingTrailingSpaces())
-        currentLine = []
-        cursorX = 0
-        trimLinesIfNeeded()
+    private func eraseCharacters(_ count: Int) {
+        guard cursorX < cols else { return }
+        for col in cursorX..<min(cols, cursorX + count) {
+            screen[cursorY][col] = " "
+        }
+    }
+
+    private func parsedParameters(_ parameters: String) -> [Int] {
+        parameters
+            .replacingOccurrences(of: "?", with: "")
+            .split(separator: ";")
+            .map { Int($0) ?? 0 }
     }
 
     private func trimLinesIfNeeded() {
@@ -220,9 +296,22 @@ final class NativeTerminalBuffer {
 
     private func rebuildDisplayText() {
         trimLinesIfNeeded()
-        var visible = history
-        visible.append(String(currentLine).trimmingTrailingSpaces())
+        let lastVisibleRow = max(cursorY, screen.lastIndex(where: { !$0.allSatisfy { $0 == " " } }) ?? 0)
+        let visibleScreen = screen.prefix(lastVisibleRow + 1).map(lineString)
+        let visible = history + visibleScreen
         displayText = visible.suffix(maxLines).joined(separator: "\n")
+    }
+
+    private func blankLine() -> [Character] {
+        Array(repeating: " ", count: cols)
+    }
+
+    private func lineString(_ line: [Character]) -> String {
+        String(line).trimmingTrailingSpaces()
+    }
+
+    private static func makeBlankScreen(cols: Int, rows: Int) -> [[Character]] {
+        Array(repeating: Array(repeating: " ", count: max(1, cols)), count: max(1, rows))
     }
 
     private enum ParseMode {
@@ -318,7 +407,7 @@ final class NativeTerminalClient {
         let nextRows = max(6, rows)
         self.cols = nextCols
         self.rows = nextRows
-        buffer.resize(cols: nextCols)
+        buffer.resize(cols: nextCols, rows: nextRows)
         sendEnvelope(["type": "resize", "cols": nextCols, "rows": nextRows])
     }
 

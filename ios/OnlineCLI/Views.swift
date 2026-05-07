@@ -211,77 +211,91 @@ struct RemoteDesktopView: View {
     @State private var panMode = false
     @State private var joystickSensitivity = 1.0
     @State private var keyboardText = ""
+    @State private var controlsCollapsed = false
+    @State private var controlsOffset = CGSize.zero
     @FocusState private var keyboardFocused: Bool
 
     var body: some View {
         NavigationStack {
-            ZStack {
-                Color.black.ignoresSafeArea()
+            GeometryReader { proxy in
+                let isLandscape = proxy.size.width > proxy.size.height
 
-                RemoteStageView(
-                    image: client.frameImage,
-                    zoom: zoom,
-                    panOffset: panOffset,
-                    panMode: panMode,
-                    remoteCursor: client.remoteCursor,
-                    onPointerMove: { client.sendPointerMove($0) },
-                    onClick: { point in client.sendClick(at: point) },
-                    onPan: { delta in panOffset.width += delta.width; panOffset.height += delta.height }
-                )
-                .ignoresSafeArea(edges: .bottom)
+                ZStack {
+                    Color.black.ignoresSafeArea()
 
-                VStack(spacing: 0) {
-                    RemoteTopOverlay(
-                        state: client.connectionState,
-                        status: client.statusText,
-                        fps: client.frameFps,
-                        latency: client.frameLatencyMs,
-                        frameBytes: client.frameBytes,
-                        displayInfo: client.displayInfo,
-                        mode: $desiredMode,
-                        profile: $streamProfile,
-                        panMode: $panMode,
-                        onConnect: connect,
-                        onDisconnect: client.disconnect,
-                        onModeChange: { mode in
-                            desiredMode = mode
-                            client.setMode(mode)
-                        },
-                        onProfileChange: { profile in
-                            streamProfile = profile
-                            app.settings.remoteStreamProfile = profile
-                            client.setStreamProfile(profile)
-                        }
+                    RemoteStageView(
+                        image: client.frameImage,
+                        zoom: zoom,
+                        panOffset: panOffset,
+                        panMode: panMode,
+                        remoteCursor: client.remoteCursor,
+                        onPointerMove: { client.sendPointerMove($0) },
+                        onClick: { point in client.sendClick(at: point) },
+                        onPan: { delta in panOffset.width += delta.width; panOffset.height += delta.height }
                     )
-                    .padding(.horizontal, 12)
-                    .padding(.top, 8)
+                    .ignoresSafeArea(edges: .bottom)
 
-                    Spacer()
+                    VStack(spacing: 0) {
+                        HStack {
+                            RemoteTopOverlay(
+                                state: client.connectionState,
+                                status: client.statusText,
+                                fps: client.frameFps,
+                                latency: client.frameLatencyMs,
+                                frameBytes: client.frameBytes,
+                                displayInfo: client.displayInfo,
+                                mode: $desiredMode,
+                                profile: $streamProfile,
+                                panMode: $panMode,
+                                compact: isLandscape,
+                                onConnect: connect,
+                                onDisconnect: client.disconnect,
+                                onModeChange: { mode in
+                                    desiredMode = mode
+                                    client.setMode(mode)
+                                },
+                                onProfileChange: { profile in
+                                    streamProfile = profile
+                                    app.settings.remoteStreamProfile = profile
+                                    client.setStreamProfile(profile)
+                                }
+                            )
+                            .frame(maxWidth: isLandscape ? min(560, proxy.size.width * 0.64) : .infinity)
+                            Spacer(minLength: 0)
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.top, 8)
 
-                    RemoteControlDeck(
+                        Spacer()
+                    }
+
+                    FloatingRemoteControls(
                         client: client,
                         zoom: $zoom,
                         panOffset: $panOffset,
                         joystickSensitivity: $joystickSensitivity,
+                        isCollapsed: $controlsCollapsed,
+                        offset: $controlsOffset,
+                        containerSize: proxy.size,
+                        compact: isLandscape,
                         diagnosticsText: diagnosticsText,
                         actions: app.remoteCapabilities?.actions ?? [],
                         keyboardFocused: $keyboardFocused
                     )
-                    .padding(.horizontal, 12)
-                    .padding(.bottom, 10)
-                }
+                    .padding(12)
 
-                TextField("", text: $keyboardText)
-                    .focused($keyboardFocused)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .frame(width: 1, height: 1)
-                    .opacity(0.01)
-                    .onChange(of: keyboardText) { _, newValue in
-                        guard !newValue.isEmpty else { return }
-                        client.sendText(newValue)
-                        keyboardText = ""
-                    }
+                    TextField("", text: $keyboardText)
+                        .focused($keyboardFocused)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .frame(width: 1, height: 1)
+                        .opacity(0.01)
+                        .onChange(of: keyboardText) { _, newValue in
+                            guard !newValue.isEmpty else { return }
+                            client.sendText(newValue)
+                            keyboardText = ""
+                        }
+                }
             }
             .navigationTitle("Remote")
             .navigationBarTitleDisplayMode(.inline)
@@ -440,67 +454,124 @@ struct RemoteTopOverlay: View {
     @Binding var mode: RemoteMode
     @Binding var profile: RemoteStreamProfile
     @Binding var panMode: Bool
+    let compact: Bool
     let onConnect: () -> Void
     let onDisconnect: () -> Void
     let onModeChange: (RemoteMode) -> Void
     let onProfileChange: (RemoteStreamProfile) -> Void
 
     var body: some View {
-        VStack(spacing: 10) {
-            HStack(spacing: 10) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(state.title)
-                        .font(.headline)
-                    Text(statusLine)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                Spacer()
-
-                Button {
-                    if case .connected = state {
-                        onDisconnect()
-                    } else {
-                        onConnect()
-                    }
-                } label: {
-                    Image(systemName: isConnected ? "stop.fill" : "play.fill")
-                        .frame(width: 34, height: 34)
-                }
-                .nativeGlass(cornerRadius: 17, interactive: true)
-            }
-
-            HStack(spacing: 10) {
-                Picker("Mode", selection: $mode) {
-                    ForEach(RemoteMode.allCases) { mode in
-                        Text(mode.title).tag(mode)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .onChange(of: mode) { _, newMode in
-                    onModeChange(newMode)
-                }
-
-                Picker("Stream", selection: $profile) {
-                    ForEach(RemoteStreamProfile.allCases) { profile in
-                        Label(profile.title, systemImage: profile.systemImage).tag(profile)
-                    }
-                }
-                .pickerStyle(.menu)
-                .onChange(of: profile) { _, newProfile in
-                    onProfileChange(newProfile)
-                }
-
-                Toggle(isOn: $panMode) {
-                    Image(systemName: "hand.draw")
-                }
-                .toggleStyle(.button)
-                .labelStyle(.iconOnly)
+        Group {
+            if compact {
+                compactBody
+            } else {
+                regularBody
             }
         }
-        .padding(12)
-        .nativeGlass(cornerRadius: 24)
+        .padding(compact ? 10 : 12)
+        .nativeGlass(cornerRadius: compact ? 18 : 24)
+    }
+
+    private var regularBody: some View {
+        VStack(spacing: 10) {
+            headerRow
+
+            HStack(spacing: 10) {
+                modePicker
+                    .pickerStyle(.segmented)
+
+                streamPicker
+                    .pickerStyle(.menu)
+
+                panToggle
+            }
+        }
+    }
+
+    private var compactBody: some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(state.title)
+                    .font(.subheadline.weight(.semibold))
+                Text(compactStatusLine)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 4)
+
+            modePicker
+                .pickerStyle(.menu)
+                .frame(width: 92)
+
+            streamPicker
+                .pickerStyle(.menu)
+                .frame(width: 42)
+                .labelsHidden()
+
+            panToggle
+            connectButton
+        }
+    }
+
+    private var headerRow: some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(state.title)
+                    .font(.headline)
+                Text(statusLine)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+            connectButton
+        }
+    }
+
+    private var connectButton: some View {
+        Button {
+            if case .connected = state {
+                onDisconnect()
+            } else {
+                onConnect()
+            }
+        } label: {
+            Image(systemName: isConnected ? "stop.fill" : "play.fill")
+                .frame(width: 34, height: 34)
+        }
+        .nativeGlass(cornerRadius: 17, interactive: true)
+    }
+
+    private var modePicker: some View {
+        Picker("Mode", selection: $mode) {
+            ForEach(RemoteMode.allCases) { mode in
+                Text(mode.title).tag(mode)
+            }
+        }
+        .onChange(of: mode) { _, newMode in
+            onModeChange(newMode)
+        }
+    }
+
+    private var streamPicker: some View {
+        Picker("Stream", selection: $profile) {
+            ForEach(RemoteStreamProfile.allCases) { profile in
+                Label(profile.title, systemImage: profile.systemImage).tag(profile)
+            }
+        }
+        .onChange(of: profile) { _, newProfile in
+            onProfileChange(newProfile)
+        }
+    }
+
+    private var panToggle: some View {
+        Toggle(isOn: $panMode) {
+            Image(systemName: "hand.draw")
+        }
+        .toggleStyle(.button)
+        .labelStyle(.iconOnly)
     }
 
     private var isConnected: Bool {
@@ -519,6 +590,134 @@ struct RemoteTopOverlay: View {
         let bytesText = frameBytes > 0 ? " • \(ByteCountFormatter.string(fromByteCount: Int64(frameBytes), countStyle: .file))" : ""
         return "\(status) • \(String(format: "%.1f", fps)) fps\(latencyText)\(sizeText)\(bytesText)"
     }
+
+    private var compactStatusLine: String {
+        let latencyText = latency.map { " • \(Int($0)) ms" } ?? ""
+        return "\(String(format: "%.1f", fps)) fps\(latencyText)"
+    }
+}
+
+struct FloatingRemoteControls: View {
+    let client: RemoteDesktopClient
+    @Binding var zoom: Double
+    @Binding var panOffset: CGSize
+    @Binding var joystickSensitivity: Double
+    @Binding var isCollapsed: Bool
+    @Binding var offset: CGSize
+    let containerSize: CGSize
+    let compact: Bool
+    let diagnosticsText: String
+    let actions: [RemoteActionDescriptor]
+    var keyboardFocused: FocusState<Bool>.Binding
+
+    @GestureState private var dragTranslation = CGSize.zero
+
+    var body: some View {
+        VStack {
+            Spacer()
+            HStack {
+                Spacer()
+
+                Group {
+                    if isCollapsed {
+                        collapsedButton
+                    } else {
+                        expandedPanel
+                    }
+                }
+                .frame(maxWidth: panelWidth)
+                .offset(x: offset.width + dragTranslation.width, y: offset.height + dragTranslation.height)
+            }
+        }
+    }
+
+    private var expandedPanel: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 8) {
+                Capsule()
+                    .fill(.secondary.opacity(0.35))
+                    .frame(width: 36, height: 5)
+
+                Text("Controls")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+
+                Button {
+                    withAnimation(.spring(response: 0.24, dampingFraction: 0.82)) {
+                        isCollapsed = true
+                    }
+                } label: {
+                    Image(systemName: "chevron.down")
+                        .frame(width: 30, height: 30)
+                }
+                .buttonStyle(.plain)
+            }
+            .contentShape(Rectangle())
+            .gesture(dragGesture)
+
+            RemoteControlDeck(
+                client: client,
+                zoom: $zoom,
+                panOffset: $panOffset,
+                joystickSensitivity: $joystickSensitivity,
+                diagnosticsText: diagnosticsText,
+                actions: actions,
+                keyboardFocused: keyboardFocused,
+                compact: compact
+            )
+        }
+        .padding(12)
+        .nativeGlass(cornerRadius: 22)
+    }
+
+    private var collapsedButton: some View {
+        Button {
+            withAnimation(.spring(response: 0.24, dampingFraction: 0.82)) {
+                isCollapsed = false
+            }
+        } label: {
+            Label("Controls", systemImage: "slider.horizontal.3")
+                .labelStyle(.iconOnly)
+                .frame(width: 48, height: 48)
+        }
+        .buttonStyle(.plain)
+        .nativeGlass(cornerRadius: 24, interactive: true)
+        .simultaneousGesture(dragGesture)
+        .accessibilityLabel("Show remote controls")
+    }
+
+    private var dragGesture: some Gesture {
+        DragGesture()
+            .updating($dragTranslation) { value, state, _ in
+                state = value.translation
+            }
+            .onEnded { value in
+                offset = clamped(
+                    CGSize(
+                        width: offset.width + value.translation.width,
+                        height: offset.height + value.translation.height
+                    )
+                )
+            }
+    }
+
+    private var panelWidth: CGFloat {
+        if isCollapsed {
+            return 56
+        }
+        return compact ? min(430, containerSize.width * 0.54) : min(620, containerSize.width - 24)
+    }
+
+    private func clamped(_ value: CGSize) -> CGSize {
+        let horizontalLimit = max(0, (containerSize.width - panelWidth) / 2)
+        let verticalLimit = max(0, (containerSize.height - 80) / 2)
+        return CGSize(
+            width: min(horizontalLimit, max(-horizontalLimit, value.width)),
+            height: min(verticalLimit, max(-verticalLimit, value.height))
+        )
+    }
 }
 
 struct RemoteControlDeck: View {
@@ -529,8 +728,17 @@ struct RemoteControlDeck: View {
     let diagnosticsText: String
     let actions: [RemoteActionDescriptor]
     var keyboardFocused: FocusState<Bool>.Binding
+    let compact: Bool
 
     var body: some View {
+        if compact {
+            compactBody
+        } else {
+            regularBody
+        }
+    }
+
+    private var regularBody: some View {
         VStack(spacing: 12) {
             HStack {
                 Label(diagnosticsText, systemImage: "waveform.path.ecg")
@@ -603,8 +811,59 @@ struct RemoteControlDeck: View {
                 }
             }
         }
-        .padding(12)
-        .nativeGlass(cornerRadius: 26)
+    }
+
+    private var compactBody: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 8) {
+                Label(diagnosticsText, systemImage: "waveform.path.ecg")
+                    .font(.caption2.weight(.semibold))
+                    .lineLimit(1)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                RemoteShortcutMenu(client: client, actions: actions)
+            }
+
+            HStack(alignment: .center, spacing: 12) {
+                RemoteJoystick(diameter: 84) { dx, dy in
+                    client.nudgePointer(dx: dx * joystickSensitivity, dy: dy * joystickSensitivity)
+                }
+
+                VStack(spacing: 8) {
+                    HStack(spacing: 8) {
+                        RemoteIconButton("minus.magnifyingglass") { zoom = max(1, zoom - 0.25) }
+                        RemoteIconButton("plus.magnifyingglass") { zoom = min(3.5, zoom + 0.25) }
+                        RemoteIconButton("scope") {
+                            zoom = 1
+                            panOffset = .zero
+                        }
+                        RemoteIconButton("keyboard") { keyboardFocused.wrappedValue = true }
+                        RemoteIconButton("xmark.circle") { client.sendKey("Escape", code: "Escape") }
+                    }
+
+                    HStack(spacing: 8) {
+                        Button("Left") { client.sendClick(button: "left") }
+                        Button("Right") { client.sendClick(button: "right") }
+                        Button("Double") { client.sendDoubleClick() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .font(.caption2.weight(.semibold))
+
+                    HStack(spacing: 8) {
+                        RemoteIconButton("arrow.up") { client.sendKey("ArrowUp", code: "ArrowUp") }
+                        RemoteIconButton("arrow.down") { client.sendKey("ArrowDown", code: "ArrowDown") }
+                        RemoteIconButton("arrow.left") { client.sendKey("ArrowLeft", code: "ArrowLeft") }
+                        RemoteIconButton("arrow.right") { client.sendKey("ArrowRight", code: "ArrowRight") }
+                    }
+
+                    HStack(spacing: 8) {
+                        Image(systemName: "speedometer")
+                            .foregroundStyle(.secondary)
+                        Slider(value: $joystickSensitivity, in: 0.45...1.8)
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -665,6 +924,7 @@ struct RemoteShortcutMenu: View {
 }
 
 struct RemoteJoystick: View {
+    var diameter: CGFloat = 108
     let onNudge: (CGFloat, CGFloat) -> Void
     @State private var knobOffset = CGSize.zero
 
@@ -672,17 +932,17 @@ struct RemoteJoystick: View {
         ZStack {
             Circle()
                 .fill(.secondary.opacity(0.18))
-                .frame(width: 108, height: 108)
+                .frame(width: diameter, height: diameter)
             Circle()
                 .fill(.primary.opacity(0.20))
-                .frame(width: 42, height: 42)
+                .frame(width: diameter * 0.39, height: diameter * 0.39)
                 .offset(knobOffset)
         }
         .contentShape(Circle())
         .gesture(
             DragGesture(minimumDistance: 0)
                 .onChanged { value in
-                    let radius: CGFloat = 42
+                    let radius: CGFloat = diameter * 0.39
                     let dx = min(radius, max(-radius, value.translation.width))
                     let dy = min(radius, max(-radius, value.translation.height))
                     knobOffset = CGSize(width: dx, height: dy)

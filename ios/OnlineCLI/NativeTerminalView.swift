@@ -5,48 +5,19 @@ struct NativeTerminalView: View {
     let client: NativeTerminalClient
     @State private var focusToken = 0
     @State private var dismissKeyboardToken = 0
-    @State private var historyDrag = 0.0
     @State private var autoScroll = true
 
     var body: some View {
-        VStack(spacing: 0) {
-            TerminalSurface(
-                text: client.buffer.displayText,
-                statusText: client.statusText,
-                focusToken: $focusToken,
-                dismissKeyboardToken: $dismissKeyboardToken,
-                autoScroll: $autoScroll,
-                onInput: client.sendInput,
-                onResize: client.sendResize(cols:rows:)
-            )
-            .overlay(alignment: .topTrailing) {
-                TerminalLiveBadge(client: client)
-                    .padding(10)
-            }
-
-            TerminalControlBar(
-                historyDrag: $historyDrag,
-                autoScroll: $autoScroll,
-                onFocus: { focusToken += 1 },
-                onDismissKeyboard: { dismissKeyboardToken += 1 },
-                onPaste: pasteClipboard,
-                onCopy: copyTerminalOutput,
-                onKey: client.sendKey(_:),
-                onHistoryScroll: { lines in
-                    Task { await client.scrollServerHistory(lines: lines) }
-                }
-            )
-        }
+        TerminalSurface(
+            text: client.buffer.displayText,
+            statusText: client.statusText,
+            focusToken: $focusToken,
+            dismissKeyboardToken: $dismissKeyboardToken,
+            autoScroll: $autoScroll,
+            onInput: client.sendInput,
+            onResize: client.sendResize(cols:rows:)
+        )
         .background(Color(red: 0.03, green: 0.04, blue: 0.06))
-    }
-
-    private func pasteClipboard() {
-        guard let text = UIPasteboard.general.string, !text.isEmpty else { return }
-        client.sendInput(text.replacingOccurrences(of: "\n", with: "\r"))
-    }
-
-    private func copyTerminalOutput() {
-        UIPasteboard.general.string = client.buffer.displayText
     }
 }
 
@@ -98,92 +69,9 @@ private struct TerminalSurface: View {
     private func resize(for size: CGSize) {
         let characterWidth = max(6, "W".size(withAttributes: [.font: font]).width)
         let lineHeight = max(12, font.lineHeight)
-        let cols = max(24, Int((size.width - 24) / characterWidth))
-        let rows = max(8, Int((size.height - 64) / lineHeight))
+        let cols = max(24, Int((size.width - 20) / characterWidth))
+        let rows = max(8, Int((size.height - 20) / lineHeight))
         onResize(cols, rows)
-    }
-}
-
-private struct TerminalControlBar: View {
-    @Binding var historyDrag: Double
-    @Binding var autoScroll: Bool
-    let onFocus: () -> Void
-    let onDismissKeyboard: () -> Void
-    let onPaste: () -> Void
-    let onCopy: () -> Void
-    let onKey: (TerminalKey) -> Void
-    let onHistoryScroll: (Int) -> Void
-
-    var body: some View {
-        VStack(spacing: 8) {
-            HStack(spacing: 10) {
-                Image(systemName: "text.line.first.and.arrowtriangle.forward")
-                    .foregroundStyle(.secondary)
-                Slider(
-                    value: $historyDrag,
-                    in: -1...1,
-                    onEditingChanged: { editing in
-                        if !editing {
-                            historyDrag = 0
-                        }
-                    }
-                )
-                    .onChange(of: historyDrag) { _, value in
-                        guard abs(value) > 0.08 else { return }
-                        let lines = Int((value * 90).rounded())
-                        onHistoryScroll(lines)
-                    }
-                Toggle(isOn: $autoScroll) {
-                    Image(systemName: "arrow.down.to.line.compact")
-                }
-                .toggleStyle(.button)
-                .labelStyle(.iconOnly)
-                .accessibilityLabel("Auto scroll")
-            }
-
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    TerminalIconButton(systemImage: "keyboard", action: onFocus)
-                    TerminalIconButton(systemImage: "keyboard.chevron.compact.down", action: onDismissKeyboard)
-                    TerminalIconButton(systemImage: "doc.on.clipboard", action: onPaste)
-                    TerminalIconButton(systemImage: "doc.on.doc", action: onCopy)
-                    Divider().frame(height: 28)
-                    TerminalKeyButton(key: .escape, onKey: onKey)
-                    TerminalKeyButton(key: .tab, onKey: onKey)
-                    TerminalKeyButton(key: .controlC, onKey: onKey)
-                    TerminalKeyButton(key: .controlD, onKey: onKey)
-                    TerminalKeyButton(key: .controlL, onKey: onKey)
-                    TerminalKeyButton(key: .arrowLeft, onKey: onKey)
-                    TerminalKeyButton(key: .arrowRight, onKey: onKey)
-                    TerminalKeyButton(key: .arrowUp, onKey: onKey)
-                    TerminalKeyButton(key: .arrowDown, onKey: onKey)
-                    TerminalKeyButton(key: .pageUp, onKey: onKey)
-                    TerminalKeyButton(key: .pageDown, onKey: onKey)
-                    TerminalKeyButton(key: .enter, onKey: onKey)
-                }
-                .padding(.horizontal, 12)
-            }
-        }
-        .padding(.vertical, 10)
-        .background(.bar)
-    }
-}
-
-private struct TerminalLiveBadge: View {
-    let client: NativeTerminalClient
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(client.connectionState.isConnected ? Color.green : Color.orange)
-                .frame(width: 7, height: 7)
-            Text("\(client.terminalProfile.title) \(client.cols)x\(client.rows)")
-                .font(.caption2.monospacedDigit().weight(.semibold))
-        }
-        .foregroundStyle(.white.opacity(0.86))
-        .padding(.horizontal, 9)
-        .padding(.vertical, 6)
-        .background(.black.opacity(0.54), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }
 
@@ -196,11 +84,11 @@ private struct TerminalTextSurface: UIViewRepresentable {
     func makeUIView(context: Context) -> UITextView {
         let textView = UITextView()
         textView.isEditable = false
-        textView.isSelectable = true
         textView.backgroundColor = UIColor(red: 0.03, green: 0.04, blue: 0.06, alpha: 1)
         textView.textColor = UIColor(red: 0.86, green: 0.89, blue: 0.93, alpha: 1)
         textView.font = font
-        textView.textContainerInset = UIEdgeInsets(top: 44, left: 12, bottom: 18, right: 12)
+        textView.isSelectable = false
+        textView.textContainerInset = UIEdgeInsets(top: 10, left: 10, bottom: 10, right: 10)
         textView.textContainer.lineFragmentPadding = 0
         textView.alwaysBounceVertical = true
         textView.keyboardDismissMode = .interactive
@@ -222,8 +110,8 @@ private struct TerminalTextSurface: UIViewRepresentable {
         if textView.text != text {
             textView.text = text
             if autoScroll {
-                let end = NSRange(location: max(0, (text as NSString).length - 1), length: 1)
-                textView.scrollRangeToVisible(end)
+                let maxOffset = max(0, textView.contentSize.height - textView.bounds.height + textView.adjustedContentInset.bottom)
+                textView.setContentOffset(CGPoint(x: 0, y: maxOffset), animated: false)
             }
         }
     }
@@ -242,39 +130,6 @@ private struct TerminalTextSurface: UIViewRepresentable {
         @objc func handleTap() {
             onTap()
         }
-    }
-}
-
-private struct TerminalIconButton: View {
-    let systemImage: String
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            Image(systemName: systemImage)
-                .frame(width: 34, height: 34)
-        }
-        .buttonStyle(.plain)
-        .nativeGlass(cornerRadius: 8, interactive: true)
-    }
-}
-
-private struct TerminalKeyButton: View {
-    let key: TerminalKey
-    let onKey: (TerminalKey) -> Void
-
-    var body: some View {
-        Button {
-            onKey(key)
-        } label: {
-            Text(key.title)
-                .font(.caption.weight(.semibold))
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
-                .frame(minWidth: 42, minHeight: 34)
-        }
-        .buttonStyle(.plain)
-        .nativeGlass(cornerRadius: 8, interactive: true)
     }
 }
 
@@ -326,6 +181,7 @@ struct TerminalInputCapture: UIViewRepresentable {
             let toolbar = UIToolbar()
             toolbar.sizeToFit()
             toolbar.items = [
+                UIBarButtonItem(title: "Paste", style: .plain, target: self, action: #selector(sendPaste)),
                 UIBarButtonItem(title: "Esc", style: .plain, target: self, action: #selector(sendEscape)),
                 UIBarButtonItem(title: "Tab", style: .plain, target: self, action: #selector(sendTab)),
                 UIBarButtonItem(title: "Ctrl-C", style: .plain, target: self, action: #selector(sendControlC)),
@@ -384,6 +240,10 @@ struct TerminalInputCapture: UIViewRepresentable {
         @objc private func sendEscape() { onInput?(TerminalKey.escape.sequence) }
         @objc private func sendTab() { onInput?(TerminalKey.tab.sequence) }
         @objc private func sendControlC() { onInput?(TerminalKey.controlC.sequence) }
+        @objc private func sendPaste() {
+            guard let text = UIPasteboard.general.string, !text.isEmpty else { return }
+            onInput?(text.replacingOccurrences(of: "\n", with: "\r"))
+        }
         @objc private func dismissKeyboard() { resignFirstResponder() }
     }
 }
