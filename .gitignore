@@ -19,5 +19,11 @@ pnpm-debug.log*
 Thumbs.db
 .idea/
 
+# Swift/Xcode generated state
+.build/
+*.xcuserstate
+xcuserdata/
+**/*.xcodeproj/project.xcworkspace/
+
 # Local installer artifacts
 JournalTradeSecureSetup_*.exe
