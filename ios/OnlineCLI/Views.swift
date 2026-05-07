@@ -30,7 +30,6 @@ struct RootView: View {
 struct ConsoleTabView: View {
     @Environment(AppModel.self) private var app
     @State private var client = NativeTerminalClient()
-    @State private var selectedProfile: TerminalProfile = .powershell
     @State private var fullScreen = false
 
     var body: some View {
@@ -40,14 +39,12 @@ struct ConsoleTabView: View {
                     VStack(spacing: 0) {
                         if !fullScreen {
                             TerminalSessionController(
-                                selectedProfile: $selectedProfile,
                                 onReconnect: connectActiveTerminal
                             )
                         }
 
                         if app.activeTerminalSession != nil {
                             NativeTerminalView(client: client)
-                                .ignoresSafeArea(.keyboard, edges: .bottom)
                         } else {
                             ContentUnavailableView(
                                 "Create a terminal",
@@ -88,7 +85,6 @@ struct ConsoleTabView: View {
                 }
             }
             .task {
-                selectedProfile = app.settings.defaultTerminalProfile
                 await app.refreshSessions()
                 connectActiveTerminal()
             }
@@ -113,58 +109,47 @@ struct ConsoleTabView: View {
 
 struct TerminalSessionController: View {
     @Environment(AppModel.self) private var app
-    @Binding var selectedProfile: TerminalProfile
     let onReconnect: () -> Void
 
     var body: some View {
         VStack(spacing: 10) {
-            HStack(spacing: 10) {
-                Menu {
-                    ForEach(app.sessions) { session in
-                        Button {
-                            app.selectTerminalSession(session.id)
-                            onReconnect()
-                        } label: {
-                            Label(session.displayName, systemImage: session.effectiveProfile.systemImage)
-                        }
+            Menu {
+                ForEach(app.sessions) { session in
+                    Button {
+                        app.selectTerminalSession(session.id)
+                        onReconnect()
+                    } label: {
+                        Label(session.displayName, systemImage: "terminal")
                     }
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: app.activeTerminalSession?.effectiveProfile.systemImage ?? "terminal")
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(app.activeTerminalSession?.displayName ?? "No terminal")
-                                .font(.subheadline.weight(.semibold))
-                            Text(activeTerminalDetail)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        Image(systemName: "chevron.up.chevron.down")
-                            .font(.caption2.weight(.bold))
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "terminal")
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(app.activeTerminalSession?.displayName ?? "No terminal")
+                            .font(.subheadline.weight(.semibold))
+                        Text(activeTerminalDetail)
+                            .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
-                    .nativeGlass(cornerRadius: 8, interactive: true)
+                    Spacer()
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.secondary)
                 }
-
-                Picker("Terminal profile", selection: $selectedProfile) {
-                    ForEach(app.availableTerminalProfiles) { profile in
-                        Label(profile.title, systemImage: profile.systemImage).tag(profile)
-                    }
-                }
-                .pickerStyle(.menu)
-                .frame(maxWidth: 150)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .nativeGlass(cornerRadius: 8, interactive: true)
             }
 
             HStack(spacing: 8) {
                 Button {
                     Task {
-                        await app.createSession(profile: selectedProfile)
+                        await app.createSession(profile: .powershell)
                         onReconnect()
                     }
                 } label: {
-                    Label("New \(selectedProfile.title)", systemImage: "plus")
+                    Label("New PowerShell", systemImage: "plus")
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(app.api == nil)
@@ -1488,7 +1473,6 @@ func formatDuration(_ milliseconds: Int) -> String {
 struct SettingsView: View {
     @Environment(AppModel.self) private var app
     @State private var draftURL = ""
-    @State private var draftTerminalProfile: TerminalProfile = .powershell
     @State private var draftRemoteMode: RemoteMode = .view
     @State private var draftStreamProfile: RemoteStreamProfile = .balanced
     @State private var preferNativeRemote = true
@@ -1508,17 +1492,6 @@ struct SettingsView: View {
                     }
 
                     LabeledContent("Status", value: app.connectionMessage)
-                }
-
-                Section("Console") {
-                    Picker("New Terminal Default", selection: $draftTerminalProfile) {
-                        ForEach(app.availableTerminalProfiles) { profile in
-                            Label(profile.title, systemImage: profile.systemImage).tag(profile)
-                        }
-                    }
-                    .onChange(of: draftTerminalProfile) { _, newValue in
-                        app.settings.defaultTerminalProfile = newValue
-                    }
                 }
 
                 Section("Remote") {
@@ -1564,7 +1537,6 @@ struct SettingsView: View {
             .navigationTitle("Settings")
             .onAppear {
                 draftURL = app.settings.baseURLString
-                draftTerminalProfile = app.settings.defaultTerminalProfile
                 draftRemoteMode = app.settings.defaultRemoteMode
                 draftStreamProfile = app.settings.remoteStreamProfile
                 preferNativeRemote = app.settings.preferNativeRemote

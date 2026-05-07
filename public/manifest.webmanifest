@@ -1,5 +1,5 @@
 {
-  "name": "Local Codex WSL Console",
+  "name": "Local Codex PowerShell Console",
   "short_name": "Online CLI",
   "description": "Terminal and remote desktop control interface.",
   "start_url": "/",

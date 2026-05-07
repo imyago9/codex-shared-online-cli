@@ -16,7 +16,7 @@ This guide keeps the app private inside your tailnet while enabling terminal + r
 
 ## 2) Start the app
 
-On the host, run the app (WSL or Windows, based on your setup):
+On the Windows host, run the app:
 ```bash
 npm start
 ```

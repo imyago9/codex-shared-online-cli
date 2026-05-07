@@ -1,16 +1,15 @@
 # Local Codex Native Console
 
-A Tailscale-first console for PowerShell and WSL terminals, Codex thread browsing, native iOS control surfaces, and optional remote desktop streaming.
+A Tailscale-first console for native PowerShell terminals, Codex thread browsing, native iOS control surfaces, and optional remote desktop streaming.
 
 ## What is included
-- PowerShell is the default terminal profile on Windows
-- WSL remains available per terminal session with the existing tmux-backed attach/detach semantics
-- Direct persistent PTY sessions for PowerShell and other host shells
-- Multi-session mode by default: each terminal is an independent console with its own selected profile
+- Native PowerShell is the terminal runtime on Windows
+- Direct persistent PTY sessions for PowerShell
+- Multi-session mode by default: each terminal is an independent PowerShell console
 - REST API for session lifecycle (`/api/sessions`)
 - Device-wide Codex thread index + one-click resume into terminal sessions
   - Resume safety: sessions are marked resumable using local `~/.codex/history.jsonl`
-  - WSL-only source selection to avoid Windows store resume mismatches
+  - Native PowerShell resume commands with Windows path normalization
   - Duplicate session ids across stores are deduped before serving API results
   - Metrics now expose `metricsQuality` (`complete|partial|estimated`) and both `activeDurationMs` + `elapsedDurationMs`
 - Session-scoped WebSocket streaming (`/ws?sessionId=...`)
@@ -21,7 +20,7 @@ A Tailscale-first console for PowerShell and WSL terminals, Codex thread browsin
 - Native iOS console, Codex Threads, metrics dashboard, stream presets, remote cursor relay, live gateway stats, and desktop shortcut actions
 - Idle session cleanup + max session guardrails
 - Graceful shutdown persistence:
-  - Server shutdown detaches web clients; WSL tmux sessions survive while direct PTY sessions are recreated from saved metadata
+  - Server shutdown detaches web clients; direct PTY sessions are recreated from saved metadata
   - Active sessions are saved and restored on next server start
 - Structured server modules (`src/config`, `src/http`, `src/sessions`, `src/ws`, `src/codex`)
 - iOS touch scroll stability update in the frontend (no private xterm monkey-patching)
@@ -51,10 +50,9 @@ A Tailscale-first console for PowerShell and WSL terminals, Codex thread browsin
 ![Calendar and metrics on desktop](docs/screenshots/image-7.jpg)
 
 ## Requirements
-- Windows with PowerShell available; WSL is optional but required for WSL terminal sessions
+- Windows with PowerShell available
 - Node.js 18+
 - Tailscale installed, signed in, and running on the host
-- `tmux` installed inside WSL when you use WSL terminal sessions
 
 ## Run
 From the project root on the host where the `tailscale` CLI is available:
@@ -87,7 +85,7 @@ Tailscale is required. Startup fails if `tailscale status --json` cannot prove t
 HTTP and WebSocket requests are accepted only when they arrive through Tailscale Serve identity headers or from Tailscale source ranges (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`). Local browser requests to `localhost` are blocked.
 
 ## Native iOS App
-The SwiftUI iPhone app lives in `ios/OnlineCLI.xcodeproj`. The Console tab is native SwiftUI/UIKit and talks directly to `/ws?sessionId=...`; it no longer embeds the browser console. It supports PowerShell and WSL terminal creation, hardware/software keyboard input, resize messages, scrollback, paste/copy, and terminal control keys.
+The SwiftUI iPhone app lives in `ios/OnlineCLI.xcodeproj`. The Console tab is native SwiftUI/UIKit and talks directly to `/ws?sessionId=...`; it no longer embeds the browser console. It supports native PowerShell terminal creation, hardware/software keyboard input, resize messages, scrollback, paste/copy, and terminal control keys.
 
 The old Sessions tab is now Threads. Terminal sessions are managed from Console; Codex threads are indexed and resumed from Threads or Metrics.
 
@@ -130,13 +128,13 @@ npm install
 npm start
 ```
 2. Open the printed `https://<node>.<tailnet>.ts.net` URL on desktop or iPhone while Tailscale is connected.
-3. Create/select a session in each web client using the session picker.
-4. Click `Copy Attach Cmd` for the selected session and run it in a local terminal to attach to that exact session.
+3. Create/select a PowerShell session in each web client using the session picker.
+4. Open the same session from another client to mirror the live console over WebSocket.
 
 ## Multi-Session Mirror Workflow (Web + Local)
 - Keep `SINGLE_CONSOLE_MODE=false` (default).
-- Use `New PowerShell` or `New WSL` to create separate terminal sessions.
-- For WSL tmux sessions, run the selected session's `Copy Attach Cmd` in a desktop terminal when you want a local mirror. Direct PowerShell sessions are managed through the app/web socket.
+- Use `New PowerShell` to create separate terminal sessions.
+- PowerShell sessions are managed through the app/web socket and can be mirrored by selecting the same session from another client.
 - On iPhone, choose the matching terminal in the Console controller to mirror that same console.
 
 ## Private Remote Access Over Tailscale
@@ -149,7 +147,7 @@ npm start
 ```
 
 ## Troubleshooting
-- If startup fails with `@lydell/node-pty ... could not find the binary package`, reinstall dependencies in the same environment where you run the server (for example inside WSL):
+- If startup fails with `@lydell/node-pty ... could not find the binary package`, reinstall dependencies in the same environment where you run the server:
 ```bash
 rm -rf node_modules package-lock.json
 npm install
@@ -158,10 +156,10 @@ npm install
 ## API
 - `GET /api/health`
 - `GET /api/sessions`
-  - Response includes `singleConsoleMode`, `defaultTerminalProfile`, and `terminalProfiles`; each terminal snapshot includes `terminalProfile`, `backend`, and WSL-only `localAttachCommand`
+  - Response includes `singleConsoleMode`, `defaultTerminalProfile`, and `terminalProfiles`; each terminal snapshot includes `terminalProfile` and `backend`
 - `GET /api/sessions/:sessionId`
 - `POST /api/sessions`
-  - Optional body: `{ "terminalProfile": "powershell" | "wsl" }`
+  - Optional body: `{ "terminalProfile": "powershell" }`
 - `POST /api/sessions/:sessionId/restart`
 - `DELETE /api/sessions/:sessionId`
 - `POST /api/sessions/:sessionId/command`
@@ -191,18 +189,9 @@ npm install
 - `SESSION_SWEEP_INTERVAL_MS` (default: `60000`)
 - `DEFAULT_COLS` (default: `120`)
 - `DEFAULT_ROWS` (default: `30`)
-- `DEFAULT_TERMINAL_PROFILE` (`powershell|wsl|system`; default on Windows: `powershell`)
 - `POWERSHELL_COMMAND` (default on Windows: `powershell.exe`, elsewhere: `pwsh`)
 - `POWERSHELL_ARGS` (default: `-NoLogo`)
-- `WSL_COMMAND` (default: `wsl.exe`)
-- `WSL_ARGS` (optional args before `-e tmux`)
-- `PTY_COMMAND` (fallback system shell override)
-- `PTY_ARGS` (space-delimited args)
 - `PTY_CWD` (working directory for new sessions)
-- `TMUX_COMMAND` (default: `tmux`)
-- `TMUX_ARGS` (optional args for `TMUX_COMMAND`; when running Node on Windows, default behavior is equivalent to `TMUX_COMMAND=wsl.exe` and `TMUX_ARGS="-e tmux"`)
-- `TMUX_HISTORY_LIMIT` (default: `200000`)
-- `TMUX_MOUSE_MODE` (default: `true`; enables tmux mouse wheel/copy-mode scrolling for local and web-attached clients)
 - `SINGLE_CONSOLE_MODE` (default: `false`; when set to `true`, forces one shared terminal and disables create/delete)
 - `SESSION_STATE_FILE` (default: `<project>/.online-cli/sessions-state.json`; persisted session metadata used to restore sessions after restart)
 - `WS_HEARTBEAT_MS` (default: `30000`)
@@ -219,7 +208,7 @@ npm install
 - `src/config.js`: runtime config parsing
 - `src/network/tailscaleAccess.js`: loopback/Tailscale source and same-origin access checks
 - `src/http/remoteRoutes.js`: remote status/capability endpoints
-- `src/sessions/`: direct PTY + WSL tmux terminal runtime and manager
+- `src/sessions/`: native PowerShell PTY runtime and manager
 - `src/codex/codexSessionIndex.js`: parses local Codex JSONL sessions and metrics
 - `src/ws/sessionGateway.js`: WebSocket routing and heartbeats
 - `src/ws/remoteGateway.js`: tailnet-gated remote stream/control websocket proxy

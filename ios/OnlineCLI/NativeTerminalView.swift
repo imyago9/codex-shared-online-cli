@@ -4,6 +4,7 @@ import UIKit
 struct NativeTerminalView: View {
     let client: NativeTerminalClient
     @State private var focusToken = 0
+    @State private var dismissKeyboardToken = 0
     @State private var historyDrag = 0.0
     @State private var autoScroll = true
 
@@ -13,6 +14,7 @@ struct NativeTerminalView: View {
                 text: client.buffer.displayText,
                 statusText: client.statusText,
                 focusToken: $focusToken,
+                dismissKeyboardToken: $dismissKeyboardToken,
                 autoScroll: $autoScroll,
                 onInput: client.sendInput,
                 onResize: client.sendResize(cols:rows:)
@@ -26,6 +28,7 @@ struct NativeTerminalView: View {
                 historyDrag: $historyDrag,
                 autoScroll: $autoScroll,
                 onFocus: { focusToken += 1 },
+                onDismissKeyboard: { dismissKeyboardToken += 1 },
                 onPaste: pasteClipboard,
                 onCopy: copyTerminalOutput,
                 onKey: client.sendKey(_:),
@@ -51,43 +54,28 @@ private struct TerminalSurface: View {
     let text: String
     let statusText: String
     @Binding var focusToken: Int
+    @Binding var dismissKeyboardToken: Int
     @Binding var autoScroll: Bool
     let onInput: (String) -> Void
     let onResize: (Int, Int) -> Void
 
-    private let fontSize: CGFloat = 13
-    private let lineHeight: CGFloat = 18
+    private let font = UIFont.monospacedSystemFont(ofSize: 13, weight: .regular)
 
     var body: some View {
         GeometryReader { proxy in
             ZStack(alignment: .topLeading) {
-                ScrollViewReader { scrollProxy in
-                    ScrollView {
-                        Text(renderedText)
-                            .font(.system(size: fontSize, design: .monospaced))
-                            .foregroundStyle(Color(red: 0.86, green: 0.89, blue: 0.93))
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .topLeading)
-                            .padding(.horizontal, 12)
-                            .padding(.top, 44)
-                            .padding(.bottom, 18)
-                        Color.clear
-                            .frame(width: 1, height: 1)
-                            .id("terminal-bottom")
-                    }
-                    .scrollIndicators(.visible)
-                    .onChange(of: text) { _, _ in
-                        guard autoScroll else { return }
-                        withAnimation(.easeOut(duration: 0.12)) {
-                            scrollProxy.scrollTo("terminal-bottom", anchor: .bottom)
-                        }
-                    }
-                    .onTapGesture {
-                        focusToken += 1
-                    }
-                }
+                TerminalTextSurface(
+                    text: renderedText,
+                    font: font,
+                    autoScroll: autoScroll,
+                    onTap: { focusToken += 1 }
+                )
 
-                TerminalInputCapture(focusToken: $focusToken, onInput: onInput)
+                TerminalInputCapture(
+                    focusToken: $focusToken,
+                    dismissKeyboardToken: $dismissKeyboardToken,
+                    onInput: onInput
+                )
                     .frame(width: 1, height: 1)
                     .opacity(0.01)
                     .accessibilityHidden(true)
@@ -108,8 +96,10 @@ private struct TerminalSurface: View {
     }
 
     private func resize(for size: CGSize) {
-        let cols = max(20, Int(size.width / (fontSize * 0.62)))
-        let rows = max(8, Int(size.height / lineHeight))
+        let characterWidth = max(6, "W".size(withAttributes: [.font: font]).width)
+        let lineHeight = max(12, font.lineHeight)
+        let cols = max(24, Int((size.width - 24) / characterWidth))
+        let rows = max(8, Int((size.height - 64) / lineHeight))
         onResize(cols, rows)
     }
 }
@@ -118,6 +108,7 @@ private struct TerminalControlBar: View {
     @Binding var historyDrag: Double
     @Binding var autoScroll: Bool
     let onFocus: () -> Void
+    let onDismissKeyboard: () -> Void
     let onPaste: () -> Void
     let onCopy: () -> Void
     let onKey: (TerminalKey) -> Void
@@ -153,6 +144,7 @@ private struct TerminalControlBar: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
                     TerminalIconButton(systemImage: "keyboard", action: onFocus)
+                    TerminalIconButton(systemImage: "keyboard.chevron.compact.down", action: onDismissKeyboard)
                     TerminalIconButton(systemImage: "doc.on.clipboard", action: onPaste)
                     TerminalIconButton(systemImage: "doc.on.doc", action: onCopy)
                     Divider().frame(height: 28)
@@ -195,6 +187,64 @@ private struct TerminalLiveBadge: View {
     }
 }
 
+private struct TerminalTextSurface: UIViewRepresentable {
+    let text: String
+    let font: UIFont
+    let autoScroll: Bool
+    let onTap: () -> Void
+
+    func makeUIView(context: Context) -> UITextView {
+        let textView = UITextView()
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.backgroundColor = UIColor(red: 0.03, green: 0.04, blue: 0.06, alpha: 1)
+        textView.textColor = UIColor(red: 0.86, green: 0.89, blue: 0.93, alpha: 1)
+        textView.font = font
+        textView.textContainerInset = UIEdgeInsets(top: 44, left: 12, bottom: 18, right: 12)
+        textView.textContainer.lineFragmentPadding = 0
+        textView.alwaysBounceVertical = true
+        textView.keyboardDismissMode = .interactive
+        textView.autocorrectionType = .no
+        textView.autocapitalizationType = .none
+        textView.smartDashesType = .no
+        textView.smartQuotesType = .no
+        textView.spellCheckingType = .no
+
+        let recognizer = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleTap))
+        recognizer.cancelsTouchesInView = false
+        textView.addGestureRecognizer(recognizer)
+        return textView
+    }
+
+    func updateUIView(_ textView: UITextView, context: Context) {
+        context.coordinator.onTap = onTap
+        textView.font = font
+        if textView.text != text {
+            textView.text = text
+            if autoScroll {
+                let end = NSRange(location: max(0, (text as NSString).length - 1), length: 1)
+                textView.scrollRangeToVisible(end)
+            }
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onTap: onTap)
+    }
+
+    final class Coordinator: NSObject {
+        var onTap: () -> Void
+
+        init(onTap: @escaping () -> Void) {
+            self.onTap = onTap
+        }
+
+        @objc func handleTap() {
+            onTap()
+        }
+    }
+}
+
 private struct TerminalIconButton: View {
     let systemImage: String
     let action: () -> Void
@@ -230,6 +280,7 @@ private struct TerminalKeyButton: View {
 
 struct TerminalInputCapture: UIViewRepresentable {
     @Binding var focusToken: Int
+    @Binding var dismissKeyboardToken: Int
     let onInput: (String) -> Void
 
     func makeUIView(context: Context) -> InputView {
@@ -246,11 +297,18 @@ struct TerminalInputCapture: UIViewRepresentable {
                 uiView.becomeFirstResponder()
             }
         }
+        if uiView.lastDismissKeyboardToken != dismissKeyboardToken {
+            uiView.lastDismissKeyboardToken = dismissKeyboardToken
+            DispatchQueue.main.async {
+                uiView.resignFirstResponder()
+            }
+        }
     }
 
     final class InputView: UIView, UIKeyInput {
         var onInput: ((String) -> Void)?
         var lastFocusToken = 0
+        var lastDismissKeyboardToken = 0
         var hasText: Bool { true }
         var keyboardType: UIKeyboardType = .asciiCapable
         var autocapitalizationType: UITextAutocapitalizationType = .none
@@ -260,6 +318,22 @@ struct TerminalInputCapture: UIViewRepresentable {
         var spellCheckingType: UITextSpellCheckingType = .no
 
         override var canBecomeFirstResponder: Bool { true }
+        override var inputAccessoryView: UIView? {
+            accessoryToolbar
+        }
+
+        private lazy var accessoryToolbar: UIToolbar = {
+            let toolbar = UIToolbar()
+            toolbar.sizeToFit()
+            toolbar.items = [
+                UIBarButtonItem(title: "Esc", style: .plain, target: self, action: #selector(sendEscape)),
+                UIBarButtonItem(title: "Tab", style: .plain, target: self, action: #selector(sendTab)),
+                UIBarButtonItem(title: "Ctrl-C", style: .plain, target: self, action: #selector(sendControlC)),
+                UIBarButtonItem(systemItem: .flexibleSpace),
+                UIBarButtonItem(title: "Done", style: .done, target: self, action: #selector(dismissKeyboard))
+            ]
+            return toolbar
+        }()
 
         func insertText(_ text: String) {
             let normalized = text.replacingOccurrences(of: "\n", with: "\r")
@@ -307,5 +381,9 @@ struct TerminalInputCapture: UIViewRepresentable {
         @objc private func controlC() { onInput?(TerminalKey.controlC.sequence) }
         @objc private func controlD() { onInput?(TerminalKey.controlD.sequence) }
         @objc private func controlL() { onInput?(TerminalKey.controlL.sequence) }
+        @objc private func sendEscape() { onInput?(TerminalKey.escape.sequence) }
+        @objc private func sendTab() { onInput?(TerminalKey.tab.sequence) }
+        @objc private func sendControlC() { onInput?(TerminalKey.controlC.sequence) }
+        @objc private func dismissKeyboard() { resignFirstResponder() }
     }
 }

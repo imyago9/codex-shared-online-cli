@@ -1,4 +1,3 @@
-const childProcess = require('child_process');
 const pty = require('@lydell/node-pty');
 const { WebSocket } = require('ws');
 
@@ -16,29 +15,14 @@ function isWsActive(ws) {
   return ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING);
 }
 
-function quoteCommandArg(value) {
-  return `'${String(value).replace(/'/g, `'\"'\"'`)}'`;
-}
-
-function normalizeTerminalProfile(value) {
-  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
-  if (['powershell', 'pwsh', 'ps'].includes(normalized)) {
-    return 'powershell';
-  }
-  if (['wsl', 'linux'].includes(normalized)) {
-    return 'wsl';
-  }
-  return 'system';
-}
-
 class TerminalSession {
   constructor(options) {
     this.id = options.id;
     this.name = options.name;
-    this.terminalProfile = normalizeTerminalProfile(options.terminalProfile || options.shellType || options.kind);
-    this.backend = options.backend || (this.terminalProfile === 'wsl' ? 'tmux' : 'direct');
+    this.terminalProfile = 'powershell';
+    this.backend = 'direct';
     this.shell = options.shell;
-    this.shellArgs = options.shellArgs;
+    this.shellArgs = Array.isArray(options.shellArgs) ? options.shellArgs : [];
     this.cwd = options.cwd;
     this.env = options.env;
     this.defaultCols = options.defaultCols;
@@ -46,24 +30,15 @@ class TerminalSession {
     this.cols = coercePositiveInt(options.cols, this.defaultCols);
     this.rows = coercePositiveInt(options.rows, this.defaultRows);
     this.logger = options.logger;
-    this.tmuxCommand = options.tmuxCommand || 'tmux';
-    this.tmuxArgs = Array.isArray(options.tmuxArgs) ? options.tmuxArgs.slice() : [];
-    if (this.tmuxArgs.length === 0 && process.platform === 'win32' && this.tmuxCommand.toLowerCase() === 'wsl.exe') {
-      this.tmuxArgs = ['-e', 'tmux'];
-    }
-    this.tmuxHistoryLimit = Math.max(Number.parseInt(options.tmuxHistoryLimit, 10) || 200_000, 2_000);
-    this.tmuxMouseMode = options.tmuxMouseMode !== false;
-    this.tmuxSessionName = options.tmuxSessionName || `online_cli_${String(this.id).replace(/[^a-zA-Z0-9]/g, '')}`;
-    this.tmuxCwd = this._resolveTmuxCwd(this.cwd);
 
     this.clients = new Map();
     this.directPty = null;
     this.ptyGeneration = 0;
     this.replayChunks = [];
     this.replayBytes = 0;
-    this.maxReplayBytes = Math.max(Number.parseInt(options.maxReplayBytes, 10) || 512_000, 64_000);
-    this.serverCopyModeActive = false;
+    this.maxReplayBytes = Math.max(Number.parseInt(options.maxReplayBytes, 10) || 768_000, 64_000);
     this.isTerminating = false;
+
     const nowIso = new Date().toISOString();
     this.createdAt = typeof options.createdAt === 'string' && options.createdAt.trim()
       ? options.createdAt
@@ -76,11 +51,7 @@ class TerminalSession {
     this.exitCode = null;
     this.status = 'starting';
 
-    if (this.backend === 'direct') {
-      this._spawnPersistentPty();
-    } else {
-      this._ensureTmuxSession();
-    }
+    this._spawnPersistentPty();
     this.status = 'running';
   }
 
@@ -90,70 +61,14 @@ class TerminalSession {
     this.lastActivityAt = now;
   }
 
-  _resolveTmuxCwd(cwd) {
-    if (typeof cwd !== 'string') {
-      return null;
-    }
-
-    const trimmed = cwd.trim();
-    if (!trimmed) {
-      return null;
-    }
-
-    if (!this._usesWslTmux()) {
-      return trimmed;
-    }
-
-    if (trimmed.startsWith('/')) {
-      return trimmed;
-    }
-
-    const drivePath = trimmed.match(/^([a-zA-Z]):[\\/](.*)$/);
-    if (drivePath) {
-      const drive = drivePath[1].toLowerCase();
-      const rest = drivePath[2].replace(/\\/g, '/');
-      return `/mnt/${drive}/${rest}`;
-    }
-
-    const uncPath = trimmed.match(/^\\\\wsl(?:\.localhost|\$)?\\[^\\]+\\(.+)$/i);
-    if (uncPath && uncPath[1]) {
-      return `/${uncPath[1].replace(/\\/g, '/')}`;
-    }
-
-    return trimmed;
-  }
-
-  _usesWslTmux() {
-    if (process.platform !== 'win32') {
-      return false;
-    }
-
-    const cmd = String(this.tmuxCommand || '').toLowerCase();
-    if (!cmd.endsWith('wsl.exe')) {
-      return false;
-    }
-
-    return this.tmuxArgs.some((arg) => String(arg).toLowerCase() === 'tmux');
-  }
-
-  _runTmux(args) {
-    return childProcess.spawnSync(this.tmuxCommand, [...this.tmuxArgs, ...args], {
-      cwd: this.cwd,
-      env: this.env,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
-  }
-
   _spawnPersistentPty() {
     if (this.directPty) {
       return;
     }
 
-    const shellArgs = Array.isArray(this.shellArgs) ? this.shellArgs : [];
     this.ptyGeneration += 1;
     const ptyGeneration = this.ptyGeneration;
-    const directPty = pty.spawn(this.shell, shellArgs, {
+    const directPty = pty.spawn(this.shell, this.shellArgs, {
       name: 'xterm-256color',
       cols: this.cols,
       rows: this.rows,
@@ -179,6 +94,7 @@ class TerminalSession {
       if (this.directPty !== directPty || this.ptyGeneration !== ptyGeneration) {
         return;
       }
+
       this.directPty = null;
       this.lastExitAt = new Date().toISOString();
       this.exitCode = event.exitCode;
@@ -189,17 +105,16 @@ class TerminalSession {
       this._appendReplay(message);
       this._broadcast(message);
 
-      this.logger.info('Direct terminal PTY exited', {
+      this.logger.info('PowerShell terminal PTY exited', {
         sessionId: this.id,
-        profile: this.terminalProfile,
         exitCode: event.exitCode
       });
     });
 
-    this.logger.info('Direct terminal PTY ready', {
+    this.logger.info('PowerShell terminal PTY ready', {
       sessionId: this.id,
-      profile: this.terminalProfile,
-      shell: this.shell
+      shell: this.shell,
+      cwd: this.cwd
     });
   }
 
@@ -225,391 +140,47 @@ class TerminalSession {
     }
   }
 
-  _resizeDirectPty(cols, rows) {
+  _resizePty(cols, rows) {
     this.cols = coercePositiveInt(cols, this.cols);
     this.rows = coercePositiveInt(rows, this.rows);
     if (!this.directPty) {
       return;
     }
+
     try {
       this.directPty.resize(this.cols, this.rows);
     } catch (error) {
-      this.logger.warn('Failed to resize direct terminal PTY', {
+      this.logger.warn('Failed to resize PowerShell terminal PTY', {
         sessionId: this.id,
         cols: this.cols,
         rows: this.rows,
         message: error.message
       });
     }
-  }
-
-  _assertTmux(result, context) {
-    if (result.error) {
-      if (result.error.code === 'ENOENT') {
-        throw new Error(
-          `${context} failed: command not found (${this.tmuxCommand}). Install tmux and/or set TMUX_COMMAND/TMUX_ARGS.`
-        );
-      }
-      throw new Error(`${context} failed: ${result.error.message}`);
-    }
-
-    if (result.status !== 0) {
-      const detail = String(result.stderr || result.stdout || '').trim() || `exit code ${result.status}`;
-      throw new Error(`${context} failed: ${detail}`);
-    }
-  }
-
-  _createTmuxSession() {
-    const createArgs = [
-      'new-session',
-      '-d',
-      '-s',
-      this.tmuxSessionName,
-      '-x',
-      String(this.cols),
-      '-y',
-      String(this.rows)
-    ];
-    if (this.tmuxCwd) {
-      createArgs.push('-c', this.tmuxCwd);
-    }
-    const create = this._runTmux(createArgs);
-    this._assertTmux(create, `tmux create session ${this.tmuxSessionName}`);
-  }
-
-  _applyTmuxOptions() {
-    const optionOperations = [
-      {
-        command: [
-          'set-window-option',
-          '-g',
-          '-t',
-          this.tmuxSessionName,
-          'history-limit',
-          String(this.tmuxHistoryLimit)
-        ],
-        option: 'history-limit',
-        value: String(this.tmuxHistoryLimit)
-      },
-      {
-        command: [
-          'set-option',
-          '-t',
-          this.tmuxSessionName,
-          'mouse',
-          this.tmuxMouseMode ? 'on' : 'off'
-        ],
-        option: 'mouse',
-        value: this.tmuxMouseMode ? 'on' : 'off'
-      }
-    ];
-
-    for (const operation of optionOperations) {
-      const result = this._runTmux(operation.command);
-      if (result.error || result.status !== 0) {
-        this.logger.warn('Failed to apply tmux option', {
-          sessionId: this.id,
-          tmuxSession: this.tmuxSessionName,
-          option: operation.option,
-          value: operation.value,
-          message: result.error ? result.error.message : String(result.stderr || result.stdout || '').trim()
-        });
-      }
-    }
-  }
-
-  _ensureTmuxSession() {
-    const check = this._runTmux(['has-session', '-t', this.tmuxSessionName]);
-    if (check.status === 0) {
-      this._applyTmuxOptions();
-      return;
-    }
-
-    this._createTmuxSession();
-    this._applyTmuxOptions();
-
-    this.logger.info('tmux session ready', {
-      sessionId: this.id,
-      tmuxSession: this.tmuxSessionName
-    });
-  }
-
-  _killTmuxSession() {
-    const result = this._runTmux(['kill-session', '-t', this.tmuxSessionName]);
-    if (result.error) {
-      this.logger.warn('Failed to kill tmux session', {
-        sessionId: this.id,
-        tmuxSession: this.tmuxSessionName,
-        message: result.error.message
-      });
-      return;
-    }
-
-    if (result.status === 0) {
-      return;
-    }
-
-    const detail = String(result.stderr || result.stdout || '').toLowerCase();
-    if (detail.includes('no session')) {
-      return;
-    }
-
-    this.logger.warn('tmux kill-session returned non-zero', {
-      sessionId: this.id,
-      tmuxSession: this.tmuxSessionName,
-      status: result.status,
-      detail: String(result.stderr || result.stdout || '').trim()
-    });
-  }
-
-  _spawnClientPty(cols, rows) {
-    return pty.spawn(this.tmuxCommand, [...this.tmuxArgs, 'attach-session', '-t', this.tmuxSessionName], {
-      name: 'xterm-256color',
-      cols,
-      rows,
-      cwd: this.cwd,
-      env: {
-        ...this.env,
-        TERM: 'xterm-256color'
-      }
-    });
-  }
-
-  _ensureServerCopyMode() {
-    if (this.serverCopyModeActive) {
-      return true;
-    }
-
-    const enable = this._runTmux(['copy-mode', '-t', this.tmuxSessionName]);
-    if (enable.error || enable.status !== 0) {
-      this.logger.warn('Failed to enter tmux copy-mode for history scroll', {
-        sessionId: this.id,
-        tmuxSession: this.tmuxSessionName,
-        message: enable.error ? enable.error.message : String(enable.stderr || enable.stdout || '').trim()
-      });
-      return false;
-    }
-
-    this.serverCopyModeActive = true;
-    return true;
-  }
-
-  _cancelServerCopyMode() {
-    if (!this.serverCopyModeActive) {
-      return true;
-    }
-
-    const cancel = this._runTmux(['send-keys', '-t', this.tmuxSessionName, '-X', 'cancel']);
-    if (cancel.error || cancel.status !== 0) {
-      const detail = String(cancel.stderr || cancel.stdout || '').toLowerCase();
-      if (!detail.includes('not in copy mode')) {
-        this.logger.warn('Failed to exit tmux copy-mode', {
-          sessionId: this.id,
-          tmuxSession: this.tmuxSessionName,
-          message: cancel.error ? cancel.error.message : String(cancel.stderr || cancel.stdout || '').trim()
-        });
-      }
-    }
-
-    this.serverCopyModeActive = false;
-    return true;
-  }
-
-  scrollHistory(lines) {
-    if (this.backend === 'direct') {
-      return false;
-    }
-
-    const parsed = Number.parseInt(lines, 10);
-    if (!Number.isFinite(parsed) || parsed === 0) {
-      return false;
-    }
-
-    this._ensureTmuxSession();
-
-    const count = Math.min(400, Math.max(1, Math.abs(parsed)));
-    if (parsed < 0) {
-      if (!this._ensureServerCopyMode()) {
-        return false;
-      }
-    } else if (!this.serverCopyModeActive) {
-      // Already at live pane flow; nothing to scroll downward.
-      return false;
-    }
-
-    const action = parsed < 0 ? 'scroll-up' : 'scroll-down';
-    const result = this._runTmux([
-      'send-keys',
-      '-t',
-      this.tmuxSessionName,
-      '-X',
-      '-N',
-      String(count),
-      action
-    ]);
-
-    if (result.error || result.status !== 0) {
-      this.logger.warn('Failed to scroll tmux history', {
-        sessionId: this.id,
-        tmuxSession: this.tmuxSessionName,
-        lines: parsed,
-        message: result.error ? result.error.message : String(result.stderr || result.stdout || '').trim()
-      });
-      return false;
-    }
-
-    this._touch();
-    return true;
-  }
-
-  _killClientPty(client) {
-    if (!client || !client.pty) {
-      return;
-    }
-
-    const attachedPty = client.pty;
-    client.pty = null;
-    try {
-      attachedPty.kill();
-    } catch (error) {
-      this.logger.warn('Failed to terminate attached tmux client PTY', {
-        sessionId: this.id,
-        message: error.message
-      });
-    }
-  }
-
-  _createAttachedClient(ws, cols, rows) {
-    const normalizedCols = coercePositiveInt(cols, this.cols);
-    const normalizedRows = coercePositiveInt(rows, this.rows);
-    const clientPty = this._spawnClientPty(normalizedCols, normalizedRows);
-    const client = {
-      cols: normalizedCols,
-      rows: normalizedRows,
-      pty: clientPty
-    };
-
-    this.clients.set(ws, client);
-
-    clientPty.onData((data) => {
-      const active = this.clients.get(ws);
-      if (!active || active !== client || client.pty !== clientPty) {
-        return;
-      }
-
-      if (!isWsOpen(ws)) {
-        this.detachClient(ws);
-        return;
-      }
-
-      ws.send(data);
-      this._touch();
-    });
-
-    clientPty.onExit((event) => {
-      const active = this.clients.get(ws);
-      if (!active || active !== client || client.pty !== clientPty) {
-        return;
-      }
-
-      this.clients.delete(ws);
-      client.pty = null;
-      this.lastExitAt = new Date().toISOString();
-      this.exitCode = event.exitCode;
-      this._touch();
-
-      this.logger.info('Attached tmux client PTY exited', {
-        sessionId: this.id,
-        tmuxSession: this.tmuxSessionName,
-        clientCount: this.clients.size,
-        exitCode: event.exitCode
-      });
-
-      if (isWsActive(ws)) {
-        ws.close(1012, 'Terminal stream ended');
-      }
-    });
-
-    this.cols = normalizedCols;
-    this.rows = normalizedRows;
-    this.status = 'running';
-    this._touch();
-    return client;
-  }
-
-  _buildLocalAttachCommand() {
-    if (this.backend === 'direct') {
-      return '';
-    }
-
-    const spec = this.getLocalAttachSpec();
-    return [spec.command, ...spec.args].map((part) => quoteCommandArg(part)).join(' ');
-  }
-
-  getLocalAttachSpec() {
-    if (this.backend === 'direct') {
-      return {
-        command: this.shell,
-        args: Array.isArray(this.shellArgs) ? this.shellArgs : [],
-        cwd: this.cwd,
-        displayCommand: ''
-      };
-    }
-
-    return {
-      command: this.tmuxCommand,
-      args: [
-        ...this.tmuxArgs,
-        'attach-session',
-        '-t',
-        this.tmuxSessionName
-      ],
-      cwd: this.cwd,
-      displayCommand: [this.tmuxCommand, ...this.tmuxArgs, 'attach-session', '-t', this.tmuxSessionName]
-        .map((part) => quoteCommandArg(part))
-        .join(' ')
-    };
   }
 
   attachClient(ws) {
-    if (this.backend === 'direct') {
-      if (this.clients.has(ws)) {
-        this.detachClient(ws);
-      }
-
-      const client = {
-        cols: this.cols,
-        rows: this.rows,
-        pty: null
-      };
-      this.clients.set(ws, client);
-      if (!this.directPty && this.status !== 'terminated') {
-        this._spawnPersistentPty();
-      }
-      const replay = this.replayChunks.join('');
-      if (replay && isWsOpen(ws)) {
-        ws.send(replay);
-      }
-
-      this.logger.info('Client attached to direct terminal session', {
-        sessionId: this.id,
-        profile: this.terminalProfile,
-        clientCount: this.clients.size
-      });
-      return;
-    }
-
-    this._ensureTmuxSession();
-
     if (this.clients.has(ws)) {
       this.detachClient(ws);
     }
 
-    this._createAttachedClient(ws, this.cols, this.rows);
+    const client = {
+      cols: this.cols,
+      rows: this.rows
+    };
+    this.clients.set(ws, client);
 
-    this.logger.info('Client attached to tmux session', {
+    if (!this.directPty && this.status !== 'terminated') {
+      this._spawnPersistentPty();
+    }
+
+    const replay = this.replayChunks.join('');
+    if (replay && isWsOpen(ws)) {
+      ws.send(replay);
+    }
+
+    this.logger.info('Client attached to PowerShell terminal session', {
       sessionId: this.id,
-      tmuxSession: this.tmuxSessionName,
       clientCount: this.clients.size
     });
   }
@@ -619,22 +190,10 @@ class TerminalSession {
     if (!client) return;
 
     this.clients.delete(ws);
-    if (this.backend === 'direct') {
-      this._touch();
-      this.logger.info('Client detached from direct terminal session', {
-        sessionId: this.id,
-        profile: this.terminalProfile,
-        clientCount: this.clients.size
-      });
-      return;
-    }
-
-    this._killClientPty(client);
     this._touch();
 
-    this.logger.info('Client detached from tmux session', {
+    this.logger.info('Client detached from PowerShell terminal session', {
       sessionId: this.id,
-      tmuxSession: this.tmuxSessionName,
       clientCount: this.clients.size
     });
   }
@@ -659,76 +218,35 @@ class TerminalSession {
       const rows = coercePositiveInt(payload.rows, client.rows);
       client.cols = cols;
       client.rows = rows;
-
-      if (this.backend === 'direct') {
-        this._resizeDirectPty(cols, rows);
-        return;
-      }
-
-      if (client.pty) {
-        try {
-          client.pty.resize(cols, rows);
-        } catch (error) {
-          this.logger.warn('Failed to resize attached tmux client PTY', {
-            sessionId: this.id,
-            cols,
-            rows,
-            message: error.message
-          });
-        }
-      }
-
-      this.cols = cols;
-      this.rows = rows;
+      this._resizePty(cols, rows);
       return;
     }
 
     if (payload && payload.type === 'input' && typeof payload.data === 'string') {
-      this.writeInput(payload.data, ws);
+      this.writeInput(payload.data);
       return;
     }
 
     if (typeof text === 'string' && text.length > 0) {
-      this.writeInput(text, ws);
+      this.writeInput(text);
     }
   }
 
-  writeInput(data, ws = null) {
+  writeInput(data) {
     if (typeof data !== 'string' || data.length === 0) {
       return false;
     }
 
-    if (this.backend === 'direct') {
-      if (!this.directPty || this.status === 'exited' || this.status === 'terminated') {
-        return false;
-      }
-
-      try {
-        this.directPty.write(data);
-        this._touch();
-        return true;
-      } catch (error) {
-        this.logger.warn('Failed to write input to direct terminal PTY', {
-          sessionId: this.id,
-          message: error.message
-        });
-        return false;
-      }
-    }
-
-    const targetClient = ws ? this.clients.get(ws) : this.clients.values().next().value;
-    if (!targetClient || !targetClient.pty) {
+    if (!this.directPty || this.status === 'exited' || this.status === 'terminated') {
       return false;
     }
 
-    this._cancelServerCopyMode();
-
     try {
-      targetClient.pty.write(data);
+      this.directPty.write(data);
       this._touch();
       return true;
     } catch (error) {
-      this.logger.warn('Failed to write input to attached tmux client PTY', {
+      this.logger.warn('Failed to write input to PowerShell terminal PTY', {
         sessionId: this.id,
         message: error.message
       });
@@ -741,74 +259,44 @@ class TerminalSession {
       return false;
     }
 
-    if (this.backend === 'direct') {
-      return this.writeInput(`${command}\r`);
-    }
+    return this.writeInput(`${command}\r`);
+  }
 
-    this._ensureTmuxSession();
-    this._cancelServerCopyMode();
-    const result = this._runTmux(['send-keys', '-t', this.tmuxSessionName, command, 'C-m']);
-
-    if (result.error || result.status !== 0) {
-      this.logger.warn('Failed to send command to tmux session', {
-        sessionId: this.id,
-        tmuxSession: this.tmuxSessionName,
-        message: result.error ? result.error.message : String(result.stderr || result.stdout || '').trim()
-      });
-      return false;
-    }
-
-    this._touch();
-    return true;
+  scrollHistory() {
+    return false;
   }
 
   restart() {
-    const activeClients = Array.from(this.clients.entries());
+    const activeClients = Array.from(this.clients.keys());
     this.clients.clear();
 
-    for (const [ws, client] of activeClients) {
-      if (this.backend !== 'direct') {
-        this._killClientPty(client);
-      }
+    for (const ws of activeClients) {
       if (isWsActive(ws)) {
         ws.close(1012, 'Session restarted');
       }
     }
 
-    if (this.backend === 'direct') {
-      const existingPty = this.directPty;
-      this.directPty = null;
-      if (existingPty) {
-        try {
-          existingPty.kill();
-        } catch (error) {
-          this.logger.warn('Failed to terminate direct terminal PTY during restart', {
-            sessionId: this.id,
-            message: error.message
-          });
-        }
+    const existingPty = this.directPty;
+    this.directPty = null;
+    if (existingPty) {
+      try {
+        existingPty.kill();
+      } catch (error) {
+        this.logger.warn('Failed to terminate PowerShell terminal PTY during restart', {
+          sessionId: this.id,
+          message: error.message
+        });
       }
-
-      this.replayChunks = [];
-      this.replayBytes = 0;
-      this.status = 'starting';
-      this.exitCode = null;
-      this.lastExitAt = null;
-      this.isTerminating = false;
-      this._spawnPersistentPty();
-      this.status = 'running';
-      this._touch();
-      return;
     }
 
-    this._killTmuxSession();
-    this._createTmuxSession();
-    this._applyTmuxOptions();
-    this.serverCopyModeActive = false;
-
-    this.status = 'running';
+    this.replayChunks = [];
+    this.replayBytes = 0;
+    this.status = 'starting';
     this.exitCode = null;
     this.lastExitAt = null;
+    this.isTerminating = false;
+    this._spawnPersistentPty();
+    this.status = 'running';
     this._touch();
   }
 
@@ -817,14 +305,10 @@ class TerminalSession {
     const closeClients = options.closeClients !== false;
     this.isTerminating = true;
 
-    const activeClients = Array.from(this.clients.entries());
+    const activeClients = Array.from(this.clients.keys());
     this.clients.clear();
 
-    for (const [ws, client] of activeClients) {
-      if (this.backend !== 'direct') {
-        this._killClientPty(client);
-      }
-
+    for (const ws of activeClients) {
       if (closeClients) {
         if (isWsActive(ws)) {
           ws.close(1012, reason);
@@ -834,42 +318,25 @@ class TerminalSession {
       }
     }
 
-    if (this.backend === 'direct') {
-      const existingPty = this.directPty;
-      this.directPty = null;
-      if (existingPty) {
-        try {
-          existingPty.kill();
-        } catch (error) {
-          this.logger.warn('Failed to terminate direct terminal PTY', {
-            sessionId: this.id,
-            message: error.message
-          });
-        }
+    const existingPty = this.directPty;
+    this.directPty = null;
+    if (existingPty) {
+      try {
+        existingPty.kill();
+      } catch (error) {
+        this.logger.warn('Failed to terminate PowerShell terminal PTY', {
+          sessionId: this.id,
+          message: error.message
+        });
       }
-
-      this.status = 'terminated';
-      this.lastExitAt = new Date().toISOString();
-      this._touch();
-
-      this.logger.info('Direct terminal session terminated', {
-        sessionId: this.id,
-        profile: this.terminalProfile,
-        closeClients
-      });
-      return;
     }
-
-    this._killTmuxSession();
-    this.serverCopyModeActive = false;
 
     this.status = 'terminated';
     this.lastExitAt = new Date().toISOString();
     this._touch();
 
-    this.logger.info('tmux-backed session terminated', {
+    this.logger.info('PowerShell terminal session terminated', {
       sessionId: this.id,
-      tmuxSession: this.tmuxSessionName,
       closeClients
     });
   }
@@ -878,14 +345,10 @@ class TerminalSession {
     const reason = options.reason || '[Session detached]';
     const closeSockets = options.closeSockets !== false;
 
-    const activeClients = Array.from(this.clients.entries());
+    const activeClients = Array.from(this.clients.keys());
     this.clients.clear();
 
-    for (const [ws, client] of activeClients) {
-      if (this.backend !== 'direct') {
-        this._killClientPty(client);
-      }
-
+    for (const ws of activeClients) {
       if (closeSockets) {
         if (isWsActive(ws)) {
           ws.close(1012, reason);
@@ -895,21 +358,10 @@ class TerminalSession {
       }
     }
 
-    this.serverCopyModeActive = false;
     this._touch();
 
-    if (this.backend === 'direct') {
-      this.logger.info('Direct terminal session detached from web clients', {
-        sessionId: this.id,
-        profile: this.terminalProfile,
-        remainingClients: this.clients.size
-      });
-      return;
-    }
-
-    this.logger.info('tmux-backed session detached from web clients', {
+    this.logger.info('PowerShell terminal session detached from clients', {
       sessionId: this.id,
-      tmuxSession: this.tmuxSessionName,
       remainingClients: this.clients.size
     });
   }
@@ -942,9 +394,7 @@ class TerminalSession {
       cwd: this.cwd,
       cols: this.cols,
       rows: this.rows,
-      tmuxSession: this.tmuxSessionName,
-      replayBytes: this.replayBytes,
-      localAttachCommand: this._buildLocalAttachCommand()
+      replayBytes: this.replayBytes
     };
   }
 }

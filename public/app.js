@@ -1,8 +1,6 @@
 const terminalElement = document.getElementById('terminal');
 const statusElement = document.getElementById('connection');
 const hintElement = document.getElementById('hint');
-const localAttachLineElement = document.getElementById('local-attach-line');
-const copyAttachCommandButton = document.getElementById('copy-attach-command');
 const sessionSelectElement = document.getElementById('session-select');
 const createSessionButton = document.getElementById('new-session');
 const deleteSessionButton = document.getElementById('delete-session');
@@ -62,7 +60,6 @@ const state = {
   codexLoading: false,
   terminalFullscreen: false,
   terminalPopoutActive: false,
-  localAttachCommand: '',
   singleConsoleMode: false,
   metricsFilters: {
     dateScope: 'all',
@@ -681,33 +678,10 @@ function updateActiveSessionHint() {
   const activeSession = state.sessions.find((session) => session.id === state.activeSessionId);
   if (!activeSession) {
     setHint('No active session selected.');
-    state.localAttachCommand = '';
-    if (localAttachLineElement) {
-      localAttachLineElement.textContent = '';
-    }
-    if (copyAttachCommandButton) {
-      copyAttachCommandButton.disabled = true;
-    }
     return;
   }
 
-  const attachCommand = typeof activeSession.localAttachCommand === 'string'
-    ? activeSession.localAttachCommand.trim()
-    : '';
-
   setHint(`Connected to ${activeSession.name}. Swipe the terminal or drag the slider below to scroll history.`);
-
-  if (localAttachLineElement) {
-    if (attachCommand) {
-      localAttachLineElement.textContent = `Local mirror attach command: ${attachCommand}`;
-    } else {
-      localAttachLineElement.textContent = '';
-    }
-  }
-  state.localAttachCommand = attachCommand;
-  if (copyAttachCommandButton) {
-    copyAttachCommandButton.disabled = !attachCommand;
-  }
 }
 
 function formatCompactNumber(value) {
@@ -1924,7 +1898,7 @@ function scrollTerminalHistory(linesToScroll) {
     return true;
   }
 
-  // Fallback for tmux/curses-style apps where local xterm scrollback can't move.
+  // Fallback for full-screen terminal apps where local xterm scrollback can't move.
   const pageKey = linesToScroll < 0 ? '\u001b[5~' : '\u001b[6~';
   const repeatCount = Math.min(8, Math.max(1, Math.round(Math.abs(linesToScroll) / 6)));
   return sendTerminalInput(pageKey.repeat(repeatCount));
@@ -2588,20 +2562,6 @@ createSessionButton.addEventListener('click', async () => {
     setHint(`Could not create session: ${error.message}`);
   }
 });
-
-if (copyAttachCommandButton) {
-  copyAttachCommandButton.addEventListener('click', async () => {
-    if (!state.localAttachCommand) {
-      return;
-    }
-    try {
-      await copyTextToClipboard(state.localAttachCommand);
-      setHint('Copied local attach command to clipboard.');
-    } catch (error) {
-      setHint(`Could not copy attach command: ${error.message}`);
-    }
-  });
-}
 
 deleteSessionButton.addEventListener('click', async () => {
   try {

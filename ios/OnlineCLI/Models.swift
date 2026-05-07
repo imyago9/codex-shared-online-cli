@@ -45,42 +45,30 @@ struct ServerSettings: Codable, Equatable {
 
 enum TerminalProfile: String, Codable, CaseIterable, Identifiable {
     case powershell
-    case wsl
-    case system
 
     var id: String { rawValue }
 
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let rawValue = (try? container.decode(String.self))?.lowercased()
+        self = rawValue == "powershell" ? .powershell : .powershell
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
     var title: String {
-        switch self {
-        case .powershell:
-            return "PowerShell"
-        case .wsl:
-            return "WSL"
-        case .system:
-            return "System"
-        }
+        "PowerShell"
     }
 
     var subtitle: String {
-        switch self {
-        case .powershell:
-            return "Native Windows shell"
-        case .wsl:
-            return "Linux shell via tmux"
-        case .system:
-            return "Host default shell"
-        }
+        "Native Windows shell"
     }
 
     var systemImage: String {
-        switch self {
-        case .powershell:
-            return "terminal"
-        case .wsl:
-            return "shippingbox"
-        case .system:
-            return "terminal"
-        }
+        "terminal"
     }
 }
 
@@ -197,7 +185,6 @@ struct TerminalSessionSnapshot: Codable, Identifiable, Hashable {
     let rows: Int?
     let createdAt: String?
     let lastActivityAt: String?
-    let localAttachCommand: String?
     let clientCount: Int?
 
     var displayName: String {
@@ -213,10 +200,7 @@ struct TerminalSessionSnapshot: Codable, Identifiable, Hashable {
     }
 
     var backendLabel: String {
-        guard let backend, !backend.isEmpty else {
-            return effectiveProfile.subtitle
-        }
-        return backend == "tmux" ? "tmux-backed" : "direct PTY"
+        backend == "direct" ? "native PTY" : effectiveProfile.subtitle
     }
 }
 

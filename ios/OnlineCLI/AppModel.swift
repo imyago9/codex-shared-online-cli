@@ -14,7 +14,7 @@ final class AppModel {
     var sessions: [TerminalSessionSnapshot] = []
     var defaultSessionId: String?
     var activeTerminalSessionId: String?
-    var availableTerminalProfiles: [TerminalProfile] = [.powershell, .wsl]
+    var availableTerminalProfiles: [TerminalProfile] = [.powershell]
     var codexSessions: [CodexSessionSummary] = []
     var codexSummary: CodexSummary?
     var remoteStatus: RemoteStatus?
@@ -52,11 +52,10 @@ final class AppModel {
 
         do {
             health = try await api.health()
-            if let defaultProfile = health?.defaultTerminalProfile {
-                settings.defaultTerminalProfile = defaultProfile
-            }
+            settings.defaultTerminalProfile = .powershell
             if let profiles = health?.terminalProfiles, !profiles.isEmpty {
-                availableTerminalProfiles = profiles
+                let supportedProfiles = profiles.filter { $0 == .powershell }
+                availableTerminalProfiles = supportedProfiles.isEmpty ? [.powershell] : supportedProfiles
             }
             connectionMessage = "Connected"
         } catch {
@@ -70,11 +69,10 @@ final class AppModel {
             let response = try await api.sessions()
             sessions = response.sessions
             defaultSessionId = response.defaultSessionId
-            if let responseDefaultProfile = response.defaultTerminalProfile {
-                settings.defaultTerminalProfile = responseDefaultProfile
-            }
+            settings.defaultTerminalProfile = .powershell
             if let profiles = response.terminalProfiles, !profiles.isEmpty {
-                availableTerminalProfiles = profiles
+                let supportedProfiles = profiles.filter { $0 == .powershell }
+                availableTerminalProfiles = supportedProfiles.isEmpty ? [.powershell] : supportedProfiles
             }
             reconcileActiveTerminal()
         } catch {
@@ -85,8 +83,7 @@ final class AppModel {
     func createSession(profile: TerminalProfile? = nil) async {
         guard let api else { return }
         do {
-            let targetProfile = profile ?? settings.defaultTerminalProfile
-            let response = try await api.createSession(terminalProfile: targetProfile)
+            let response = try await api.createSession(terminalProfile: .powershell)
             defaultSessionId = response.defaultSessionId
             activeTerminalSessionId = response.session.id
             await refreshSessions()

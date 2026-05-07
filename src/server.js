@@ -55,29 +55,18 @@ function startServer(options = {}) {
     maxSessions: config.maxSessions,
     defaultCols: config.defaultCols,
     defaultRows: config.defaultRows,
-    defaultShell: config.defaultShell,
-    defaultShellArgs: config.defaultShellArgs,
     defaultTerminalProfile: config.defaultTerminalProfile,
     powerShellCommand: config.powerShellCommand,
     powerShellArgs: config.powerShellArgs,
-    wslCommand: config.wslCommand,
-    wslArgs: config.wslArgs,
     defaultCwd: config.defaultCwd,
     sessionIdleTimeoutMs: config.sessionIdleTimeoutMs,
     sessionSweepIntervalMs: config.sessionSweepIntervalMs,
-    tmuxCommand: config.tmuxCommand,
-    tmuxArgs: config.tmuxArgs,
-    tmuxHistoryLimit: config.tmuxHistoryLimit,
-    tmuxMouseMode: config.tmuxMouseMode,
     singleConsoleMode: config.singleConsoleMode,
     sessionStateFile: config.sessionStateFile
   });
 
   sessionManager.start();
-  const codexSessionIndex = new CodexSessionIndex({
-    logger,
-    defaultShell: config.defaultShell
-  });
+  const codexSessionIndex = new CodexSessionIndex({ logger });
 
   app.use('/api', createRemoteRoutes(remoteClient));
   app.use('/api', createSessionRoutes(sessionManager, codexSessionIndex));
@@ -171,7 +160,6 @@ function startServer(options = {}) {
     }
     sessionManager.stop({
       persistState: true,
-      preserveTmux: true,
       closeClients: true
     });
 

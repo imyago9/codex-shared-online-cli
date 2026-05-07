@@ -3,42 +3,20 @@ const fs = require('fs');
 const path = require('path');
 const { TerminalSession } = require('./terminalSession');
 
-function normalizeTerminalProfile(value, fallback = 'powershell') {
-  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
-  if (['powershell', 'pwsh', 'ps'].includes(normalized)) {
-    return 'powershell';
-  }
-  if (['wsl', 'linux'].includes(normalized)) {
-    return 'wsl';
-  }
-  if (['system', 'shell', 'default'].includes(normalized)) {
-    return 'system';
-  }
-  return fallback;
-}
-
 class SessionManager {
   constructor(options) {
     this.logger = options.logger;
     this.maxSessions = options.maxSessions;
     this.defaultCols = options.defaultCols;
     this.defaultRows = options.defaultRows;
-    this.defaultShell = options.defaultShell;
-    this.defaultShellArgs = options.defaultShellArgs;
-    this.defaultTerminalProfile = normalizeTerminalProfile(options.defaultTerminalProfile, 'powershell');
     this.powerShellCommand = options.powerShellCommand || (process.platform === 'win32' ? 'powershell.exe' : 'pwsh');
     this.powerShellArgs = Array.isArray(options.powerShellArgs) ? options.powerShellArgs : ['-NoLogo'];
-    this.wslCommand = options.wslCommand || 'wsl.exe';
-    this.wslArgs = Array.isArray(options.wslArgs) ? options.wslArgs : [];
     this.defaultCwd = options.defaultCwd;
     this.sessionIdleTimeoutMs = options.sessionIdleTimeoutMs;
     this.sessionSweepIntervalMs = options.sessionSweepIntervalMs;
-    this.tmuxCommand = options.tmuxCommand || 'tmux';
-    this.tmuxArgs = Array.isArray(options.tmuxArgs) ? options.tmuxArgs : [];
-    this.tmuxHistoryLimit = options.tmuxHistoryLimit;
-    this.tmuxMouseMode = options.tmuxMouseMode !== false;
     this.singleConsoleMode = options.singleConsoleMode !== false;
     this.sessionStateFile = options.sessionStateFile;
+    this.defaultTerminalProfile = 'powershell';
 
     this.sessions = new Map();
     this.defaultSessionId = null;
@@ -57,7 +35,6 @@ class SessionManager {
 
   stop(options = {}) {
     const persistState = options.persistState !== false;
-    const preserveTmux = options.preserveTmux !== false;
     const closeClients = options.closeClients !== false;
 
     if (this.cleanupTimer) {
@@ -70,75 +47,21 @@ class SessionManager {
     }
 
     for (const session of this.sessions.values()) {
-      if (preserveTmux) {
-        session.disconnectClients({
-          reason: 'Server shutting down',
-          closeSockets: closeClients
-        });
-      } else {
-        session.terminate({ reason: 'Server shutting down', closeClients });
-      }
+      session.disconnectClients({
+        reason: 'Server shutting down',
+        closeSockets: closeClients
+      });
+      session.terminate({
+        reason: 'Server shutting down',
+        closeClients: false
+      });
     }
 
     this.sessions.clear();
   }
 
   _nextName() {
-    return `Session ${this.sessions.size + 1}`;
-  }
-
-  _resolveSessionRuntime(options = {}) {
-    const requestedProfile = options.terminalProfile || options.shellType || options.kind;
-    let inferredProfile = this.defaultTerminalProfile;
-    if (!requestedProfile && typeof options.shell === 'string') {
-      const shell = options.shell.toLowerCase();
-      if (shell.includes('wsl')) {
-        inferredProfile = 'wsl';
-      } else if (shell.includes('powershell') || shell.includes('pwsh')) {
-        inferredProfile = 'powershell';
-      }
-    }
-    const terminalProfile = normalizeTerminalProfile(
-      requestedProfile,
-      inferredProfile
-    );
-
-    if (terminalProfile === 'powershell') {
-      return {
-        terminalProfile,
-        backend: 'direct',
-        shell: options.shell || this.powerShellCommand,
-        shellArgs: Array.isArray(options.shellArgs) ? options.shellArgs : this.powerShellArgs,
-        tmuxCommand: this.tmuxCommand,
-        tmuxArgs: this.tmuxArgs
-      };
-    }
-
-    if (terminalProfile === 'wsl') {
-      const tmuxCommand = process.platform === 'win32' ? this.wslCommand : this.tmuxCommand;
-      let tmuxArgs = process.platform === 'win32' ? this.wslArgs.slice() : this.tmuxArgs.slice();
-      const hasTmux = tmuxArgs.some((arg) => String(arg).toLowerCase() === 'tmux');
-      if (process.platform === 'win32' && !hasTmux) {
-        tmuxArgs = [...tmuxArgs, '-e', 'tmux'];
-      }
-      return {
-        terminalProfile,
-        backend: 'tmux',
-        shell: options.shell || this.wslCommand,
-        shellArgs: Array.isArray(options.shellArgs) ? options.shellArgs : this.wslArgs,
-        tmuxCommand,
-        tmuxArgs
-      };
-    }
-
-    return {
-      terminalProfile,
-      backend: 'direct',
-      shell: options.shell || this.defaultShell,
-      shellArgs: Array.isArray(options.shellArgs) ? options.shellArgs : this.defaultShellArgs,
-      tmuxCommand: this.tmuxCommand,
-      tmuxArgs: this.tmuxArgs
-    };
+    return `PowerShell ${this.sessions.size + 1}`;
   }
 
   createSession(options = {}) {
@@ -155,6 +78,15 @@ class SessionManager {
       throw error;
     }
 
+    const requestedProfile = typeof options.terminalProfile === 'string'
+      ? options.terminalProfile.trim().toLowerCase()
+      : '';
+    if (requestedProfile && requestedProfile !== 'powershell') {
+      const error = new Error('Only native PowerShell terminal sessions are supported');
+      error.statusCode = 400;
+      throw error;
+    }
+
     const explicitId = typeof options.id === 'string' ? options.id.trim() : '';
     const id = explicitId || crypto.randomUUID();
     if (this.sessions.has(id)) {
@@ -163,15 +95,13 @@ class SessionManager {
       throw error;
     }
 
-    const runtime = this._resolveSessionRuntime(options);
-
     const session = new TerminalSession({
       id,
       name: options.name || this._nextName(),
-      terminalProfile: runtime.terminalProfile,
-      backend: runtime.backend,
-      shell: runtime.shell,
-      shellArgs: runtime.shellArgs,
+      terminalProfile: 'powershell',
+      backend: 'direct',
+      shell: this.powerShellCommand,
+      shellArgs: this.powerShellArgs,
       cwd: options.cwd || this.defaultCwd,
       env: process.env,
       defaultCols: options.defaultCols || this.defaultCols,
@@ -180,17 +110,12 @@ class SessionManager {
       rows: options.rows,
       createdAt: options.createdAt,
       lastActivityAt: options.lastActivityAt,
-      tmuxCommand: runtime.tmuxCommand,
-      tmuxArgs: runtime.tmuxArgs,
-      tmuxHistoryLimit: this.tmuxHistoryLimit,
-      tmuxMouseMode: this.tmuxMouseMode,
-      tmuxSessionName: options.tmuxSessionName,
       logger: this.logger
     });
 
     this.sessions.set(id, session);
 
-    this.logger.info('Session created', {
+    this.logger.info('PowerShell session created', {
       sessionId: id,
       name: session.name,
       total: this.sessions.size
@@ -212,7 +137,7 @@ class SessionManager {
     }
 
     const defaultSession = this.createSession({
-      name: 'Default Session',
+      name: 'Default PowerShell',
       allowSingleConsoleBypass: true,
       skipPersist: true
     });
@@ -258,7 +183,7 @@ class SessionManager {
       }
     }
 
-    this.logger.info('Session deleted', {
+    this.logger.info('PowerShell session deleted', {
       sessionId: id,
       total: this.sessions.size
     });
@@ -323,7 +248,7 @@ class SessionManager {
     }
 
     if (removedIds.length > 0) {
-      this.logger.info('Cleaned up idle sessions', {
+      this.logger.info('Cleaned up idle PowerShell sessions', {
         count: removedIds.length,
         sessionIds: removedIds
       });
@@ -339,14 +264,13 @@ class SessionManager {
     const sessions = Array.from(this.sessions.values()).map((session) => ({
       id: session.id,
       name: session.name,
-      terminalProfile: session.terminalProfile,
-      backend: session.backend,
+      terminalProfile: 'powershell',
+      backend: 'direct',
       shell: session.shell,
       shellArgs: Array.isArray(session.shellArgs) ? session.shellArgs : [],
       cwd: session.cwd,
       cols: session.cols,
       rows: session.rows,
-      tmuxSessionName: session.tmuxSessionName,
       createdAt: session.createdAt,
       lastActivityAt: session.lastActivityAt
     }));
@@ -367,11 +291,12 @@ class SessionManager {
 
     try {
       const payload = {
-        version: 1,
+        version: 2,
         savedAt: new Date().toISOString(),
         reason: reason || 'update',
         defaultSessionId: this.defaultSessionId,
         singleConsoleMode: this.singleConsoleMode === true,
+        terminalProfile: 'powershell',
         sessions: this._serializeSessionsForState()
       };
 
@@ -440,18 +365,9 @@ class SessionManager {
         const session = this.createSession({
           id,
           name: typeof candidate.name === 'string' && candidate.name.trim() ? candidate.name : undefined,
-          terminalProfile: typeof candidate.terminalProfile === 'string' && candidate.terminalProfile.trim()
-            ? candidate.terminalProfile
-            : candidate.shellType,
-          backend: typeof candidate.backend === 'string' && candidate.backend.trim() ? candidate.backend : undefined,
-          shell: typeof candidate.shell === 'string' && candidate.shell.trim() ? candidate.shell : undefined,
-          shellArgs: Array.isArray(candidate.shellArgs) ? candidate.shellArgs : undefined,
           cwd: typeof candidate.cwd === 'string' && candidate.cwd.trim() ? candidate.cwd : undefined,
           cols: candidate.cols,
           rows: candidate.rows,
-          tmuxSessionName: typeof candidate.tmuxSessionName === 'string' && candidate.tmuxSessionName.trim()
-            ? candidate.tmuxSessionName
-            : undefined,
           createdAt: typeof candidate.createdAt === 'string' ? candidate.createdAt : undefined,
           lastActivityAt: typeof candidate.lastActivityAt === 'string' ? candidate.lastActivityAt : undefined,
           allowSingleConsoleBypass: true,
@@ -463,7 +379,7 @@ class SessionManager {
           this.defaultSessionId = session.id;
         }
       } catch (error) {
-        this.logger.warn('Failed to restore persisted session', {
+        this.logger.warn('Failed to restore persisted PowerShell session', {
           sessionId: id,
           message: error.message
         });
@@ -477,7 +393,7 @@ class SessionManager {
     }
 
     if (restored > 0) {
-      this.logger.info('Restored persisted sessions', {
+      this.logger.info('Restored persisted PowerShell sessions', {
         restored,
         defaultSessionId: this.defaultSessionId
       });

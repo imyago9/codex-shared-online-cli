@@ -33,8 +33,10 @@ enum NativeTerminalConnectionState: Equatable {
 final class NativeTerminalBuffer {
     var displayText = ""
 
-    private var lines: [String] = []
-    private var currentLine = ""
+    private var history: [String] = []
+    private var currentLine: [Character] = []
+    private var cursorX = 0
+    private var cols = 80
     private var parseMode: ParseMode = .normal
     private var csiBuffer = ""
     private var pendingCarriageReturn = false
@@ -45,12 +47,18 @@ final class NativeTerminalBuffer {
     }
 
     func reset() {
-        lines = []
-        currentLine = ""
+        history = []
+        currentLine = []
+        cursorX = 0
         parseMode = .normal
         csiBuffer = ""
         pendingCarriageReturn = false
         displayText = ""
+    }
+
+    func resize(cols: Int) {
+        self.cols = max(20, cols)
+        rebuildDisplayText()
     }
 
     func feed(_ text: String) {
@@ -105,23 +113,24 @@ final class NativeTerminalBuffer {
             pendingCarriageReturn = false
         case 0x08, 0x7F:
             pendingCarriageReturn = false
-            if !currentLine.isEmpty {
-                currentLine.removeLast()
-            }
+            cursorX = max(0, cursorX - 1)
         case 0x09:
             applyPendingCarriageReturn()
-            currentLine.append("    ")
+            let spaces = 4 - (cursorX % 4)
+            for _ in 0..<spaces {
+                append(Character(" "))
+            }
         case 0x00...0x1F:
             break
         default:
             applyPendingCarriageReturn()
-            currentLine.append(Character(scalar))
+            append(Character(scalar))
         }
     }
 
     private func applyPendingCarriageReturn() {
         if pendingCarriageReturn {
-            currentLine = ""
+            cursorX = 0
             pendingCarriageReturn = false
         }
     }
@@ -129,14 +138,20 @@ final class NativeTerminalBuffer {
     private func handleCSI(final: Character, parameters: String) {
         switch final {
         case "J":
-            lines.removeAll(keepingCapacity: true)
-            currentLine = ""
+            history.removeAll(keepingCapacity: true)
+            currentLine = []
+            cursorX = 0
             pendingCarriageReturn = false
         case "K":
             pendingCarriageReturn = false
-            currentLine = ""
+            eraseInLine(parameters: parameters)
         case "G":
-            break
+            cursorX = max(0, min(cols - 1, firstParameter(parameters, defaultValue: 1) - 1))
+        case "C":
+            cursorX = max(0, min(cols - 1, cursorX + firstParameter(parameters, defaultValue: 1)))
+            padLine(to: cursorX)
+        case "D":
+            cursorX = max(0, cursorX - firstParameter(parameters, defaultValue: 1))
         case "m":
             break
         default:
@@ -144,21 +159,69 @@ final class NativeTerminalBuffer {
         }
     }
 
+    private func append(_ character: Character) {
+        if cursorX >= cols {
+            commitLine()
+        }
+        padLine(to: cursorX)
+        if cursorX < currentLine.count {
+            currentLine[cursorX] = character
+        } else {
+            currentLine.append(character)
+        }
+        cursorX += 1
+    }
+
+    private func padLine(to index: Int) {
+        while currentLine.count < index {
+            currentLine.append(" ")
+        }
+    }
+
+    private func eraseInLine(parameters: String) {
+        let mode = firstParameter(parameters, defaultValue: 0)
+        switch mode {
+        case 1:
+            if cursorX > 0 {
+                for index in 0..<min(cursorX, currentLine.count) {
+                    currentLine[index] = " "
+                }
+            }
+        case 2:
+            currentLine = []
+            cursorX = 0
+        default:
+            if cursorX < currentLine.count {
+                currentLine.removeSubrange(cursorX..<currentLine.count)
+            }
+        }
+    }
+
+    private func firstParameter(_ parameters: String, defaultValue: Int) -> Int {
+        let sanitized = parameters
+            .replacingOccurrences(of: "?", with: "")
+            .split(separator: ";")
+            .first
+            .flatMap { Int($0) }
+        return max(0, sanitized ?? defaultValue)
+    }
+
     private func commitLine() {
-        lines.append(currentLine)
-        currentLine = ""
+        history.append(String(currentLine).trimmingTrailingSpaces())
+        currentLine = []
+        cursorX = 0
         trimLinesIfNeeded()
     }
 
     private func trimLinesIfNeeded() {
-        guard lines.count > maxLines else { return }
-        lines.removeFirst(lines.count - maxLines)
+        guard history.count > maxLines else { return }
+        history.removeFirst(history.count - maxLines)
     }
 
     private func rebuildDisplayText() {
         trimLinesIfNeeded()
-        var visible = lines
-        visible.append(currentLine)
+        var visible = history
+        visible.append(String(currentLine).trimmingTrailingSpaces())
         displayText = visible.suffix(maxLines).joined(separator: "\n")
     }
 
@@ -255,6 +318,7 @@ final class NativeTerminalClient {
         let nextRows = max(6, rows)
         self.cols = nextCols
         self.rows = nextRows
+        buffer.resize(cols: nextCols)
         sendEnvelope(["type": "resize", "cols": nextCols, "rows": nextRows])
     }
 
@@ -323,9 +387,8 @@ final class NativeTerminalClient {
             if let sessionId = payload["sessionId"] as? String {
                 self.sessionId = sessionId
             }
-            if let rawProfile = payload["terminalProfile"] as? String,
-               let profile = TerminalProfile(rawValue: rawProfile) {
-                terminalProfile = profile
+            if let rawProfile = payload["terminalProfile"] as? String, !rawProfile.isEmpty {
+                terminalProfile = .powershell
             }
             if let backend = payload["backend"] as? String {
                 self.backend = backend
@@ -381,7 +444,6 @@ final class NativeTerminalClient {
                     rows: self.rows,
                     createdAt: nil,
                     lastActivityAt: nil,
-                    localAttachCommand: nil,
                     clientCount: nil
                 )
                 self.reconnectTask = nil
@@ -451,5 +513,15 @@ enum TerminalKey: String, CaseIterable, Identifiable {
         case .controlD: return "\u{04}"
         case .controlL: return "\u{0C}"
         }
+    }
+}
+
+private extension String {
+    func trimmingTrailingSpaces() -> String {
+        var value = self
+        while value.last == " " {
+            value.removeLast()
+        }
+        return value
     }
 }

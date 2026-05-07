@@ -2,7 +2,6 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const readline = require('readline');
-const childProcess = require('child_process');
 
 const ACTIVE_EVENT_GAP_CAP_MS = 5 * 60 * 1000;
 const KNOWN_TOOL_CALL_TYPES = new Set([
@@ -444,15 +443,15 @@ function extractSessionIdFromFilename(filePath) {
   return match ? match[1] : null;
 }
 
-function quoteShellArg(value) {
-  return `'${String(value).replace(/'/g, `'\"'\"'`)}'`;
+function quotePowerShellString(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
 }
 
 function buildResumeCommand(sessionId) {
   return `codex resume ${sessionId}`;
 }
 
-function normalizeCwdForWsl(cwd) {
+function normalizeCwdForPowerShell(cwd) {
   if (typeof cwd !== 'string') {
     return null;
   }
@@ -462,11 +461,10 @@ function normalizeCwdForWsl(cwd) {
     return null;
   }
 
-  // Normalize WSL UNC path, e.g. \\wsl.localhost\Ubuntu\home\user\.codex
-  // (or legacy \\wsl$\Ubuntu\...) into Linux path.
-  const wslUncMatch = trimmed.match(/^\\\\wsl(?:\.localhost|\$)?\\[^\\]+\\(.+)$/i);
-  if (wslUncMatch && wslUncMatch[1]) {
-    return `/${wslUncMatch[1].replace(/\\/g, '/')}`;
+  // Non-native UNC stores cannot be resumed safely from the native PowerShell PTY.
+  const nonNativeUncMatch = trimmed.match(/^\\\\wsl(?:\.localhost|\$)?\\[^\\]+\\(.+)$/i);
+  if (nonNativeUncMatch && nonNativeUncMatch[1]) {
+    return null;
   }
 
   // Normalize Windows extended-length prefix, e.g. \\?\C:\Users\...
@@ -475,28 +473,38 @@ function normalizeCwdForWsl(cwd) {
   }
 
   if (trimmed.startsWith('/mnt/')) {
-    return trimmed;
+    const mntMatch = trimmed.match(/^\/mnt\/([a-zA-Z])\/?(.*)$/);
+    if (!mntMatch) {
+      return null;
+    }
+    const drive = mntMatch[1].toUpperCase();
+    const rest = (mntMatch[2] || '').replace(/\//g, '\\');
+    return rest ? `${drive}:\\${rest}` : `${drive}:\\`;
   }
 
   const drivePathMatch = trimmed.match(/^([a-zA-Z]):[\\/](.*)$/);
   if (drivePathMatch) {
-    const drive = drivePathMatch[1].toLowerCase();
-    const rest = drivePathMatch[2].replace(/\\/g, '/');
-    return `/mnt/${drive}/${rest}`;
+    const drive = drivePathMatch[1].toUpperCase();
+    const rest = drivePathMatch[2].replace(/\//g, '\\');
+    return `${drive}:\\${rest}`;
+  }
+
+  if (trimmed.startsWith('/')) {
+    return null;
   }
 
   return trimmed;
 }
 
 function buildResumeShellCommand(sessionId, options = {}) {
-  const codexHome = normalizeCwdForWsl(options.codexHome) || '';
-  const cwd = normalizeCwdForWsl(options.cwd);
-  const envPrefix = codexHome ? `CODEX_HOME=${quoteShellArg(codexHome)} ` : '';
+  const codexHome = normalizeCwdForPowerShell(options.codexHome) || '';
+  const cwd = normalizeCwdForPowerShell(options.cwd);
+  const envPrefix = codexHome ? `$env:CODEX_HOME = ${quotePowerShellString(codexHome)}; ` : '';
   const baseCommand = `${envPrefix}${buildResumeCommand(sessionId)}`;
 
   if (cwd) {
-    const quotedCwd = quoteShellArg(cwd);
-    return `if [ -d ${quotedCwd} ]; then ${baseCommand} -C ${quotedCwd}; else ${baseCommand}; fi`;
+    const quotedCwd = quotePowerShellString(cwd);
+    return `if (Test-Path -LiteralPath ${quotedCwd}) { ${baseCommand} -C ${quotedCwd} } else { ${baseCommand} }`;
   }
 
   return baseCommand;
@@ -710,7 +718,7 @@ async function parseSessionFile(filePath) {
     session.id = `${path.basename(filePath)}-${Math.trunc(stat.mtimeMs)}`;
   }
 
-  session.preferredCwd = normalizeCwdForWsl(session.cwd);
+  session.preferredCwd = normalizeCwdForPowerShell(session.cwd);
   session.resumeCommand = buildResumeCommand(session.id);
   session.resumeCommandWithCwd = buildResumeCommand(session.id);
   session.metricsQuality = resolveMetricsQuality(session);
@@ -843,7 +851,6 @@ class CodexSessionIndex {
   constructor(options = {}) {
     const codexHome = options.codexHome || process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 
-    this.defaultShell = options.defaultShell || process.env.PTY_COMMAND || '';
     this.primaryCodexHome = codexHome;
     this.sessionsRootCandidates = this._buildSessionsRootCandidates(options, codexHome);
     this.sessionsRoots = this._resolveExistingSessionsRoots();
@@ -978,7 +985,7 @@ class CodexSessionIndex {
           session.storeSessionsRoot = sessionsRoot;
           session.storeCodexHome = storeCodexHome;
           session.storeHistoryPath = historyPath || null;
-          session.preferredCwd = normalizeCwdForWsl(session.cwd);
+          session.preferredCwd = normalizeCwdForPowerShell(session.cwd);
 
           const historyEntry = historyAvailable ? historyIndex.get(session.id) : null;
           if (!historyAvailable) {
@@ -1090,51 +1097,10 @@ class CodexSessionIndex {
     pushUnique(preferred, process.env.CODEX_SESSIONS_DIR);
     pushMany(preferred, extraRoots);
 
-    const shell = String(this.defaultShell || '').toLowerCase();
-    const wslRoot = this._detectWslCodexHomeWindows();
-    const useWslOnly = process.platform === 'win32' && (shell.includes('wsl') || shell.endsWith('wsl.exe'));
-    if (wslRoot && useWslOnly) {
-      pushUnique(preferred, path.join(wslRoot, 'sessions'));
-      return [...preferred, ...candidates];
-    }
-
-    if (wslRoot) {
-      pushUnique(candidates, path.join(wslRoot, 'sessions'));
-    }
-
     pushUnique(candidates, path.join(codexHome, 'sessions'));
     pushUnique(candidates, path.join(os.homedir(), '.codex', 'sessions'));
 
     return [...preferred, ...candidates];
-  }
-
-  _detectWslCodexHomeWindows() {
-    if (process.platform !== 'win32') {
-      return null;
-    }
-
-    const attempts = [
-      ['-e', 'sh', '-lc', 'wslpath -w "$HOME/.codex"'],
-      ['sh', '-lc', 'wslpath -w "$HOME/.codex"']
-    ];
-
-    for (const args of attempts) {
-      try {
-        const output = childProcess.execFileSync('wsl.exe', args, {
-          encoding: 'utf8',
-          stdio: ['ignore', 'pipe', 'ignore']
-        });
-
-        const resolved = String(output || '').replace(/\r/g, '').trim();
-        if (resolved) {
-          return resolved;
-        }
-      } catch (_error) {
-        continue;
-      }
-    }
-
-    return null;
   }
 
   _resolveExistingSessionsRoots() {

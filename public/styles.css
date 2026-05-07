@@ -313,20 +313,6 @@ body {
   color: var(--muted);
 }
 
-.attach-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-}
-
-#local-attach-line {
-  font-family: "JetBrains Mono", "Fira Code", Consolas, Menlo, monospace;
-  font-size: 12px;
-  word-break: break-all;
-  flex: 1;
-}
-
 .view-switch {
   display: inline-flex;
   align-items: center;
@@ -1446,11 +1432,6 @@ body.remote-simulated-fullscreen .remote-stage .remote-overlay {
     height: 32px;
     min-width: 130px;
     font-size: 12px;
-  }
-
-  .attach-row {
-    flex-direction: column;
-    align-items: flex-start;
   }
 
   .terminal-shell {

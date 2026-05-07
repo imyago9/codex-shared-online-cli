@@ -20,13 +20,13 @@
     <header class="topbar">
       <div class="title-wrap">
         <div class="title">Local Codex Console</div>
-        <div class="subtitle">PowerShell default with optional WSL terminals</div>
+        <div class="subtitle">Native PowerShell terminals over Tailscale</div>
       </div>
 
       <div class="controls">
         <label class="session-label" for="session-select">Session</label>
         <select id="session-select" class="session-select"></select>
-        <button id="new-session" class="control-btn" type="button">New</button>
+        <button id="new-session" class="control-btn" type="button">New PowerShell</button>
         <button id="delete-session" class="control-btn danger" type="button">End</button>
         <div id="connection" class="status">Connecting...</div>
       </div>
@@ -78,10 +78,6 @@
           </div>
         </div>
         <div id="hint" class="hint">Tap or click inside the terminal to focus. Session input is shared per selected session.</div>
-        <div class="attach-row">
-          <div class="hint" id="local-attach-line"></div>
-          <button id="copy-attach-command" class="control-btn" type="button">Copy Attach Cmd</button>
-        </div>
         <section class="codex-panel" aria-label="Codex sessions">
           <div class="codex-head">
             <div class="codex-title">Codex Sessions On This Device</div>

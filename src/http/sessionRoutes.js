@@ -7,11 +7,7 @@ function isSafeSessionId(value) {
 
 function createSessionRoutes(sessionManager, codexSessionIndex) {
   const router = express.Router();
-  const terminalProfiles = () => (
-    sessionManager.defaultTerminalProfile === 'system'
-      ? ['system', 'powershell', 'wsl']
-      : ['powershell', 'wsl']
-  );
+  const terminalProfiles = () => ['powershell'];
 
   router.get('/health', (_req, res) => {
     res.json({
@@ -54,10 +50,13 @@ function createSessionRoutes(sessionManager, codexSessionIndex) {
       const terminalProfile = typeof body.terminalProfile === 'string'
         ? body.terminalProfile.trim()
         : (typeof body.shellType === 'string' ? body.shellType.trim() : '');
+      if (terminalProfile && terminalProfile.toLowerCase() !== 'powershell') {
+        return res.status(400).json({ error: 'Only native PowerShell terminal sessions are supported' });
+      }
 
       const session = sessionManager.createSession({
         name: name || undefined,
-        terminalProfile: terminalProfile || undefined
+        terminalProfile: 'powershell'
       });
 
       return res.status(201).json({

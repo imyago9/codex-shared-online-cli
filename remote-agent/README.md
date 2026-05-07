@@ -8,7 +8,7 @@ This sidecar runs on the Windows host and exposes desktop streaming + input cont
 - `WS /input` (normalized mouse/keyboard input)
 
 ## Why this exists
-The main app can run inside WSL, but Windows desktop capture/control must execute on the Windows host. This sidecar keeps those responsibilities isolated.
+Windows desktop capture/control runs as a host-side service so the main app can keep terminal, Codex, and remote desktop responsibilities cleanly separated.
 
 ## Startup
 Set `REMOTE_ENABLED=true` in the main app `.env`, then run `npm start` from the repository root. The main startup script installs missing sidecar dependencies and starts this process automatically.
