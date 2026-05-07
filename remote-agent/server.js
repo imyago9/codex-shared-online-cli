@@ -2254,15 +2254,19 @@ function getDisplayCatalogSnapshot() {
   return [createVirtualDisplayDescriptor(displayBounds)];
 }
 
-function getSelectedDisplayCatalogSnapshot() {
+function getDisplayCatalogSnapshotForMonitorIds(monitorIds) {
   const catalog = getDisplayCatalogSnapshot();
-  if (!Array.isArray(streamState.activeMonitorIds) || streamState.activeMonitorIds.length === 0) {
+  if (!Array.isArray(monitorIds) || monitorIds.length === 0) {
     return catalog;
   }
 
-  const selected = new Set(streamState.activeMonitorIds);
+  const selected = new Set(monitorIds);
   const selectedDisplays = catalog.filter((display) => selected.has(display.id));
   return selectedDisplays.length > 0 ? selectedDisplays : catalog;
+}
+
+function getSelectedDisplayCatalogSnapshot() {
+  return getDisplayCatalogSnapshotForMonitorIds(streamState.activeMonitorIds);
 }
 
 function mapNormalizedInputThroughMonitorLayout(x, y) {
@@ -2978,12 +2982,17 @@ function broadcastVideoCursor() {
   const bounds = videoState.activePlan && videoState.activePlan.bounds
     ? videoState.activePlan.bounds
     : null;
-  const x = bounds && Number.isFinite(cursorSnapshot.screenX)
-    ? Math.max(0, Math.min(1, (cursorSnapshot.screenX - bounds.left) / Math.max(1, bounds.width - 1)))
-    : cursorSnapshot.x;
-  const y = bounds && Number.isFinite(cursorSnapshot.screenY)
-    ? Math.max(0, Math.min(1, (cursorSnapshot.screenY - bounds.top) / Math.max(1, bounds.height - 1)))
-    : cursorSnapshot.y;
+  const visualCursor = mapPhysicalCursorToActiveVideoLayout(cursorSnapshot);
+  const x = visualCursor
+    ? visualCursor.x
+    : (bounds && Number.isFinite(cursorSnapshot.screenX)
+      ? Math.max(0, Math.min(1, (cursorSnapshot.screenX - bounds.left) / Math.max(1, bounds.width - 1)))
+      : cursorSnapshot.x);
+  const y = visualCursor
+    ? visualCursor.y
+    : (bounds && Number.isFinite(cursorSnapshot.screenY)
+      ? Math.max(0, Math.min(1, (cursorSnapshot.screenY - bounds.top) / Math.max(1, bounds.height - 1)))
+      : cursorSnapshot.y);
   broadcastVideoControl({
     type: 'cursor',
     x,
@@ -2996,6 +3005,55 @@ function broadcastVideoCursor() {
     mapHeight: cursorSnapshot.mapHeight,
     at: cursorSnapshot.at
   });
+}
+
+function mapPhysicalCursorToActiveVideoLayout(cursorSnapshot) {
+  if (!cursorSnapshot || !Number.isFinite(cursorSnapshot.screenX) || !Number.isFinite(cursorSnapshot.screenY)) {
+    return null;
+  }
+
+  const hasLayout = Array.isArray(videoState.activeMonitorLayout) && videoState.activeMonitorLayout.length > 0;
+  const hasSelection = Array.isArray(videoState.activeMonitorIds) && videoState.activeMonitorIds.length > 0;
+  if (!hasLayout && !hasSelection) {
+    return null;
+  }
+
+  const physicalDisplays = getDisplayCatalogSnapshotForMonitorIds(videoState.activeMonitorIds);
+  if (physicalDisplays.length === 0) {
+    return null;
+  }
+
+  const visualDisplays = hasLayout
+    ? applyMonitorLayout(physicalDisplays, videoState.activeMonitorLayout)
+    : physicalDisplays;
+  const visualBounds = computeDisplayUnion(visualDisplays);
+  if (!visualBounds) {
+    return null;
+  }
+
+  const physicalDisplay = physicalDisplays.find((display) => (
+    cursorSnapshot.screenX >= display.left
+    && cursorSnapshot.screenX <= display.left + display.width
+    && cursorSnapshot.screenY >= display.top
+    && cursorSnapshot.screenY <= display.top + display.height
+  ));
+  if (!physicalDisplay) {
+    return null;
+  }
+
+  const visualDisplay = visualDisplays.find((display) => display.id === physicalDisplay.id);
+  if (!visualDisplay) {
+    return null;
+  }
+
+  const localX = Math.max(0, Math.min(1, (cursorSnapshot.screenX - physicalDisplay.left) / Math.max(1, physicalDisplay.width)));
+  const localY = Math.max(0, Math.min(1, (cursorSnapshot.screenY - physicalDisplay.top) / Math.max(1, physicalDisplay.height)));
+  const visualX = visualDisplay.left + localX * Math.max(1, visualDisplay.width - 1);
+  const visualY = visualDisplay.top + localY * Math.max(1, visualDisplay.height - 1);
+  return {
+    x: Math.max(0, Math.min(1, (visualX - visualBounds.left) / Math.max(1, visualBounds.width - 1))),
+    y: Math.max(0, Math.min(1, (visualY - visualBounds.top) / Math.max(1, visualBounds.height - 1)))
+  };
 }
 
 function broadcastVideoStats() {
@@ -3071,6 +3129,7 @@ function recomputeVideoSettings() {
   let nextFps = config.videoFps;
   let nextBitrateKbps = config.videoBitrateKbps;
   let nextMonitorIds = [];
+  let nextMonitorLayout = [];
 
   for (const client of videoState.clients) {
     if (!isWsOpen(client)) {
@@ -3085,6 +3144,9 @@ function recomputeVideoSettings() {
     if (Array.isArray(client.requestedMonitorIds) && client.requestedMonitorIds.length > 0) {
       nextMonitorIds = client.requestedMonitorIds.slice(0, 16);
     }
+    if (Array.isArray(client.requestedMonitorLayout) && client.requestedMonitorLayout.length > 0) {
+      nextMonitorLayout = client.requestedMonitorLayout.slice(0, 16);
+    }
   }
 
   const changed = nextFps !== videoState.activeFps
@@ -3094,8 +3156,9 @@ function recomputeVideoSettings() {
   videoState.activeFps = nextFps;
   videoState.activeBitrateKbps = nextBitrateKbps;
   videoState.activeMonitorIds = nextMonitorIds;
+  videoState.activeMonitorLayout = nextMonitorLayout;
   streamState.activeMonitorIds = nextMonitorIds;
-  streamState.activeMonitorLayout = [];
+  streamState.activeMonitorLayout = nextMonitorLayout;
 
   if (changed && videoState.process) {
     scheduleVideoRestart('video-settings-changed');

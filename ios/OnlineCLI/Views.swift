@@ -860,6 +860,8 @@ private struct RemoteStageSurface: UIViewRepresentable {
 private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate {
     private final class MonitorLayers {
         let imageLayer = CALayer()
+        let videoContainerLayer = CALayer()
+        let videoLayer = AVSampleBufferDisplayLayer()
         let strokeLayer = CAShapeLayer()
         let labelBackgroundLayer = CAShapeLayer()
         let textLayer = CATextLayer()
@@ -869,11 +871,19 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
             imageLayer.magnificationFilter = .linear
             imageLayer.minificationFilter = .linear
             imageLayer.contentsScale = contentsScale
+            videoContainerLayer.masksToBounds = true
+            videoContainerLayer.contentsScale = contentsScale
+            videoContainerLayer.isHidden = true
+            videoLayer.videoGravity = .resize
+            videoLayer.backgroundColor = UIColor.black.cgColor
+            videoLayer.contentsScale = contentsScale
             textLayer.contentsScale = contentsScale
             textLayer.alignmentMode = .center
             textLayer.truncationMode = .end
             textLayer.isWrapped = false
             contentParent.addSublayer(imageLayer)
+            contentParent.addSublayer(videoContainerLayer)
+            videoContainerLayer.addSublayer(videoLayer)
             overlayParent.addSublayer(strokeLayer)
             overlayParent.addSublayer(labelBackgroundLayer)
             overlayParent.addSublayer(textLayer)
@@ -881,6 +891,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
 
         func removeFromSuperlayer() {
             imageLayer.removeFromSuperlayer()
+            videoContainerLayer.removeFromSuperlayer()
             strokeLayer.removeFromSuperlayer()
             labelBackgroundLayer.removeFromSuperlayer()
             textLayer.removeFromSuperlayer()
@@ -892,7 +903,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         let visualBounds: CGRect
         let visualFrame: CGRect
         let monitorFrames: [RemoteMonitorStageFrame]
-        let usesMonitorImageLayers: Bool
+        let usesMonitorLayers: Bool
     }
 
     private let imageView = UIView()
@@ -1051,6 +1062,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
             videoActive = false
             flushVideoLayer(removeImage: true)
             videoLayer.isHidden = true
+            hideMonitorVideoLayers()
         }
         latestImage = update.image
         desktopSize = update.pixelSize
@@ -1084,14 +1096,6 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         imageView.layer.contents = nil
         videoActive = true
         desktopSize = update.pixelSize
-        let renderer = videoLayer.sampleBufferRenderer
-        if renderer.status == .failed || renderer.requiresFlushToResumeDecoding {
-            flushVideoLayer(removeImage: false)
-        }
-        if !renderer.isReadyForMoreMediaData {
-            renderer.flush()
-        }
-        renderer.enqueue(sampleBuffer)
         placeholderView.isHidden = true
         cursorView.isHidden = remoteCursor == nil
 
@@ -1099,6 +1103,19 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
             || previousDesktopSize != update.pixelSize
             || videoLayer.isHidden
             || placeholderView.frame != bounds
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if let geometry = stageGeometry(panOffset: panOffsetValue, zoom: zoomValue), geometry.usesMonitorLayers {
+            videoLayer.isHidden = true
+            monitorContentLayer.isHidden = false
+            updateMonitorVideoLayers(geometry: geometry, sampleBuffer: sampleBuffer)
+            updateMonitorOverlay(frames: geometry.monitorFrames)
+        } else {
+            hideMonitorVideoLayers()
+            monitorContentLayer.isHidden = true
+            enqueue(sampleBuffer, on: videoLayer)
+        }
+        CATransaction.commit()
         if geometryChanged {
             setNeedsLayout()
         }
@@ -1128,16 +1145,25 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         if let geometry = stageGeometry(panOffset: panOffsetValue, zoom: zoomValue), hasRenderableFrame {
             if videoActive {
                 imageView.isHidden = true
-                monitorContentLayer.isHidden = true
                 hideMonitorImageLayers()
-                videoLayer.isHidden = false
-                videoLayer.frame = pixelAligned(geometry.visualFrame)
+                if geometry.usesMonitorLayers {
+                    videoLayer.isHidden = true
+                    monitorContentLayer.isHidden = false
+                    updateMonitorVideoLayers(geometry: geometry)
+                } else {
+                    monitorContentLayer.isHidden = true
+                    hideMonitorVideoLayers()
+                    videoLayer.isHidden = false
+                    videoLayer.frame = pixelAligned(geometry.visualFrame)
+                    videoLayer.contentsRect = CGRect(x: 0, y: 0, width: 1, height: 1)
+                }
                 updateMonitorOverlay(frames: geometry.monitorFrames)
             } else if let image = latestImage {
                 videoLayer.isHidden = true
-                imageView.isHidden = geometry.usesMonitorImageLayers
-                monitorContentLayer.isHidden = !geometry.usesMonitorImageLayers
-                if geometry.usesMonitorImageLayers {
+                hideMonitorVideoLayers()
+                imageView.isHidden = geometry.usesMonitorLayers
+                monitorContentLayer.isHidden = !geometry.usesMonitorLayers
+                if geometry.usesMonitorLayers {
                     updateMonitorLayers(geometry: geometry, image: image)
                 } else {
                     hideMonitorImageLayers()
@@ -1501,8 +1527,9 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
             return
         }
 
-        let desktopX = geometry.sourceBounds.minX + geometry.sourceBounds.width * min(1, max(0, remoteCursor.x))
-        let desktopY = geometry.sourceBounds.minY + geometry.sourceBounds.height * min(1, max(0, remoteCursor.y))
+        let cursorBounds = geometry.usesMonitorLayers ? geometry.visualBounds : geometry.sourceBounds
+        let desktopX = cursorBounds.minX + cursorBounds.width * min(1, max(0, remoteCursor.x))
+        let desktopY = cursorBounds.minY + cursorBounds.height * min(1, max(0, remoteCursor.y))
         guard geometry.visualBounds.contains(CGPoint(x: desktopX, y: desktopY)) else {
             cursorView.isHidden = true
             return
@@ -1523,11 +1550,51 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
             let layers = monitorLayers[frame.id] ?? makeMonitorLayers(for: frame.id)
             layers.imageLayer.isHidden = false
             layers.imageLayer.contents = image
-            layers.imageLayer.contentsRect = contentsRect(for: frame.desktopRect, sourceBounds: geometry.sourceBounds)
+            layers.imageLayer.contentsRect = contentsRect(for: frame.sourceRect, sourceBounds: geometry.sourceBounds)
             layers.imageLayer.frame = pixelAligned(frame.rect)
+            layers.videoContainerLayer.isHidden = true
         }
 
         updateMonitorOverlay(frames: geometry.monitorFrames)
+    }
+
+    private func updateMonitorVideoLayers(geometry: StageGeometry, sampleBuffer: CMSampleBuffer? = nil) {
+        monitorContentLayer.isHidden = false
+        let activeIds = Set(geometry.monitorFrames.map(\.id))
+        removeInactiveMonitorLayers(activeIds: activeIds)
+
+        for frame in geometry.monitorFrames {
+            let layers = monitorLayers[frame.id] ?? makeMonitorLayers(for: frame.id)
+            layers.imageLayer.isHidden = true
+            layers.imageLayer.contents = nil
+            layers.videoContainerLayer.isHidden = false
+            layers.videoContainerLayer.frame = pixelAligned(frame.rect)
+            layers.videoLayer.frame = videoLayerFrame(for: frame, sourceBounds: geometry.sourceBounds)
+            if let sampleBuffer {
+                enqueue(copySampleBuffer(sampleBuffer), on: layers.videoLayer)
+            }
+        }
+    }
+
+    private func enqueue(_ sampleBuffer: CMSampleBuffer, on layer: AVSampleBufferDisplayLayer) {
+        let renderer = layer.sampleBufferRenderer
+        if renderer.status == .failed || renderer.requiresFlushToResumeDecoding {
+            renderer.flush()
+        }
+        if !renderer.isReadyForMoreMediaData {
+            renderer.flush()
+        }
+        renderer.enqueue(sampleBuffer)
+    }
+
+    private func copySampleBuffer(_ sampleBuffer: CMSampleBuffer) -> CMSampleBuffer {
+        var copiedSampleBuffer: CMSampleBuffer?
+        let status = CMSampleBufferCreateCopy(
+            allocator: kCFAllocatorDefault,
+            sampleBuffer: sampleBuffer,
+            sampleBufferOut: &copiedSampleBuffer
+        )
+        return status == noErr ? (copiedSampleBuffer ?? sampleBuffer) : sampleBuffer
     }
 
     private func updateMonitorOverlay(frames: [RemoteMonitorStageFrame]) {
@@ -1590,6 +1657,24 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         }
     }
 
+    private func hideMonitorVideoLayers() {
+        for layers in monitorLayers.values {
+            layers.videoContainerLayer.isHidden = true
+            layers.videoLayer.sampleBufferRenderer.flush()
+        }
+    }
+
+    private func videoLayerFrame(for frame: RemoteMonitorStageFrame, sourceBounds: CGRect) -> CGRect {
+        let scaleX = frame.rect.width / max(1, frame.sourceRect.width)
+        let scaleY = frame.rect.height / max(1, frame.sourceRect.height)
+        return pixelAligned(CGRect(
+            x: -(frame.sourceRect.minX - sourceBounds.minX) * scaleX,
+            y: -(frame.sourceRect.minY - sourceBounds.minY) * scaleY,
+            width: sourceBounds.width * scaleX,
+            height: sourceBounds.height * scaleY
+        ))
+    }
+
     private func monitorLabelRect(for label: String, in rect: CGRect) -> CGRect {
         let font = UIFont.boldSystemFont(ofSize: 11)
         let size = (label as NSString).size(withAttributes: [.font: font])
@@ -1610,12 +1695,12 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
 
         let selectedMonitors = stageMonitors()
         let selectedMonitorIds = Set(selectedMonitors.map(\.id))
-        let usesMonitorImageLayers = monitors.count > 1
+        let hasLayoutOffsets = !monitorLayoutOffsets.isEmpty
+        let usesMonitorLayers = monitors.count > 1
             && !selectedMonitors.isEmpty
-            && selectedMonitorIds.count < Set(monitors.map(\.id)).count
-            && sourceBoundsIntersects(monitors: selectedMonitors, sourceBounds: sourceBounds)
+            && (selectedMonitorIds.count < Set(monitors.map(\.id)).count || hasLayoutOffsets)
 
-        let visualBounds = usesMonitorImageLayers ? monitorUnion(for: selectedMonitors) : sourceBounds
+        let visualBounds = usesMonitorLayers ? monitorUnion(for: selectedMonitors) : sourceBounds
         guard visualBounds.width > 0, visualBounds.height > 0 else { return nil }
 
         let frame = pixelAligned(contentFrame(for: visualBounds.size, panOffset: panOffset, zoom: zoom))
@@ -1623,8 +1708,8 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
             sourceBounds: sourceBounds,
             visualBounds: visualBounds,
             visualFrame: frame,
-            monitorFrames: monitorFrames(in: frame, visualBounds: visualBounds, monitors: usesMonitorImageLayers ? selectedMonitors : monitors),
-            usesMonitorImageLayers: usesMonitorImageLayers
+            monitorFrames: monitorFrames(in: frame, visualBounds: visualBounds, monitors: usesMonitorLayers ? selectedMonitors : monitors),
+            usesMonitorLayers: usesMonitorLayers
         )
     }
 
@@ -1643,6 +1728,12 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
                 return nil
             }
 
+            let sourceRect = CGRect(
+                x: CGFloat(monitor.left) + (intersection.minX - rawRect.minX),
+                y: CGFloat(monitor.top) + (intersection.minY - rawRect.minY),
+                width: intersection.width,
+                height: intersection.height
+            )
             let x = visualFrame.minX + ((intersection.minX - visualBounds.minX) / visualBounds.width) * visualFrame.width
             let y = visualFrame.minY + ((intersection.minY - visualBounds.minY) / visualBounds.height) * visualFrame.height
             let width = (intersection.width / visualBounds.width) * visualFrame.width
@@ -1651,7 +1742,8 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
                 id: monitor.id,
                 monitor: monitor,
                 rect: CGRect(x: x, y: y, width: width, height: height),
-                desktopRect: intersection
+                desktopRect: intersection,
+                sourceRect: sourceRect
             )
         }
     }
@@ -1689,14 +1781,6 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
 
     private func monitorUnion(for monitors: [RemoteMonitorDescriptor]) -> CGRect {
         RemoteMonitorLayoutGeometry(monitors: monitors, offsets: monitorLayoutOffsets).union
-    }
-
-    private func sourceBoundsIntersects(monitors: [RemoteMonitorDescriptor], sourceBounds: CGRect) -> Bool {
-        let layout = RemoteMonitorLayoutGeometry(monitors: monitors, offsets: monitorLayoutOffsets)
-        return monitors.contains { monitor in
-            let intersection = layout.rect(for: monitor).intersection(sourceBounds)
-            return !intersection.isNull && intersection.width > 1 && intersection.height > 1
-        }
     }
 
     private func normalizedPoint(for location: CGPoint) -> CGPoint? {
@@ -2037,6 +2121,7 @@ private struct RemoteMonitorStageFrame: Identifiable {
     let monitor: RemoteMonitorDescriptor
     let rect: CGRect
     var desktopRect: CGRect = .zero
+    var sourceRect: CGRect = .zero
 }
 
 struct RemoteTopOverlay: View {
