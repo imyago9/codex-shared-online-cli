@@ -1,17 +1,12 @@
-# Local Codex Native Console
+# Online CLI Console
 
-A Tailscale-first console for native PowerShell terminals, Codex thread browsing, native iOS control surfaces, and optional remote desktop streaming.
+A Tailscale-first console for native PowerShell terminals, native iOS control surfaces, and optional remote desktop streaming.
 
 ## What is included
 - Native PowerShell is the terminal runtime on Windows
 - Direct persistent PTY sessions for PowerShell
 - Multi-session mode by default: each terminal is an independent PowerShell console
 - REST API for session lifecycle (`/api/sessions`)
-- Device-wide Codex thread index + one-click resume into terminal sessions
-  - Resume safety: sessions are marked resumable using local `~/.codex/history.jsonl`
-  - Native PowerShell resume commands with Windows path normalization
-  - Duplicate session ids across stores are deduped before serving API results
-  - Metrics now expose `metricsQuality` (`complete|partial|estimated`) and both `activeDurationMs` + `elapsedDurationMs`
 - Session-scoped WebSocket streaming (`/ws?sessionId=...`)
 - Optional remote desktop sidecar integration (`Remote` tab, decoupled from Console)
   - Browser stream via proxied WS (`/ws/remote`) over the same tailnet access boundary
@@ -20,37 +15,15 @@ A Tailscale-first console for native PowerShell terminals, Codex thread browsing
 - Optional command sidecar for Windows host automation over Tailscale
   - Token-gated command runs, live output streaming, run history, stop support
   - Useful for fetching/pulling on Windows, restarting `npm start`, and closing the Mac/iOS/Windows loop
-- Native iOS console, Codex Threads, metrics dashboard, stream presets, remote cursor relay, live gateway stats, and desktop shortcut actions
+- Native iOS console, stream presets, remote cursor relay, live gateway stats, and desktop shortcut actions
 - Idle session cleanup + max session guardrails
 - Graceful shutdown persistence:
   - Server shutdown detaches web clients; direct PTY sessions are recreated from saved metadata
   - Active sessions are saved and restored on next server start
-- Structured server modules (`src/config`, `src/http`, `src/sessions`, `src/ws`, `src/codex`)
+- Structured server modules (`src/config`, `src/http`, `src/sessions`, `src/ws`, `src/remote`)
 - iOS touch scroll stability update in the frontend (no private xterm monkey-patching)
 - Touch and wheel scrolling support for terminal history across desktop and iOS clients
-- Top pill view switch with an in-depth metrics dashboard (calendar + filters + summary cards)
-
-## Screenshots
-### 1) Console view with Codex open
-![Console view with Codex open](docs/screenshots/image-1.jpg)
-
-### 2) Codex session list
-![Codex session list](docs/screenshots/image-2.jpg)
-
-### 3) Metric filters
-![Metric filters](docs/screenshots/image-3.jpg)
-
-### 4) Calendar
-![Calendar](docs/screenshots/image-4.jpg)
-
-### 5) iOS console synced with desktop (from screenshot 6)
-![iOS console synced with desktop](docs/screenshots/image-5.jpg)
-
-### 6) Desktop console synced with iOS (from screenshot 5)
-![Desktop console synced with iOS](docs/screenshots/image-6.jpg)
-
-### 7) Calendar and metrics on desktop
-![Calendar and metrics on desktop](docs/screenshots/image-7.jpg)
+- Top pill view switch for Console and Remote
 
 ## Requirements
 - Windows with PowerShell available
@@ -90,7 +63,7 @@ HTTP and WebSocket requests are accepted only when they arrive through Tailscale
 ## Native iOS App
 The SwiftUI iPhone app lives in `ios/OnlineCLI.xcodeproj`. The Console tab is native SwiftUI/UIKit and talks directly to `/ws?sessionId=...`; it no longer embeds the browser console. It supports native PowerShell terminal creation, hardware/software keyboard input, resize messages, scrollback, paste/copy, and terminal control keys.
 
-The old Sessions tab is now Threads. Terminal sessions are managed from Console; Codex threads are indexed and resumed from Threads or Metrics.
+The iOS app is intentionally focused on Console, Remote, and Settings. CLI agents and other tools can still be used normally inside any PowerShell terminal or through the remote desktop.
 
 Run `npm start` first, keep Tailscale connected on the iPhone, then open the Xcode project and build the `OnlineCLI` scheme. The app defaults to the printed tailnet URL and can be changed in Settings.
 
@@ -143,7 +116,7 @@ cd command-sidecar
 .\tailscale-serve.ps1 -Path /cmd -Port 3777
 ```
 
-From Mac/Codex:
+From Mac:
 ```bash
 export WINDOWS_COMMAND_URL="https://desktop-cguakc2.tailbca5e0.ts.net/cmd"
 export WINDOWS_COMMAND_TOKEN="<generated-token>"
@@ -196,11 +169,6 @@ npm install
 - `POST /api/sessions/:sessionId/restart`
 - `DELETE /api/sessions/:sessionId`
 - `POST /api/sessions/:sessionId/command`
-- `GET /api/codex/sessions`
-  - Query params: `limit` (number or `all`), `search`, `cwd`, `refresh=1`
-  - Optional query param: `resumable=1|0`
-- `GET /api/codex/sessions/:codexSessionId`
-- `POST /api/codex/sessions/:codexSessionId/resume`
 - `GET /api/remote/status`
 - `GET /api/remote/capabilities`
   - Includes stream presets, supported desktop actions, display metadata, and live remote gateway stats
@@ -229,11 +197,6 @@ npm install
 - `SESSION_STATE_FILE` (default: `<project>/.online-cli/sessions-state.json`; persisted session metadata used to restore sessions after restart)
 - `WS_HEARTBEAT_MS` (default: `30000`)
 - `LOG_LEVEL` (`debug|info|warn|error`, default: `info`)
-- `CODEX_HOME` (default: `~/.codex`)
-- `CODEX_SESSIONS_DIR` (default: `$CODEX_HOME/sessions`)
-- `CODEX_HISTORY_FILE` (default auto-detected, including `$CODEX_HOME/history.jsonl`)
-- `CODEX_EXTRA_SESSIONS_DIRS` (optional `;`-delimited extra Codex session dirs)
-
 ## Code layout
 - `server.js`: startup entry point
 - `scripts/start.js`: Tailscale Serve + optional remote sidecar orchestrator
@@ -242,7 +205,6 @@ npm install
 - `src/network/tailscaleAccess.js`: loopback/Tailscale source and same-origin access checks
 - `src/http/remoteRoutes.js`: remote status/capability endpoints
 - `src/sessions/`: native PowerShell PTY runtime and manager
-- `src/codex/codexSessionIndex.js`: parses local Codex JSONL sessions and metrics
 - `src/ws/sessionGateway.js`: WebSocket routing and heartbeats
 - `src/ws/remoteGateway.js`: tailnet-gated remote stream/control websocket proxy
 - `src/remote/remoteClient.js`: sidecar health/connection helper

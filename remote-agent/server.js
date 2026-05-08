@@ -448,23 +448,106 @@ function resolveWindowsDisplayCatalog(logger) {
 
   try {
     const command = `
-Add-Type -AssemblyName System.Windows.Forms
-$items = @([System.Windows.Forms.Screen]::AllScreens | ForEach-Object {
-  $bounds = $_.Bounds
-  $name = $_.DeviceName
-  if ($_.Primary) { $name = 'Primary' }
-  [PSCustomObject]@{
-    id = $_.DeviceName
-    name = $name
-    primary = $_.Primary
-    left = $bounds.Left
-    top = $bounds.Top
-    width = $bounds.Width
-    height = $bounds.Height
+$source = @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+namespace OnlineCli {
+  public static class MonitorCatalog {
+    private const int MONITORINFOF_PRIMARY = 1;
+
+    [DllImport("user32.dll")]
+    private static extern bool SetProcessDPIAware();
+
+    [DllImport("user32.dll", EntryPoint = "SetProcessDpiAwarenessContext")]
+    private static extern bool SetProcessDpiAwarenessContext(IntPtr dpiContext);
+
+    private delegate bool MonitorEnumDelegate(IntPtr hMonitor, IntPtr hdcMonitor, ref Rect monitorRect, IntPtr data);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr clipRect, MonitorEnumDelegate callback, IntPtr data);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MonitorInfoEx monitorInfo);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Rect {
+      public int left;
+      public int top;
+      public int right;
+      public int bottom;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+    private struct MonitorInfoEx {
+      public int cbSize;
+      public Rect monitor;
+      public Rect work;
+      public int flags;
+
+      [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+      public string deviceName;
+    }
+
+    public sealed class Display {
+      public string id { get; set; }
+      public string name { get; set; }
+      public bool primary { get; set; }
+      public int left { get; set; }
+      public int top { get; set; }
+      public int right { get; set; }
+      public int bottom { get; set; }
+      public int width { get; set; }
+      public int height { get; set; }
+    }
+
+    public static Display[] GetDisplays() {
+      EnableDpiAwareness();
+      var displays = new List<Display>();
+      MonitorEnumDelegate callback = delegate(IntPtr hMonitor, IntPtr hdcMonitor, ref Rect monitorRect, IntPtr data) {
+        var info = new MonitorInfoEx();
+        info.cbSize = Marshal.SizeOf(typeof(MonitorInfoEx));
+        if (!GetMonitorInfo(hMonitor, ref info)) {
+          return true;
+        }
+
+        var isPrimary = (info.flags & MONITORINFOF_PRIMARY) == MONITORINFOF_PRIMARY;
+        displays.Add(new Display {
+          id = info.deviceName,
+          name = isPrimary ? "Primary" : info.deviceName,
+          primary = isPrimary,
+          left = info.monitor.left,
+          top = info.monitor.top,
+          right = info.monitor.right,
+          bottom = info.monitor.bottom,
+          width = Math.Max(1, info.monitor.right - info.monitor.left),
+          height = Math.Max(1, info.monitor.bottom - info.monitor.top)
+        });
+        return true;
+      };
+
+      EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, callback, IntPtr.Zero);
+      return displays.ToArray();
+    }
+
+    private static void EnableDpiAwareness() {
+      try {
+        SetProcessDpiAwarenessContext(new IntPtr(-4));
+      } catch {
+        try {
+          SetProcessDPIAware();
+        } catch {
+        }
+      }
+    }
   }
-})
+}
+'@
+Add-Type -TypeDefinition $source
+$items = @([OnlineCli.MonitorCatalog]::GetDisplays())
 ConvertTo-Json -Compress -Depth 4 -InputObject $items
-`;
+	`;
 
     const raw = childProcess.execFileSync('powershell', ['-NoProfile', '-Command', command], {
       encoding: 'utf8',
@@ -482,6 +565,27 @@ ConvertTo-Json -Compress -Depth 4 -InputObject $items
     });
     return [];
   }
+}
+
+function applyDisplayBoundsFromCatalog(targetBounds, displays, source = 'windows-display-catalog') {
+  const bounds = computeDisplayUnion(displays);
+  if (!targetBounds || !bounds) {
+    return false;
+  }
+
+  targetBounds.left = bounds.left;
+  targetBounds.top = bounds.top;
+  targetBounds.width = bounds.width;
+  targetBounds.height = bounds.height;
+  targetBounds.virtualLeft = bounds.left;
+  targetBounds.virtualTop = bounds.top;
+  targetBounds.virtualWidth = bounds.width;
+  targetBounds.virtualHeight = bounds.height;
+  targetBounds.scaleX = 1;
+  targetBounds.scaleY = 1;
+  targetBounds.source = source;
+  targetBounds.baseSource = source;
+  return true;
 }
 
 function computeDisplayUnion(displays) {
@@ -2296,16 +2400,16 @@ function mapNormalizedInputThroughMonitorLayout(x, y) {
   const visualY = visualBounds.top + normalizedY * Math.max(1, visualBounds.height - 1);
   let visualDisplay = visualDisplays.find((display) => (
     visualX >= display.left
-    && visualX <= display.left + display.width
+    && visualX < display.left + display.width
     && visualY >= display.top
-    && visualY <= display.top + display.height
+    && visualY < display.top + display.height
   ));
 
   if (!visualDisplay) {
     visualDisplay = visualDisplays
       .map((display) => {
-        const clampedX = Math.max(display.left, Math.min(display.left + display.width, visualX));
-        const clampedY = Math.max(display.top, Math.min(display.top + display.height, visualY));
+        const clampedX = Math.max(display.left, Math.min(display.left + Math.max(0, display.width - 1), visualX));
+        const clampedY = Math.max(display.top, Math.min(display.top + Math.max(0, display.height - 1), visualY));
         return {
           display,
           distance: Math.hypot(visualX - clampedX, visualY - clampedY)
@@ -2323,8 +2427,8 @@ function mapNormalizedInputThroughMonitorLayout(x, y) {
     return null;
   }
 
-  const localX = Math.max(0, Math.min(1, (visualX - visualDisplay.left) / Math.max(1, visualDisplay.width)));
-  const localY = Math.max(0, Math.min(1, (visualY - visualDisplay.top) / Math.max(1, visualDisplay.height)));
+  const localX = Math.max(0, Math.min(1, (visualX - visualDisplay.left) / Math.max(1, visualDisplay.width - 1)));
+  const localY = Math.max(0, Math.min(1, (visualY - visualDisplay.top) / Math.max(1, visualDisplay.height - 1)));
   return {
     px: physicalDisplay.left + Math.round(localX * Math.max(1, physicalDisplay.width - 1)),
     py: physicalDisplay.top + Math.round(localY * Math.max(1, physicalDisplay.height - 1))
@@ -2337,6 +2441,7 @@ const initialWindowsDisplayCatalog = resolveWindowsDisplayCatalog(logger);
 if (initialWindowsDisplayCatalog.length > 0) {
   captureDisplayCatalog.entries = initialWindowsDisplayCatalog;
   captureDisplayCatalog.refreshedAt = Date.now();
+  applyDisplayBoundsFromCatalog(displayBounds, initialWindowsDisplayCatalog);
 }
 
 async function refreshCaptureDisplayCatalog(force = false) {
@@ -2360,6 +2465,7 @@ async function refreshCaptureDisplayCatalog(force = false) {
       captureDisplayCatalog.entries = nextEntries;
       captureDisplayCatalog.refreshedAt = Date.now();
       captureDisplayCatalog.lastError = null;
+      applyDisplayBoundsFromCatalog(displayBounds, nextEntries);
       return nextEntries;
     })
     .catch((error) => {
@@ -2712,7 +2818,7 @@ function getSelectedVideoDisplays() {
 }
 
 function evenVideoDimension(value) {
-  return Math.max(2, Math.floor(Math.max(2, value) / 2) * 2);
+  return Math.max(2, Math.ceil(Math.max(2, value) / 2) * 2);
 }
 
 function h264NalType(unit) {
@@ -2852,8 +2958,8 @@ function createVideoCapturePlan() {
   const captureBounds = {
     left: Math.round(bounds.left || 0),
     top: Math.round(bounds.top || 0),
-    width: evenVideoDimension(bounds.width || displayBounds.virtualWidth || displayBounds.width || 1920),
-    height: evenVideoDimension(bounds.height || displayBounds.virtualHeight || displayBounds.height || 1080)
+    width: Math.max(2, Math.round(bounds.width || displayBounds.virtualWidth || displayBounds.width || 1920)),
+    height: Math.max(2, Math.round(bounds.height || displayBounds.virtualHeight || displayBounds.height || 1080))
   };
   const output = fitVideoOutputSize(captureBounds.width, captureBounds.height);
   return {
@@ -3033,9 +3139,9 @@ function mapPhysicalCursorToActiveVideoLayout(cursorSnapshot) {
 
   const physicalDisplay = physicalDisplays.find((display) => (
     cursorSnapshot.screenX >= display.left
-    && cursorSnapshot.screenX <= display.left + display.width
+    && cursorSnapshot.screenX < display.left + display.width
     && cursorSnapshot.screenY >= display.top
-    && cursorSnapshot.screenY <= display.top + display.height
+    && cursorSnapshot.screenY < display.top + display.height
   ));
   if (!physicalDisplay) {
     return null;
@@ -3046,8 +3152,8 @@ function mapPhysicalCursorToActiveVideoLayout(cursorSnapshot) {
     return null;
   }
 
-  const localX = Math.max(0, Math.min(1, (cursorSnapshot.screenX - physicalDisplay.left) / Math.max(1, physicalDisplay.width)));
-  const localY = Math.max(0, Math.min(1, (cursorSnapshot.screenY - physicalDisplay.top) / Math.max(1, physicalDisplay.height)));
+  const localX = Math.max(0, Math.min(1, (cursorSnapshot.screenX - physicalDisplay.left) / Math.max(1, physicalDisplay.width - 1)));
+  const localY = Math.max(0, Math.min(1, (cursorSnapshot.screenY - physicalDisplay.top) / Math.max(1, physicalDisplay.height - 1)));
   const visualX = visualDisplay.left + localX * Math.max(1, visualDisplay.width - 1);
   const visualY = visualDisplay.top + localY * Math.max(1, visualDisplay.height - 1);
   return {

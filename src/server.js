@@ -11,7 +11,6 @@ const { createRemoteRoutes } = require('./http/remoteRoutes');
 const { createRemoteClient } = require('./remote/remoteClient');
 const { createSessionGateway } = require('./ws/sessionGateway');
 const { createRemoteGateway } = require('./ws/remoteGateway');
-const { CodexSessionIndex } = require('./codex/codexSessionIndex');
 
 function startServer(options = {}) {
   const logger = createLogger(config.logLevel);
@@ -66,10 +65,9 @@ function startServer(options = {}) {
   });
 
   sessionManager.start();
-  const codexSessionIndex = new CodexSessionIndex({ logger });
 
   app.use('/api', createRemoteRoutes(remoteClient));
-  app.use('/api', createSessionRoutes(sessionManager, codexSessionIndex));
+  app.use('/api', createSessionRoutes(sessionManager));
 
   app.use((error, _req, res, _next) => {
     const statusCode = Number.isInteger(error.statusCode) ? error.statusCode : 500;

@@ -13,6 +13,12 @@ private enum RemoteChromeSpacing {
     static let edgeInset: CGFloat = 2
     static let portraitTabInset: CGFloat = 84
     static let monitorPanelDockGap: CGFloat = 54
+    static let quickDockHeight: CGFloat = 50
+    static let controlsLauncherGap: CGFloat = 8
+    static let controlsDockGap: CGFloat = 12
+    static let controlsDockHeight = quickDockHeight + controlsLauncherGap + quickDockHeight
+    static let portraitKeyboardDockOverlap: CGFloat = 78
+    static let landscapeKeyboardDockGap: CGFloat = 8
 }
 
 struct RemoteTelemetrySnapshot: Equatable {
@@ -63,12 +69,6 @@ struct RootView: View {
 
             RemoteDesktopView()
                 .tabItem { Label("Remote", systemImage: "desktopcomputer") }
-
-            ThreadsView()
-                .tabItem { Label("Threads", systemImage: "bubble.left.and.text.bubble.right") }
-
-            MetricsView()
-                .tabItem { Label("Metrics", systemImage: "chart.bar.xaxis") }
 
             SettingsView()
                 .tabItem { Label("Settings", systemImage: "gearshape") }
@@ -383,6 +383,7 @@ struct RemoteDesktopView: View {
     @State private var controlsOffset = CGSize.zero
     @State private var interfaceIsLandscape = false
     @State private var keyboardHeight: CGFloat = 0
+    @State private var keyboardAnimationDuration = 0.25
     @State private var telemetry = RemoteTelemetrySnapshot()
     @State private var monitorPanelPresented = false
     @State private var monitorDragMode = false
@@ -401,6 +402,8 @@ struct RemoteDesktopView: View {
                 let leadingChromeOutset = useLandscapeEdgeOutsets ? edgeOutset(proxy.safeAreaInsets.leading) : 0
                 let trailingChromeOutset = useLandscapeEdgeOutsets ? edgeOutset(proxy.safeAreaInsets.trailing) : 0
                 let bottomChromeOutset = isLandscape && keyboardHeight <= 0 ? edgeOutset(proxy.safeAreaInsets.bottom) : 0
+                let quickDockInset = quickDockBottomInset(isLandscape: isLandscape)
+                let controlsBottomInset = controlsBottomInset(quickDockBottomInset: quickDockInset)
                 ZStack {
                     Color.black.ignoresSafeArea()
 
@@ -428,40 +431,27 @@ struct RemoteDesktopView: View {
                     .allowsHitTesting(!(monitorPanelPresented && monitorDragMode))
                     .ignoresSafeArea(edges: .bottom)
 
-                    VStack {
-                        Spacer()
-                        RemoteDiagnosticsOverlay(telemetry: telemetry)
-                            .padding(.bottom, quickDockBottomInset(isLandscape: isLandscape) + 58)
-                    }
-                    .allowsHitTesting(false)
-                    .zIndex(10)
-
                     VStack(spacing: 0) {
                         HStack {
-                            RemoteTopOverlay(
-                                telemetry: telemetry,
-                                mode: $desiredMode,
-                                profile: $streamProfile,
-                                gestureMode: $gestureMode,
-                                compact: true,
-                                onConnect: connect,
-                                onDisconnect: disconnect,
-                                onModeChange: setRemoteMode,
-                                onProfileChange: { profile in
-                                    streamProfile = profile
-                                    app.settings.remoteStreamProfile = profile
-                                    client.setStreamProfile(profile)
-                                    refreshTelemetry()
+                            RemoteQuickDockButton(
+                                systemName: client.isConnected ? "pause.fill" : "play.fill",
+                                isActive: client.isConnected,
+                                accessibilityLabel: client.isConnected ? "Pause remote stream" : "Start remote stream"
+                            ) {
+                                if client.isConnected {
+                                    disconnect()
+                                } else {
+                                    connect()
                                 }
-                            )
-                            .frame(maxWidth: min(isLandscape ? 300 : 360, proxy.size.width - (RemoteChromeSpacing.edgeInset * 2)))
+                            }
+                            .padding(.leading, RemoteChromeSpacing.edgeInset)
+                            .padding(.top, RemoteChromeSpacing.edgeInset)
+                            .offset(x: -leadingChromeOutset)
                             Spacer(minLength: 0)
                         }
-                        .padding(.horizontal, RemoteChromeSpacing.edgeInset)
-                        .padding(.top, RemoteChromeSpacing.edgeInset)
-
                         Spacer()
                     }
+                    .zIndex(50)
 
                     if monitorPanelPresented {
                         VStack {
@@ -479,7 +469,7 @@ struct RemoteDesktopView: View {
                                 )
                                 .frame(width: min(isLandscape ? 310 : 340, proxy.size.width - (RemoteChromeSpacing.edgeInset * 2)))
                                 .padding(.trailing, RemoteChromeSpacing.edgeInset)
-                                .padding(.bottom, quickDockBottomInset(isLandscape: isLandscape) + RemoteChromeSpacing.monitorPanelDockGap)
+                                .padding(.bottom, controlsBottomInset + RemoteChromeSpacing.monitorPanelDockGap)
                                 .offset(x: trailingChromeOutset, y: bottomChromeOutset)
                             }
                         }
@@ -500,50 +490,58 @@ struct RemoteDesktopView: View {
                         actions: app.remoteCapabilities?.actions ?? [],
                         keyboardVisible: remoteKeyboardVisible,
                         onKeyboardFocus: focusRemoteKeyboard,
-                        anchor: .leading
+                        anchor: .trailing
                     )
                     .padding(RemoteChromeSpacing.edgeInset)
-                    .offset(x: -leadingChromeOutset, y: bottomChromeOutset)
+                    .offset(x: trailingChromeOutset, y: bottomChromeOutset - controlsBottomInset)
+                    .animation(.easeOut(duration: keyboardAnimationDuration), value: controlsBottomInset)
+                    .zIndex(45)
 
                     VStack {
                         Spacer()
-                        HStack {
+                        HStack(alignment: .bottom) {
+                            if keyboardHeight > 0 {
+                                RemoteEscButton {
+                                    client.sendKey("Escape", code: "Escape")
+                                }
+                                .transition(.scale(scale: 0.92).combined(with: .opacity))
+                            }
+
                             Spacer(minLength: 0)
-                            RemoteQuickDock(
-                                mode: desiredMode,
-                                monitorActive: monitorPanelPresented,
-                                monitorCount: availableMonitors.count,
-                                keyboardFocused: remoteKeyboardVisible,
-                                onControlToggle: toggleControlMode,
-                                onMonitorToggle: toggleMonitorPanel,
-                                onKeyboardToggle: toggleRemoteKeyboard
-                            )
+
+                            VStack(alignment: .trailing, spacing: RemoteChromeSpacing.controlsLauncherGap) {
+                                RemoteControlsLauncherButton(isActive: !controlsCollapsed) {
+                                    withAnimation(.spring(response: 0.24, dampingFraction: 0.82)) {
+                                        controlsCollapsed.toggle()
+                                    }
+                                }
+
+                                RemoteQuickDock(
+                                    mode: desiredMode,
+                                    monitorActive: monitorPanelPresented,
+                                    monitorCount: availableMonitors.count,
+                                    keyboardFocused: remoteKeyboardVisible,
+                                    onControlToggle: toggleControlMode,
+                                    onMonitorToggle: toggleMonitorPanel,
+                                    onKeyboardToggle: toggleRemoteKeyboard
+                                )
+                            }
                         }
+                        .padding(.leading, RemoteChromeSpacing.edgeInset)
                         .padding(.trailing, RemoteChromeSpacing.edgeInset)
-                        .padding(.bottom, quickDockBottomInset(isLandscape: isLandscape))
+                        .padding(.bottom, quickDockInset)
                         .offset(x: trailingChromeOutset, y: bottomChromeOutset)
+                        .animation(.easeOut(duration: keyboardAnimationDuration), value: quickDockInset)
+                        .animation(.spring(response: 0.22, dampingFraction: 0.86), value: keyboardHeight > 0)
                     }
+                    .zIndex(55)
 
                 }
                 .ignoresSafeArea(.keyboard, edges: .bottom)
-                .toolbar(isLandscape ? .hidden : .visible, for: .navigationBar)
+                .toolbar(.hidden, for: .navigationBar)
                 .toolbar(isLandscape ? .hidden : .visible, for: .tabBar)
             }
-            .navigationTitle("Remote")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        Task {
-                            await app.refreshRemoteStatus()
-                            await app.refreshRemoteCapabilities()
-                        }
-                    } label: {
-                        Image(systemName: "bolt.horizontal.circle")
-                    }
-                    .accessibilityLabel("Refresh remote status")
-                }
-            }
+            .ignoresSafeArea(.keyboard, edges: .bottom)
             .onAppear {
                 desiredMode = app.settings.defaultRemoteMode
                 streamProfile = app.settings.remoteStreamProfile
@@ -690,10 +688,16 @@ struct RemoteDesktopView: View {
     }
 
     private func quickDockBottomInset(isLandscape: Bool) -> CGFloat {
-        if keyboardHeight > 0 {
-            return keyboardHeight + RemoteChromeSpacing.edgeInset
-        }
-        return isLandscape ? RemoteChromeSpacing.edgeInset : RemoteChromeSpacing.portraitTabInset
+        let restingInset = isLandscape ? RemoteChromeSpacing.edgeInset : RemoteChromeSpacing.portraitTabInset
+        guard keyboardHeight > 0 else { return restingInset }
+        let keyboardInset = isLandscape
+            ? keyboardHeight + RemoteChromeSpacing.landscapeKeyboardDockGap
+            : keyboardHeight - RemoteChromeSpacing.portraitKeyboardDockOverlap
+        return max(restingInset, keyboardInset)
+    }
+
+    private func controlsBottomInset(quickDockBottomInset: CGFloat) -> CGFloat {
+        quickDockBottomInset + RemoteChromeSpacing.controlsDockHeight + RemoteChromeSpacing.controlsDockGap
     }
 
     private func edgeOutset(_ safeInset: CGFloat) -> CGFloat {
@@ -709,6 +713,7 @@ struct RemoteDesktopView: View {
         let screenHeight = UIScreen.main.bounds.height
         let nextHeight = max(0, screenHeight - endFrame.minY)
         let duration = notification.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double ?? 0.25
+        keyboardAnimationDuration = duration
         withAnimation(.easeOut(duration: duration)) {
             keyboardHeight = nextHeight > 12 ? nextHeight : 0
         }
@@ -1566,7 +1571,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
             layers.imageLayer.isHidden = false
             layers.imageLayer.contents = image
             layers.imageLayer.contentsRect = contentsRect(for: frame.sourceRect, sourceBounds: geometry.sourceBounds)
-            layers.imageLayer.frame = pixelAligned(frame.rect)
+            layers.imageLayer.frame = pixelAlignedEdges(frame.rect)
             layers.videoContainerLayer.isHidden = true
         }
 
@@ -1583,7 +1588,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
             layers.imageLayer.isHidden = true
             layers.imageLayer.contents = nil
             layers.videoContainerLayer.isHidden = false
-            layers.videoContainerLayer.frame = pixelAligned(frame.rect)
+            layers.videoContainerLayer.frame = pixelAlignedEdges(frame.rect)
             layers.videoLayer.frame = videoLayerFrame(for: frame, sourceBounds: geometry.sourceBounds)
             if let sampleBuffer, let copiedSampleBuffer = deepCopySampleBuffer(sampleBuffer) {
                 if layers.videoLayer.sampleBufferRenderer.status == .failed {
@@ -1703,7 +1708,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
 
         for frame in frames {
             let layers = monitorLayers[frame.id] ?? makeMonitorLayers(for: frame.id)
-            let rect = pixelAligned(frame.rect)
+            let rect = pixelAlignedEdges(frame.rect)
             let path = UIBezierPath(roundedRect: rect, cornerRadius: 5).cgPath
             layers.strokeLayer.path = path
             layers.strokeLayer.fillColor = UIColor.clear.cgColor
@@ -1761,7 +1766,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     private func videoLayerFrame(for frame: RemoteMonitorStageFrame, sourceBounds: CGRect) -> CGRect {
         let scaleX = frame.rect.width / max(1, frame.sourceRect.width)
         let scaleY = frame.rect.height / max(1, frame.sourceRect.height)
-        return pixelAligned(CGRect(
+        return pixelAlignedEdges(CGRect(
             x: -(frame.sourceRect.minX - sourceBounds.minX) * scaleX,
             y: -(frame.sourceRect.minY - sourceBounds.minY) * scaleY,
             width: sourceBounds.width * scaleX,
@@ -1964,13 +1969,17 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
 
         let x = (desktopRect.minX - sourceBounds.minX) / sourceBounds.width
         let y = (desktopRect.minY - sourceBounds.minY) / sourceBounds.height
-        let width = desktopRect.width / sourceBounds.width
-        let height = desktopRect.height / sourceBounds.height
+        let maxX = (desktopRect.maxX - sourceBounds.minX) / sourceBounds.width
+        let maxY = (desktopRect.maxY - sourceBounds.minY) / sourceBounds.height
+        let clampedX = min(1, max(0, x))
+        let clampedY = min(1, max(0, y))
+        let clampedMaxX = min(1, max(clampedX, maxX))
+        let clampedMaxY = min(1, max(clampedY, maxY))
         return CGRect(
-            x: min(1, max(0, x)),
-            y: min(1, max(0, y)),
-            width: min(1, max(0, width)),
-            height: min(1, max(0, height))
+            x: clampedX,
+            y: clampedY,
+            width: clampedMaxX - clampedX,
+            height: clampedMaxY - clampedY
         )
     }
 
@@ -1982,6 +1991,21 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
             y: (rect.origin.y * scale).rounded() / scale,
             width: (rect.size.width * scale).rounded() / scale,
             height: (rect.size.height * scale).rounded() / scale
+        )
+    }
+
+    private func pixelAlignedEdges(_ rect: CGRect) -> CGRect {
+        let scale = window?.screen.scale ?? UIScreen.main.scale
+        guard scale > 0 else { return rect }
+        let minX = (rect.minX * scale).rounded() / scale
+        let minY = (rect.minY * scale).rounded() / scale
+        let maxX = (rect.maxX * scale).rounded() / scale
+        let maxY = (rect.maxY * scale).rounded() / scale
+        return CGRect(
+            x: minX,
+            y: minY,
+            width: max(0, maxX - minX),
+            height: max(0, maxY - minY)
         )
     }
 
@@ -2218,201 +2242,6 @@ private struct RemoteMonitorStageFrame: Identifiable {
     var sourceRect: CGRect = .zero
 }
 
-struct RemoteTopOverlay: View {
-    let telemetry: RemoteTelemetrySnapshot
-    @Binding var mode: RemoteMode
-    @Binding var profile: RemoteStreamProfile
-    @Binding var gestureMode: RemoteGestureMode
-    let compact: Bool
-    let onConnect: () -> Void
-    let onDisconnect: () -> Void
-    let onModeChange: (RemoteMode) -> Void
-    let onProfileChange: (RemoteStreamProfile) -> Void
-
-    var body: some View {
-        Group {
-            if compact {
-                compactBody
-            } else {
-                regularBody
-            }
-        }
-        .padding(compact ? 10 : 12)
-        .frame(minHeight: compact ? 52 : 78)
-        .remoteFloatingSurface(cornerRadius: compact ? 20 : 24)
-    }
-
-    private var regularBody: some View {
-        VStack(spacing: 10) {
-            headerRow
-
-            HStack(spacing: 10) {
-                modePicker
-                    .pickerStyle(.segmented)
-
-                streamPicker
-                    .pickerStyle(.menu)
-
-                gesturePicker
-                    .pickerStyle(.menu)
-            }
-        }
-    }
-
-    private var compactBody: some View {
-        HStack(spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(telemetry.state.title)
-                    .font(.caption.weight(.semibold))
-                Text(compactStatusLine)
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-
-            Spacer(minLength: 4)
-
-            compactOptionsMenu
-            connectButton
-        }
-    }
-
-    private var headerRow: some View {
-        HStack(spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(telemetry.state.title)
-                    .font(.headline)
-                Text(statusLine)
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-
-            Spacer()
-            connectButton
-        }
-    }
-
-    private var connectButton: some View {
-        Button {
-            if case .connected = telemetry.state {
-                onDisconnect()
-            } else {
-                onConnect()
-            }
-        } label: {
-            Image(systemName: isConnected ? "stop.fill" : "play.fill")
-                .frame(width: 34, height: 34)
-        }
-        .remoteControlButtonSurface(cornerRadius: 17)
-    }
-
-    private var modePicker: some View {
-        Picker("Mode", selection: $mode) {
-            ForEach(RemoteMode.allCases) { mode in
-                Text(mode.title).tag(mode)
-            }
-        }
-        .onChange(of: mode) { _, newMode in
-            onModeChange(newMode)
-        }
-    }
-
-    private var streamPicker: some View {
-        Picker("Stream", selection: $profile) {
-            ForEach(RemoteStreamProfile.allCases) { profile in
-                Label(profile.title, systemImage: profile.systemImage).tag(profile)
-            }
-        }
-        .onChange(of: profile) { _, newProfile in
-            onProfileChange(newProfile)
-        }
-    }
-
-    private var gesturePicker: some View {
-        Picker("Gesture", selection: $gestureMode) {
-            ForEach(RemoteGestureMode.allCases) { mode in
-                Label(mode.title, systemImage: mode.systemImage).tag(mode)
-            }
-        }
-    }
-
-    private var compactOptionsMenu: some View {
-        Menu {
-            Picker("Mode", selection: $mode) {
-                ForEach(RemoteMode.allCases) { mode in
-                    Text(mode.title).tag(mode)
-                }
-            }
-            .onChange(of: mode) { _, newMode in
-                onModeChange(newMode)
-            }
-
-            Picker("Stream", selection: $profile) {
-                ForEach(RemoteStreamProfile.allCases) { profile in
-                    Label(profile.title, systemImage: profile.systemImage).tag(profile)
-                }
-            }
-            .onChange(of: profile) { _, newProfile in
-                onProfileChange(newProfile)
-            }
-
-            Picker("Gesture", selection: $gestureMode) {
-                ForEach(RemoteGestureMode.allCases) { mode in
-                    Label(mode.title, systemImage: mode.systemImage).tag(mode)
-                }
-            }
-        } label: {
-            Image(systemName: "ellipsis.circle")
-                .frame(width: 34, height: 34)
-        }
-        .buttonStyle(.plain)
-        .remoteControlButtonSurface(cornerRadius: 17)
-    }
-
-    private var isConnected: Bool {
-        if case .connected = telemetry.state {
-            return true
-        }
-        return false
-    }
-
-    private var statusLine: String {
-        let latencyText = telemetry.latency.map { " • \(Int($0)) ms" } ?? ""
-        let sizeText = telemetry.displaySizeText.map { " • \($0)" } ?? ""
-        let bytesText = telemetry.frameBytes > 0 ? " • \(ByteCountFormatter.string(fromByteCount: Int64(telemetry.frameBytes), countStyle: .file))" : ""
-        return "\(telemetry.status) • \(String(format: "%.1f", telemetry.fps)) fps\(latencyText)\(sizeText)\(bytesText)"
-    }
-
-    private var compactStatusLine: String {
-        let latencyText = telemetry.latency.map { " • \(Int($0)) ms" } ?? ""
-        return "\(String(format: "%.1f", telemetry.fps)) fps\(latencyText)"
-    }
-}
-
-struct RemoteDiagnosticsOverlay: View {
-    let telemetry: RemoteTelemetrySnapshot
-
-    var body: some View {
-        HStack(spacing: 8) {
-            diagnostic("RX", telemetry.receivedFps, suffix: "fps")
-            diagnostic("Draw", telemetry.presentedFps, suffix: "fps")
-            diagnostic("Dec", telemetry.decodeMs, suffix: "ms")
-            diagnostic("Layer", telemetry.renderMs, suffix: "ms")
-            Text("Drop \(telemetry.droppedFrames)")
-            Text("Input \(telemetry.droppedInputEvents)")
-        }
-        .font(.caption2.monospacedDigit().weight(.semibold))
-        .foregroundStyle(.white.opacity(0.88))
-        .padding(.horizontal, 10)
-        .padding(.vertical, 7)
-        .background(.black.opacity(0.62), in: Capsule())
-    }
-
-    private func diagnostic(_ label: String, _ value: Double, suffix: String) -> Text {
-        Text("\(label) \(String(format: "%.1f", value))\(suffix)")
-    }
-}
-
 struct RemoteQuickDock: View {
     let mode: RemoteMode
     let monitorActive: Bool
@@ -2450,6 +2279,42 @@ struct RemoteQuickDock: View {
         }
         .padding(6)
         .remoteFloatingSurface(cornerRadius: 26)
+    }
+}
+
+struct RemoteControlsLauncherButton: View {
+    let isActive: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "gamecontroller")
+                .font(.system(size: 20, weight: .semibold))
+                .foregroundStyle(isActive ? .white : .primary)
+                .frame(width: 50, height: 50)
+                .background(
+                    Circle()
+                        .fill(isActive ? Color.accentColor : Color.white.opacity(0.92))
+                )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(isActive ? "Hide joystick controls" : "Show joystick controls")
+    }
+}
+
+struct RemoteEscButton: View {
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text("Esc")
+                .font(.system(size: 14, weight: .bold, design: .rounded))
+                .foregroundStyle(.primary)
+                .frame(width: 50, height: 50)
+        }
+        .buttonStyle(.plain)
+        .remoteFloatingSurface(cornerRadius: 25, shadow: false)
+        .accessibilityLabel("Escape")
     }
 }
 
@@ -2912,11 +2777,6 @@ private extension Array where Element == RemoteMonitorDescriptor {
 }
 
 struct FloatingRemoteControls: View {
-    private struct DragState: Equatable {
-        var translation = CGSize.zero
-        var isActive = false
-    }
-
     enum Anchor: Equatable {
         case leading
         case trailing
@@ -2945,28 +2805,25 @@ struct FloatingRemoteControls: View {
     let onKeyboardFocus: () -> Void
     let anchor: Anchor
 
-    @GestureState private var dragState = DragState()
-
     var body: some View {
-        ZStack(alignment: anchor.alignment) {
-            Group {
-                if isCollapsed {
-                    collapsedButton
-                } else {
+        Group {
+            if isCollapsed {
+                EmptyView()
+            } else {
+                RemoteStableDraggableHost(
+                    offset: $offset,
+                    panelWidth: panelWidth,
+                    containerSize: containerSize,
+                    anchor: anchor,
+                    isCollapsed: false
+                ) {
                     expandedPanel
+                        .frame(width: panelWidth)
+                        .fixedSize(horizontal: true, vertical: true)
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: anchor.alignment)
             }
-            .frame(width: panelWidth)
-            .offset(x: offset.width + dragState.translation.width, y: offset.height + dragState.translation.height)
-            .transaction { transaction in
-                transaction.animation = nil
-                transaction.disablesAnimations = true
-            }
-            .fixedSize(horizontal: true, vertical: true)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: anchor.alignment)
-        .animation(nil, value: dragState)
-        .animation(nil, value: offset)
     }
 
     private var expandedPanel: some View {
@@ -2993,7 +2850,6 @@ struct FloatingRemoteControls: View {
                 .buttonStyle(.plain)
             }
             .contentShape(Rectangle())
-            .gesture(dragGesture)
 
             RemoteControlDeck(
                 client: client,
@@ -3011,65 +2867,272 @@ struct FloatingRemoteControls: View {
         .remoteFloatingSurface(cornerRadius: 22, shadow: false)
     }
 
-    private var collapsedButton: some View {
-        Image(systemName: "gamecontroller")
-            .font(.system(size: 20, weight: .semibold))
-            .frame(width: 54, height: 54)
-            .contentShape(Rectangle())
-            .remoteFloatingSurface(cornerRadius: 27, shadow: false)
-            .onTapGesture {
-                openPanel()
-            }
-            .simultaneousGesture(dragGesture)
-            .accessibilityLabel("Show joystick controls")
-            .accessibilityAddTraits(.isButton)
-    }
-
-    private func openPanel() {
-        withAnimation(.spring(response: 0.24, dampingFraction: 0.82)) {
-            isCollapsed = false
-        }
-    }
-
-    private var dragGesture: some Gesture {
-        DragGesture(minimumDistance: 8)
-            .updating($dragState) { value, state, _ in
-                state = DragState(translation: value.translation, isActive: true)
-            }
-            .onEnded { value in
-                withoutDragAnimation {
-                    offset = clamped(
-                        CGSize(
-                            width: offset.width + value.translation.width,
-                            height: offset.height + value.translation.height
-                        )
-                    )
-                }
-            }
-    }
-
     private var panelWidth: CGFloat {
-        if isCollapsed {
-            return 56
-        }
         return compact ? min(430, containerSize.width * 0.54) : min(620, containerSize.width - 24)
     }
+}
 
-    private func clamped(_ value: CGSize) -> CGSize {
-        let horizontalLimit = max(0, containerSize.width - panelWidth - 4)
-        let verticalLimit = max(0, containerSize.height - 80)
-        let minX = anchor == .leading ? 0 : -horizontalLimit
-        let maxX = anchor == .leading ? horizontalLimit : 0
+private struct RemoteStableDraggableHost<Content: View>: UIViewControllerRepresentable {
+    @Binding var offset: CGSize
+    let panelWidth: CGFloat
+    let containerSize: CGSize
+    let anchor: FloatingRemoteControls.Anchor
+    let isCollapsed: Bool
+    @ViewBuilder let content: Content
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(offset: $offset)
+    }
+
+    func makeUIViewController(context: Context) -> RemoteStableDraggableController<Content> {
+        let controller = RemoteStableDraggableController(rootView: content)
+        controller.onOffsetCommitted = { context.coordinator.offset.wrappedValue = $0 }
+        return controller
+    }
+
+    func updateUIViewController(_ controller: RemoteStableDraggableController<Content>, context: Context) {
+        context.coordinator.offset = $offset
+        controller.onOffsetCommitted = { context.coordinator.offset.wrappedValue = $0 }
+        controller.update(
+            rootView: content,
+            offset: offset,
+            configuration: RemoteStableDraggableConfiguration(
+                panelWidth: panelWidth,
+                containerSize: containerSize,
+                anchor: anchor,
+                isCollapsed: isCollapsed
+            )
+        )
+    }
+
+    final class Coordinator {
+        var offset: Binding<CGSize>
+
+        init(offset: Binding<CGSize>) {
+            self.offset = offset
+        }
+    }
+}
+
+private struct RemoteStableDraggableConfiguration: Equatable {
+    var panelWidth: CGFloat
+    var containerSize: CGSize
+    var anchor: FloatingRemoteControls.Anchor
+    var isCollapsed: Bool
+
+    var dragHandleHeight: CGFloat {
+        isCollapsed ? 56 : 52
+    }
+}
+
+private final class RemotePassthroughView: UIView {
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        let hitView = super.hitTest(point, with: event)
+        return hitView === self ? nil : hitView
+    }
+}
+
+private final class RemoteStableDraggableController<Content: View>: UIViewController, UIGestureRecognizerDelegate {
+    private let hostingController: UIHostingController<Content>
+    private var configuration = RemoteStableDraggableConfiguration(
+        panelWidth: 56,
+        containerSize: .zero,
+        anchor: .leading,
+        isCollapsed: true
+    )
+    private var committedOffset = CGSize.zero
+    private var activeTranslation = CGSize.zero
+    private var cachedContentSize = CGSize.zero
+    private var panRecognizer: UIPanGestureRecognizer?
+    private var pendingRootView: Content?
+    var onOffsetCommitted: ((CGSize) -> Void)?
+
+    init(rootView: Content) {
+        hostingController = UIHostingController(rootView: rootView)
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func loadView() {
+        let view = RemotePassthroughView()
+        view.backgroundColor = .clear
+        self.view = view
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+
+        hostingController.view.backgroundColor = .clear
+        hostingController.view.clipsToBounds = false
+        hostingController.view.layer.allowsGroupOpacity = false
+        hostingController.view.layer.rasterizationScale = UIScreen.main.scale
+        addChild(hostingController)
+        view.addSubview(hostingController.view)
+        hostingController.didMove(toParent: self)
+
+        let panRecognizer = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
+        panRecognizer.cancelsTouchesInView = false
+        panRecognizer.delegate = self
+        hostingController.view.addGestureRecognizer(panRecognizer)
+        self.panRecognizer = panRecognizer
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        refreshContentSize()
+        layoutHostedView()
+    }
+
+    func update(rootView: Content, offset: CGSize, configuration: RemoteStableDraggableConfiguration) {
+        self.configuration = configuration
+
+        if isDragging {
+            pendingRootView = rootView
+        } else {
+            setDraggingRenderMode(false)
+            hostingController.rootView = rootView
+            refreshContentSize()
+            committedOffset = clamped(offset, in: layoutBounds, contentSize: cachedContentSize)
+            activeTranslation = .zero
+            layoutHostedView()
+        }
+    }
+
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        guard gestureRecognizer === panRecognizer else { return true }
+        let location = gestureRecognizer.location(in: hostingController.view)
+        guard hostingController.view.bounds.contains(location) else { return false }
+        if configuration.isCollapsed {
+            return true
+        }
+        return location.y <= configuration.dragHandleHeight
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+        true
+    }
+
+    @objc private func handlePan(_ recognizer: UIPanGestureRecognizer) {
+        switch recognizer.state {
+        case .began:
+            setDraggingRenderMode(true)
+            activeTranslation = .zero
+            layoutHostedView()
+        case .changed:
+            let translation = recognizer.translation(in: view)
+            activeTranslation = CGSize(width: translation.x, height: translation.y)
+            layoutHostedView()
+        case .ended, .cancelled, .failed:
+            let nextOffset = clamped(
+                CGSize(
+                    width: committedOffset.width + activeTranslation.width,
+                    height: committedOffset.height + activeTranslation.height
+                ),
+                in: layoutBounds,
+                contentSize: cachedContentSize
+            )
+            committedOffset = nextOffset
+            activeTranslation = .zero
+            applyPendingRootViewIfNeeded()
+            setDraggingRenderMode(false)
+            onOffsetCommitted?(nextOffset)
+            layoutHostedView()
+        default:
+            break
+        }
+    }
+
+    private var isDragging: Bool {
+        guard let state = panRecognizer?.state else { return false }
+        return state == .began || state == .changed
+    }
+
+    private var layoutBounds: CGSize {
+        let boundsSize = view.bounds.size
+        if boundsSize.width > 1, boundsSize.height > 1 {
+            return boundsSize
+        }
+        return configuration.containerSize
+    }
+
+    private func refreshContentSize() {
+        cachedContentSize = measuredContentSize()
+    }
+
+    private func measuredContentSize() -> CGSize {
+        let maxSize = CGSize(
+            width: max(1, configuration.panelWidth),
+            height: max(1, layoutBounds.height)
+        )
+        let fittingSize = hostingController.sizeThatFits(in: maxSize)
+        return CGSize(
+            width: max(1, configuration.panelWidth),
+            height: min(maxSize.height, max(1, fittingSize.height))
+        )
+    }
+
+    private func layoutHostedView() {
+        guard isViewLoaded else { return }
+        if cachedContentSize == .zero {
+            refreshContentSize()
+        }
+        let contentSize = cachedContentSize
+        let visualOffset = clamped(
+            CGSize(
+                width: committedOffset.width + activeTranslation.width,
+                height: committedOffset.height + activeTranslation.height
+            ),
+            in: layoutBounds,
+            contentSize: contentSize
+        )
+        let origin = origin(for: visualOffset, contentSize: contentSize, in: layoutBounds)
+
+        UIView.performWithoutAnimation {
+            hostingController.view.frame = CGRect(origin: origin, size: contentSize)
+            hostingController.view.setNeedsLayout()
+            hostingController.view.layoutIfNeeded()
+        }
+    }
+
+    private func applyPendingRootViewIfNeeded() {
+        if let pendingRootView {
+            hostingController.rootView = pendingRootView
+            self.pendingRootView = nil
+            refreshContentSize()
+        }
+    }
+
+    private func setDraggingRenderMode(_ enabled: Bool) {
+        hostingController.view.layer.shouldRasterize = enabled
+    }
+
+    private func origin(for offset: CGSize, contentSize: CGSize, in boundsSize: CGSize) -> CGPoint {
+        let x: CGFloat
+        switch configuration.anchor {
+        case .leading:
+            x = offset.width
+        case .trailing:
+            x = boundsSize.width - contentSize.width + offset.width
+        }
+        return CGPoint(
+            x: x,
+            y: boundsSize.height - contentSize.height + offset.height
+        )
+    }
+
+    private func clamped(_ value: CGSize, in boundsSize: CGSize, contentSize: CGSize) -> CGSize {
+        let horizontalLimit = max(0, boundsSize.width - contentSize.width - 4)
+        let verticalLimit = max(0, boundsSize.height - 80)
+        let minX = configuration.anchor == .leading ? 0 : -horizontalLimit
+        let maxX = configuration.anchor == .leading ? horizontalLimit : 0
         return CGSize(
             width: min(maxX, max(minX, value.width)),
             height: min(0, max(-verticalLimit, value.height))
         )
-    }
-
-    private func withoutDragAnimation(_ updates: () -> Void) {
-        var transaction = Transaction()
-        transaction.disablesAnimations = true
-        withTransaction(transaction, updates)
     }
 }
 
@@ -3366,759 +3429,6 @@ private extension View {
                     .stroke(.white.opacity(0.16), lineWidth: 1)
             }
     }
-}
-
-struct ThreadsView: View {
-    @Environment(AppModel.self) private var app
-    @State private var search = ""
-    @State private var statusFilter: ThreadStatusFilter = .all
-
-    var body: some View {
-        NavigationStack {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 14) {
-                    ThreadSummaryStrip(summary: app.codexSummary, threads: app.codexSessions)
-
-                    VStack(spacing: 10) {
-                        TextField("Search threads, cwd, model", text: $search)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                            .textFieldStyle(.roundedBorder)
-
-                        Picker("Resume status", selection: $statusFilter) {
-                            ForEach(ThreadStatusFilter.allCases) { filter in
-                                Text(filter.title).tag(filter)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                    }
-
-                    if filteredThreads.isEmpty {
-                        ContentUnavailableView(
-                            "No threads found",
-                            systemImage: "bubble.left.and.text.bubble.right",
-                            description: Text("The current filters have no matching Codex threads.")
-                        )
-                        .frame(maxWidth: .infinity)
-                        .padding(.top, 40)
-                    } else {
-                        ForEach(filteredThreads) { thread in
-                            CodexThreadCard(thread: thread)
-                        }
-                    }
-                }
-                .padding(16)
-            }
-            .navigationTitle("Threads")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    ConnectionBadge(text: app.connectionMessage)
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        Task { await app.refreshCodexSessions() }
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
-                    }
-                    .accessibilityLabel("Refresh Codex threads")
-                }
-            }
-            .task {
-                await app.refreshCodexSessions()
-                await app.refreshSessions()
-            }
-        }
-    }
-
-    private var filteredThreads: [CodexSessionSummary] {
-        let query = search.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return app.codexSessions.filter { thread in
-            statusFilter.includes(thread)
-            && (query.isEmpty || thread.searchText.contains(query))
-        }
-    }
-}
-
-struct ThreadSummaryStrip: View {
-    let summary: CodexSummary?
-    let threads: [CodexSessionSummary]
-
-    var body: some View {
-        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
-            MetricTile(title: "Threads", value: "\(summary?.sessionCount ?? summary?.totalSessions ?? threads.count)", systemImage: "bubble.left.and.text.bubble.right")
-            MetricTile(title: "Tokens", value: (summary?.totalTokens ?? threadTokens).formatted(.number.notation(.compactName)), systemImage: "number")
-            MetricTile(title: "Tool Calls", value: (summary?.totalToolCalls ?? threadTools).formatted(.number.notation(.compactName)), systemImage: "wrench.and.screwdriver")
-            MetricTile(title: "Resumable", value: "\(summary?.resumableSessionCount ?? threads.filter(\.isThreadResumable).count)", systemImage: "arrow.uturn.backward")
-        }
-    }
-
-    private var threadTokens: Int {
-        threads.reduce(0) { $0 + $1.tokenCount }
-    }
-
-    private var threadTools: Int {
-        threads.reduce(0) { $0 + $1.toolCallCount }
-    }
-}
-
-struct CodexThreadCard: View {
-    @Environment(AppModel.self) private var app
-    let thread: CodexSessionSummary
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .top, spacing: 10) {
-                Image(systemName: thread.isThreadResumable ? "checkmark.circle.fill" : "exclamationmark.circle")
-                    .foregroundStyle(thread.isThreadResumable ? .green : .orange)
-                    .font(.title3)
-
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(thread.title)
-                        .font(.headline)
-                    Text(thread.id)
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-
-                Spacer()
-            }
-
-            HStack(spacing: 6) {
-                Chip(text: thread.resumeLabel)
-                Chip(text: thread.metricsQualityLabel)
-                Chip(text: "\(thread.tokenCount.formatted(.number.notation(.compactName))) tokens")
-                Chip(text: "\(thread.toolCallCount.formatted(.number.notation(.compactName))) tools")
-            }
-
-            Text(thread.metadataLine)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(3)
-
-            HStack {
-                Button {
-                    Task {
-                        await app.resumeCodexSession(thread, into: app.fallbackTerminalSessionId)
-                    }
-                } label: {
-                    Label("Resume in Terminal", systemImage: "arrow.uturn.backward")
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(!thread.isThreadResumable || app.fallbackTerminalSessionId == nil)
-
-                Button {
-                    UIPasteboard.general.string = thread.resumeCommand ?? "codex resume \(thread.id)"
-                } label: {
-                    Image(systemName: "doc.on.doc")
-                }
-                .buttonStyle(.bordered)
-                .accessibilityLabel("Copy resume command")
-                .disabled(!thread.isThreadResumable)
-            }
-        }
-        .padding(14)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-    }
-}
-
-enum ThreadStatusFilter: String, CaseIterable, Identifiable {
-    case all
-    case resumable
-    case blocked
-    case unknown
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .all:
-            return "All"
-        case .resumable:
-            return "Resumable"
-        case .blocked:
-            return "Blocked"
-        case .unknown:
-            return "Unknown"
-        }
-    }
-
-    func includes(_ thread: CodexSessionSummary) -> Bool {
-        switch self {
-        case .all:
-            return true
-        case .resumable:
-            return thread.resumeStatusValue == .resumable
-        case .blocked:
-            return thread.resumeStatusValue == .blocked
-        case .unknown:
-            return thread.resumeStatusValue == .unknown
-        }
-    }
-}
-
-struct MetricsView: View {
-    @Environment(AppModel.self) private var app
-    @State private var search = ""
-    @State private var statusFilter: ThreadStatusFilter = .all
-    @State private var modelFilter = ""
-    @State private var cwdFilter = ""
-    @State private var month = Date()
-    @State private var selectedDay: String?
-
-    var body: some View {
-        NavigationStack {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 16) {
-                    MetricsFilterPanel(
-                        search: $search,
-                        statusFilter: $statusFilter,
-                        modelFilter: $modelFilter,
-                        cwdFilter: $cwdFilter,
-                        month: $month,
-                        models: modelOptions,
-                        cwds: cwdOptions,
-                        onClear: clearFilters
-                    )
-
-                    MetricsSummaryGrid(threads: filteredThreads)
-
-                    MetricsCalendarView(
-                        month: month,
-                        threads: filteredBeforeSelectedDay,
-                        selectedDay: $selectedDay
-                    )
-
-                    VStack(alignment: .leading, spacing: 10) {
-                        HStack {
-                            Label("Filtered Threads", systemImage: "line.3.horizontal.decrease.circle")
-                                .font(.headline)
-                            Spacer()
-                            Text("\(filteredThreads.count) results")
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.secondary)
-                        }
-
-                        ForEach(filteredThreads.prefix(160)) { thread in
-                            MetricsThreadRow(thread: thread)
-                        }
-                    }
-                }
-                .padding(16)
-            }
-            .navigationTitle("Metrics")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        Task { await app.refreshCodexSessions() }
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
-                    }
-                }
-            }
-            .task {
-                await app.refreshCodexSessions()
-                if let newest = app.codexSessions.compactMap(\.metricDate).max() {
-                    month = newest
-                }
-            }
-        }
-    }
-
-    private var filteredBeforeSelectedDay: [CodexSessionSummary] {
-        filteredThreads(includeSelectedDay: false)
-    }
-
-    private var filteredThreads: [CodexSessionSummary] {
-        filteredThreads(includeSelectedDay: true)
-    }
-
-    private func filteredThreads(includeSelectedDay: Bool) -> [CodexSessionSummary] {
-        let query = search.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return app.codexSessions.filter { thread in
-            guard statusFilter.includes(thread) else { return false }
-            if !modelFilter.isEmpty && thread.model != modelFilter { return false }
-            if !cwdFilter.isEmpty && thread.cwd != cwdFilter { return false }
-            if includeSelectedDay, let selectedDay, thread.metricDayKey != selectedDay { return false }
-            if !query.isEmpty && !thread.searchText.contains(query) { return false }
-            return true
-        }
-    }
-
-    private var modelOptions: [String] {
-        uniqueSorted(app.codexSessions.compactMap(\.model))
-    }
-
-    private var cwdOptions: [String] {
-        uniqueSorted(app.codexSessions.compactMap(\.cwd))
-    }
-
-    private func uniqueSorted(_ values: [String]) -> [String] {
-        Array(Set(values.filter { !$0.isEmpty })).sorted()
-    }
-
-    private func clearFilters() {
-        search = ""
-        statusFilter = .all
-        modelFilter = ""
-        cwdFilter = ""
-        selectedDay = nil
-    }
-}
-
-struct MetricsFilterPanel: View {
-    @Binding var search: String
-    @Binding var statusFilter: ThreadStatusFilter
-    @Binding var modelFilter: String
-    @Binding var cwdFilter: String
-    @Binding var month: Date
-    let models: [String]
-    let cwds: [String]
-    let onClear: () -> Void
-
-    var body: some View {
-        VStack(spacing: 12) {
-            TextField("Search id, cwd, model, store", text: $search)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .textFieldStyle(.roundedBorder)
-
-            Picker("Status", selection: $statusFilter) {
-                ForEach(ThreadStatusFilter.allCases) { filter in
-                    Text(filter.title).tag(filter)
-                }
-            }
-            .pickerStyle(.segmented)
-
-            HStack(spacing: 10) {
-                Menu {
-                    Button("All models") { modelFilter = "" }
-                    ForEach(models, id: \.self) { model in
-                        Button(model) { modelFilter = model }
-                    }
-                } label: {
-                    Label(modelFilter.isEmpty ? "All Models" : modelFilter, systemImage: "cpu")
-                        .lineLimit(1)
-                }
-                .buttonStyle(.bordered)
-
-                Menu {
-                    Button("All directories") { cwdFilter = "" }
-                    ForEach(cwds, id: \.self) { cwd in
-                        Button(cwd) { cwdFilter = cwd }
-                    }
-                } label: {
-                    Label(cwdFilter.isEmpty ? "All CWDs" : URL(fileURLWithPath: cwdFilter).lastPathComponent, systemImage: "folder")
-                        .lineLimit(1)
-                }
-                .buttonStyle(.bordered)
-            }
-
-            HStack {
-                DatePicker("Calendar", selection: $month, displayedComponents: .date)
-                    .datePickerStyle(.compact)
-                Spacer()
-                Button("Clear", action: onClear)
-                    .buttonStyle(.bordered)
-            }
-        }
-        .padding(14)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-    }
-}
-
-struct MetricsSummaryGrid: View {
-    let threads: [CodexSessionSummary]
-
-    var body: some View {
-        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
-            MetricTile(title: "Threads", value: "\(threads.count)", systemImage: "rectangle.stack")
-            MetricTile(title: "Tokens", value: totalTokens.formatted(.number.notation(.compactName)), systemImage: "number")
-            MetricTile(title: "Tool Calls", value: totalTools.formatted(.number.notation(.compactName)), systemImage: "wrench.and.screwdriver")
-            MetricTile(title: "Avg Active", value: formatDuration(averageActiveMs), systemImage: "timer")
-        }
-    }
-
-    private var totalTokens: Int {
-        threads.reduce(0) { $0 + $1.tokenCount }
-    }
-
-    private var totalTools: Int {
-        threads.reduce(0) { $0 + $1.toolCallCount }
-    }
-
-    private var averageActiveMs: Int {
-        guard !threads.isEmpty else { return 0 }
-        return threads.reduce(0) { $0 + $1.activeMs } / threads.count
-    }
-}
-
-struct MetricsCalendarView: View {
-    let month: Date
-    let threads: [CodexSessionSummary]
-    @Binding var selectedDay: String?
-
-    private let columns = Array(repeating: GridItem(.flexible(), spacing: 6), count: 7)
-    private let calendar = Calendar.current
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Label(monthTitle, systemImage: "calendar")
-                    .font(.headline)
-                Spacer()
-                Text(selectedDay ?? "Tap a day")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-            }
-
-            LazyVGrid(columns: columns, spacing: 6) {
-                ForEach(calendar.shortWeekdaySymbols, id: \.self) { weekday in
-                    Text(weekday)
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity)
-                }
-
-                ForEach(leadingBlankDays, id: \.self) { index in
-                    Color.clear
-                        .frame(height: 46)
-                        .accessibilityHidden(true)
-                        .id("blank-\(index)")
-                }
-
-                ForEach(days, id: \.self) { day in
-                    let key = dayKey(day)
-                    let stats = dayStats[key] ?? DayStats()
-                    Button {
-                        guard stats.count > 0 else { return }
-                        selectedDay = selectedDay == key ? nil : key
-                    } label: {
-                        VStack(spacing: 3) {
-                            Text("\(day)")
-                                .font(.caption.weight(.bold))
-                            Text(stats.count > 0 ? "\(stats.count)" : "")
-                                .font(.caption2.monospacedDigit())
-                        }
-                        .frame(maxWidth: .infinity, minHeight: 46)
-                        .background(dayBackground(stats: stats, key: key), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(stats.count == 0)
-                }
-            }
-        }
-        .padding(14)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-    }
-
-    private var monthTitle: String {
-        month.formatted(.dateTime.month(.wide).year())
-    }
-
-    private var monthStart: Date {
-        let components = calendar.dateComponents([.year, .month], from: month)
-        return calendar.date(from: components) ?? month
-    }
-
-    private var days: [Int] {
-        let range = calendar.range(of: .day, in: .month, for: monthStart) ?? 1..<1
-        return Array(range)
-    }
-
-    private var leadingBlankDays: [Int] {
-        let weekday = calendar.component(.weekday, from: monthStart)
-        return Array(0..<max(0, weekday - 1))
-    }
-
-    private var dayStats: [String: DayStats] {
-        threads.reduce(into: [:]) { partial, thread in
-            guard let key = thread.metricDayKey, key.hasPrefix(monthStart.monthKey) else { return }
-            var stats = partial[key] ?? DayStats()
-            stats.count += 1
-            stats.tokens += thread.tokenCount
-            partial[key] = stats
-        }
-    }
-
-    private var maxCount: Int {
-        dayStats.values.map(\.count).max() ?? 0
-    }
-
-    private func dayKey(_ day: Int) -> String {
-        "\(monthStart.monthKey)-\(String(format: "%02d", day))"
-    }
-
-    private func dayBackground(stats: DayStats, key: String) -> Color {
-        guard stats.count > 0, maxCount > 0 else {
-            return Color.secondary.opacity(0.08)
-        }
-        let intensity = Double(stats.count) / Double(maxCount)
-        if selectedDay == key {
-            return Color.green.opacity(0.55)
-        }
-        return Color.orange.opacity(0.18 + (intensity * 0.48))
-    }
-}
-
-struct MetricsThreadRow: View {
-    let thread: CodexSessionSummary
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text(thread.id)
-                    .font(.caption.monospaced().weight(.semibold))
-                    .lineLimit(1)
-                Spacer()
-                Text(thread.metricDayKey ?? "unknown")
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-
-            HStack(spacing: 6) {
-                Chip(text: thread.resumeLabel)
-                Chip(text: "\(thread.tokenCount.formatted(.number.notation(.compactName))) tok")
-                Chip(text: "\(thread.toolCallCount.formatted(.number.notation(.compactName))) tools")
-                Chip(text: formatDuration(thread.activeMs))
-            }
-
-            Text(thread.metadataLine)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-        }
-        .padding(12)
-        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-    }
-}
-
-struct DayStats: Hashable {
-    var count = 0
-    var tokens = 0
-}
-
-struct MetricTile: View {
-    let title: String
-    let value: String
-    let systemImage: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Label(title, systemImage: systemImage)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-            Text(value)
-                .font(.title3.monospacedDigit().weight(.bold))
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(14)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-    }
-}
-
-struct Chip: View {
-    let text: String
-
-    var body: some View {
-        Text(text)
-            .font(.caption2.weight(.semibold))
-            .lineLimit(1)
-            .minimumScaleFactor(0.75)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-    }
-}
-
-struct MetricRow: View {
-    let title: String
-    let value: String
-    let systemImage: String
-
-    var body: some View {
-        HStack {
-            Label(title, systemImage: systemImage)
-            Spacer()
-            Text(value)
-                .font(.title3.monospacedDigit().weight(.semibold))
-        }
-    }
-}
-
-enum CodexResumeStatus {
-    case resumable
-    case blocked
-    case unknown
-}
-
-extension CodexSessionSummary {
-    var isThreadResumable: Bool {
-        isResumable != false && resumeStatusValue != .blocked
-    }
-
-    var resumeStatusValue: CodexResumeStatus {
-        if resumeStatus == "unknown" {
-            return .unknown
-        }
-        if resumeStatus == "not_resumable" || isResumable == false {
-            return .blocked
-        }
-        if isResumable == true || resumeStatus == "resumable" {
-            return .resumable
-        }
-        return .unknown
-    }
-
-    var resumeLabel: String {
-        switch resumeStatusValue {
-        case .resumable:
-            return "resumable"
-        case .blocked:
-            return "blocked"
-        case .unknown:
-            return "unknown"
-        }
-    }
-
-    var metricsQualityLabel: String {
-        switch metricsQuality {
-        case "complete":
-            return "metrics complete"
-        case "partial":
-            return "metrics partial"
-        case "estimated":
-            return "metrics estimated"
-        default:
-            return metrics == nil ? "metrics estimated" : "metrics partial"
-        }
-    }
-
-    var tokenCount: Int {
-        metrics?.totalTokenUsage?.totalTokens ?? 0
-    }
-
-    var toolCallCount: Int {
-        metrics?.toolCalls ?? 0
-    }
-
-    var activeMs: Int {
-        if let activeDurationMs, activeDurationMs > 0 {
-            return activeDurationMs
-        }
-        return elapsedMs
-    }
-
-    var elapsedMs: Int {
-        if let elapsedDurationMs, elapsedDurationMs > 0 {
-            return elapsedDurationMs
-        }
-        return durationMs ?? 0
-    }
-
-    var metricDate: Date? {
-        [lastPromptAt, endedAt, startedAt]
-            .compactMap { $0 }
-            .compactMap(Self.parseDate(_:))
-            .first
-    }
-
-    var metricDayKey: String? {
-        metricDate?.dayKey
-    }
-
-    var searchText: String {
-        [
-            id,
-            cwd,
-            model,
-            cliVersion,
-            fileName,
-            storeCodexHome,
-            resumeStatus,
-            resumeReason
-        ]
-        .compactMap { $0 }
-        .joined(separator: " ")
-        .lowercased()
-    }
-
-    var metadataLine: String {
-        var parts = [
-            "cwd: \(cwd ?? "Unknown")",
-            "model: \(model ?? "Unknown")",
-            "time: \(formattedThreadTime)"
-        ]
-        if let storeCodexHome, !storeCodexHome.isEmpty {
-            parts.append("store: \(storeCodexHome)")
-        }
-        if let resumeReason, !resumeReason.isEmpty {
-            parts.append("resume: \(resumeReason)")
-        }
-        return parts.joined(separator: " | ")
-    }
-
-    private var formattedThreadTime: String {
-        guard let metricDate else { return "Unknown" }
-        return metricDate.formatted(date: .abbreviated, time: .shortened)
-    }
-
-    private static func parseDate(_ value: String) -> Date? {
-        isoFormatterWithFractions.date(from: value) ?? isoFormatter.date(from: value)
-    }
-
-    private static let isoFormatterWithFractions: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter
-    }()
-
-    private static let isoFormatter = ISO8601DateFormatter()
-}
-
-extension Date {
-    var dayKey: String {
-        Self.dayFormatter.string(from: self)
-    }
-
-    var monthKey: String {
-        Self.monthFormatter.string(from: self)
-    }
-
-    private static let dayFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter
-    }()
-
-    private static let monthFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM"
-        return formatter
-    }()
-}
-
-func formatDuration(_ milliseconds: Int) -> String {
-    guard milliseconds > 0 else { return "0m" }
-    let seconds = milliseconds / 1_000
-    let hours = seconds / 3_600
-    let minutes = (seconds % 3_600) / 60
-    let remainingSeconds = seconds % 60
-    if hours > 0 {
-        return "\(hours)h \(minutes)m"
-    }
-    if minutes > 0 {
-        return "\(minutes)m \(remainingSeconds)s"
-    }
-    return "\(remainingSeconds)s"
 }
 
 struct SettingsView: View {

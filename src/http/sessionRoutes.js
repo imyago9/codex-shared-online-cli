@@ -1,11 +1,6 @@
 const express = require('express');
 
-function isSafeSessionId(value) {
-  return typeof value === 'string'
-    && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
-}
-
-function createSessionRoutes(sessionManager, codexSessionIndex) {
+function createSessionRoutes(sessionManager) {
   const router = express.Router();
   const terminalProfiles = () => ['powershell'];
 
@@ -137,81 +132,6 @@ function createSessionRoutes(sessionManager, codexSessionIndex) {
     }
 
     return res.status(202).json({ ok: true, lines, applied: scrolled === true });
-  });
-
-  router.get('/codex/sessions', async (req, res, next) => {
-    try {
-      const force = req.query.refresh === '1' || req.query.refresh === 'true';
-      const result = await codexSessionIndex.listSessions({
-        force,
-        limit: req.query.limit,
-        search: req.query.search,
-        cwd: req.query.cwd,
-        resumable: req.query.resumable
-      });
-
-      return res.json(result);
-    } catch (error) {
-      return next(error);
-    }
-  });
-
-  router.get('/codex/sessions/:codexSessionId', async (req, res, next) => {
-    try {
-      const codexSession = await codexSessionIndex.getSessionById(req.params.codexSessionId);
-      if (!codexSession) {
-        return res.status(404).json({ error: 'Codex session not found' });
-      }
-
-      return res.json({ session: codexSession });
-    } catch (error) {
-      return next(error);
-    }
-  });
-
-  router.post('/codex/sessions/:codexSessionId/resume', async (req, res, next) => {
-    try {
-      const codexSessionId = req.params.codexSessionId;
-      if (!isSafeSessionId(codexSessionId)) {
-        return res.status(400).json({ error: 'Invalid Codex session id format' });
-      }
-
-      const codexSession = await codexSessionIndex.getSessionById(codexSessionId);
-      if (!codexSession) {
-        return res.status(404).json({ error: 'Codex session not found' });
-      }
-
-      if (codexSession.isResumable === false) {
-        return res.status(409).json({
-          error: codexSession.resumeReason || 'Codex session is indexed but not resumable in local CLI history.'
-        });
-      }
-
-      const body = req.body || {};
-      const terminalSessionId = sessionManager.singleConsoleMode
-        ? sessionManager.defaultSessionId
-        : (typeof body.terminalSessionId === 'string' ? body.terminalSessionId : sessionManager.defaultSessionId);
-
-      const command = typeof codexSession.resumeCommand === 'string'
-        ? codexSession.resumeCommand
-        : `codex resume ${codexSessionId}`;
-      const wrote = sessionManager.writeCommandToSession(terminalSessionId, command);
-      if (wrote === null) {
-        return res.status(404).json({ error: 'Target terminal session not found' });
-      }
-      if (wrote === false) {
-        return res.status(502).json({ error: 'Failed to enqueue resume command in terminal session' });
-      }
-
-      return res.status(202).json({
-        ok: true,
-        terminalSessionId,
-        codexSessionId,
-        command
-      });
-    } catch (error) {
-      return next(error);
-    }
   });
 
   return router;

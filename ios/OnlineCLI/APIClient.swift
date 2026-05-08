@@ -66,18 +66,6 @@ struct OnlineCLIAPI {
         )
     }
 
-    func codexSessions(limit: Int) async throws -> CodexSessionsResponse {
-        try await request("api/codex/sessions?limit=\(limit)&refresh=1")
-    }
-
-    func resumeCodexSession(_ id: String, terminalSessionId: String?) async throws {
-        _ = try await requestData(
-            "api/codex/sessions/\(id)/resume",
-            method: "POST",
-            body: ResumeRequest(terminalSessionId: terminalSessionId)
-        )
-    }
-
     func remoteStatus() async throws -> RemoteStatus {
         try await request("api/remote/status")
     }
@@ -173,10 +161,6 @@ private struct CommandRequest: Encodable {
 
 private struct ScrollRequest: Encodable {
     let lines: Int
-}
-
-private struct ResumeRequest: Encodable {
-    let terminalSessionId: String?
 }
 
 private struct ErrorResponse: Decodable {

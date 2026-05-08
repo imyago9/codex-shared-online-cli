@@ -15,8 +15,6 @@ final class AppModel {
     var defaultSessionId: String?
     var activeTerminalSessionId: String?
     var availableTerminalProfiles: [TerminalProfile] = [.powershell]
-    var codexSessions: [CodexSessionSummary] = []
-    var codexSummary: CodexSummary?
     var remoteStatus: RemoteStatus?
     var remoteCapabilities: RemoteCapabilities?
     var connectionMessage = "Not checked"
@@ -36,7 +34,6 @@ final class AppModel {
     func refreshAll() async {
         await refreshHealth()
         await refreshSessions()
-        await refreshCodexSessions()
         await refreshRemoteStatus()
         await refreshRemoteCapabilities()
     }
@@ -121,26 +118,6 @@ final class AppModel {
         }
     }
 
-    func refreshCodexSessions() async {
-        guard let api else { return }
-        do {
-            let response = try await api.codexSessions(limit: 200)
-            codexSessions = response.sessions
-            codexSummary = response.summary
-        } catch {
-            connectionMessage = error.localizedDescription
-        }
-    }
-
-    func resumeCodexSession(_ codexSession: CodexSessionSummary, into terminalSessionId: String?) async {
-        guard let api else { return }
-        do {
-            try await api.resumeCodexSession(codexSession.id, terminalSessionId: terminalSessionId)
-        } catch {
-            connectionMessage = error.localizedDescription
-        }
-    }
-
     func refreshRemoteStatus() async {
         guard let api else { return }
         do {
@@ -166,10 +143,6 @@ final class AppModel {
 
     var activeTerminalSession: TerminalSessionSnapshot? {
         sessions.first { $0.id == activeTerminalSessionId }
-    }
-
-    var fallbackTerminalSessionId: String? {
-        activeTerminalSessionId ?? defaultSessionId ?? sessions.first?.id
     }
 
     private func reconcileActiveTerminal() {

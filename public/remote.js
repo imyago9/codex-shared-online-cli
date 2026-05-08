@@ -1,10 +1,8 @@
 (function remoteDesktopModule() {
   const elements = {
     viewPillConsole: document.getElementById('view-pill-console'),
-    viewPillMetrics: document.getElementById('view-pill-metrics'),
     viewPillRemote: document.getElementById('view-pill-remote'),
     consoleView: document.getElementById('console-view'),
-    metricsView: document.getElementById('metrics-view'),
     remoteView: document.getElementById('remote-view'),
     modeSelect: document.getElementById('remote-mode-select'),
     openKeyboardButton: document.getElementById('remote-open-keyboard'),
@@ -1560,16 +1558,11 @@
 
   function applyViewPills(activeView) {
     const isConsole = activeView === 'console';
-    const isMetrics = activeView === 'metrics';
     const isRemote = activeView === 'remote';
 
     if (elements.viewPillConsole) {
       elements.viewPillConsole.classList.toggle('active', isConsole);
       elements.viewPillConsole.setAttribute('aria-selected', isConsole ? 'true' : 'false');
-    }
-    if (elements.viewPillMetrics) {
-      elements.viewPillMetrics.classList.toggle('active', isMetrics);
-      elements.viewPillMetrics.setAttribute('aria-selected', isMetrics ? 'true' : 'false');
     }
     if (elements.viewPillRemote) {
       elements.viewPillRemote.classList.toggle('active', isRemote);
@@ -1578,9 +1571,6 @@
 
     if (elements.consoleView) {
       elements.consoleView.classList.toggle('active', isConsole);
-    }
-    if (elements.metricsView) {
-      elements.metricsView.classList.toggle('active', isMetrics);
     }
     elements.remoteView.classList.toggle('active', isRemote);
   }
@@ -1986,12 +1976,6 @@
     if (elements.viewPillConsole) {
       elements.viewPillConsole.addEventListener('click', () => {
         deactivateRemoteView('console');
-      });
-    }
-
-    if (elements.viewPillMetrics) {
-      elements.viewPillMetrics.addEventListener('click', () => {
-        deactivateRemoteView('metrics');
       });
     }
 
