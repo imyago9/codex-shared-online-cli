@@ -2,7 +2,6 @@ import Foundation
 
 struct ServerSettings: Codable, Equatable {
     var baseURLString = ""
-    var companionToken = ""
     var defaultTerminalProfile: TerminalProfile = .powershell
     var defaultRemoteMode: RemoteMode = .view
     var remoteStreamProfile: RemoteStreamProfile = .balanced
@@ -10,7 +9,6 @@ struct ServerSettings: Codable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case baseURLString
-        case companionToken
         case defaultTerminalProfile
         case defaultRemoteMode
         case remoteStreamProfile
@@ -19,10 +17,25 @@ struct ServerSettings: Codable, Equatable {
 
     init() {}
 
+    static func normalizedURLString(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return ""
+        }
+
+        let withScheme = trimmed.contains("://") ? trimmed : "https://\(trimmed)"
+        guard var components = URLComponents(string: withScheme) else {
+            return withScheme
+        }
+        components.path = ""
+        components.query = nil
+        components.fragment = nil
+        return components.url?.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")) ?? withScheme
+    }
+
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         baseURLString = try container.decodeIfPresent(String.self, forKey: .baseURLString) ?? baseURLString
-        companionToken = try container.decodeIfPresent(String.self, forKey: .companionToken) ?? companionToken
         defaultTerminalProfile = try container.decodeIfPresent(TerminalProfile.self, forKey: .defaultTerminalProfile) ?? defaultTerminalProfile
         defaultRemoteMode = try container.decodeIfPresent(RemoteMode.self, forKey: .defaultRemoteMode) ?? defaultRemoteMode
         remoteStreamProfile = try container.decodeIfPresent(RemoteStreamProfile.self, forKey: .remoteStreamProfile) ?? remoteStreamProfile
@@ -35,18 +48,10 @@ struct ServerSettings: Codable, Equatable {
             return nil
         }
 
-        let withScheme = trimmed.contains("://") ? trimmed : "https://\(trimmed)"
-        guard var components = URLComponents(string: withScheme) else {
+        guard var components = URLComponents(string: Self.normalizedURLString(trimmed)) else {
             return nil
         }
-        components.path = ""
-        components.query = nil
-        components.fragment = nil
         return components.url
-    }
-
-    var trimmedCompanionToken: String {
-        companionToken.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
@@ -231,28 +236,6 @@ struct HealthResponse: Codable {
     let singleConsoleMode: Bool
     let defaultTerminalProfile: TerminalProfile?
     let terminalProfiles: [TerminalProfile]?
-}
-
-struct CompanionStatus: Codable, Equatable {
-    let ok: Bool
-    let companionVersion: String?
-    let serverRunning: Bool
-    let remoteAgentRunning: Bool
-    let runOnStartup: Bool
-    let autoStartServer: Bool
-    let appUrl: String?
-    let tailnetUrl: String?
-    let repoRoot: String?
-    let serverPort: Int?
-    let remotePort: Int?
-    let launcherPort: Int?
-    let message: String?
-}
-
-struct CompanionActionResponse: Codable, Equatable {
-    let ok: Bool
-    let message: String?
-    let status: CompanionStatus?
 }
 
 struct SessionsResponse: Codable {

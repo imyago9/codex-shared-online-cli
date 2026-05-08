@@ -30,31 +30,6 @@ struct OnlineCLIAPI {
         try await request("api/health")
     }
 
-    func companionStatus(token: String? = nil) async throws -> CompanionStatus {
-        try await request("companion/api/status", authToken: token)
-    }
-
-    func startServer(token: String? = nil) async throws -> CompanionActionResponse {
-        try await request("companion/api/server/start", method: "POST", body: EmptyBody(), authToken: token)
-    }
-
-    func stopServer(token: String? = nil) async throws -> CompanionActionResponse {
-        try await request("companion/api/server/stop", method: "POST", body: EmptyBody(), authToken: token)
-    }
-
-    func restartServer(token: String? = nil) async throws -> CompanionActionResponse {
-        try await request("companion/api/server/restart", method: "POST", body: EmptyBody(), authToken: token)
-    }
-
-    func setRunOnStartup(_ enabled: Bool, token: String? = nil) async throws -> CompanionActionResponse {
-        try await request(
-            "companion/api/startup",
-            method: "POST",
-            body: StartupRequest(enabled: enabled),
-            authToken: token
-        )
-    }
-
     func sessions() async throws -> SessionsResponse {
         try await request("api/sessions")
     }
@@ -199,10 +174,6 @@ private struct CommandRequest: Encodable {
 
 private struct ScrollRequest: Encodable {
     let lines: Int
-}
-
-private struct StartupRequest: Encodable {
-    let enabled: Bool
 }
 
 private struct ErrorResponse: Decodable {

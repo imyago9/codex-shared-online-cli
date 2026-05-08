@@ -17,11 +17,8 @@ final class AppModel {
     var availableTerminalProfiles: [TerminalProfile] = [.powershell]
     var remoteStatus: RemoteStatus?
     var remoteCapabilities: RemoteCapabilities?
-    var companionStatus: CompanionStatus?
-    var companionMessage = "Not checked"
     var connectionMessage = "Not checked"
     var isLoading = false
-    var isCompanionLoading = false
 
     init() {
         self.settings = SettingsStore.load()
@@ -46,7 +43,6 @@ final class AppModel {
             activeTerminalSessionId = nil
             remoteStatus = nil
             remoteCapabilities = nil
-            await refreshCompanionStatus()
         }
     }
 
@@ -70,86 +66,6 @@ final class AppModel {
         } catch {
             health = nil
             connectionMessage = error.localizedDescription
-        }
-    }
-
-    func refreshCompanionStatus() async {
-        guard let api else {
-            companionStatus = nil
-            companionMessage = "Enter a tailnet URL"
-            return
-        }
-
-        isCompanionLoading = true
-        defer { isCompanionLoading = false }
-
-        do {
-            companionStatus = try await api.companionStatus(token: settings.trimmedCompanionToken)
-            companionMessage = companionStatus?.serverRunning == true ? "Server running" : "Companion ready"
-        } catch {
-            companionStatus = nil
-            companionMessage = error.localizedDescription
-        }
-    }
-
-    func startServerFromCompanion() async {
-        guard let api else { return }
-        isCompanionLoading = true
-        defer { isCompanionLoading = false }
-
-        do {
-            let response = try await api.startServer(token: settings.trimmedCompanionToken)
-            companionStatus = response.status
-            companionMessage = response.message ?? "Server start requested"
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
-            await refreshAll()
-        } catch {
-            companionMessage = error.localizedDescription
-        }
-    }
-
-    func stopServerFromCompanion() async {
-        guard let api else { return }
-        isCompanionLoading = true
-        defer { isCompanionLoading = false }
-
-        do {
-            let response = try await api.stopServer(token: settings.trimmedCompanionToken)
-            companionStatus = response.status
-            companionMessage = response.message ?? "Server stopped"
-            await refreshAll()
-        } catch {
-            companionMessage = error.localizedDescription
-        }
-    }
-
-    func restartServerFromCompanion() async {
-        guard let api else { return }
-        isCompanionLoading = true
-        defer { isCompanionLoading = false }
-
-        do {
-            let response = try await api.restartServer(token: settings.trimmedCompanionToken)
-            companionStatus = response.status
-            companionMessage = response.message ?? "Server restart requested"
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
-            await refreshAll()
-        } catch {
-            companionMessage = error.localizedDescription
-        }
-    }
-
-    func setRunOnStartup(_ enabled: Bool) async {
-        guard let api else { return }
-        isCompanionLoading = true
-        defer { isCompanionLoading = false }
-
-        do {
-            let response = try await api.setRunOnStartup(enabled, token: settings.trimmedCompanionToken)
-            companionStatus = response.status
-            companionMessage = response.message ?? (enabled ? "Run on startup enabled" : "Run on startup disabled")
-        } catch {
-            companionMessage = error.localizedDescription
         }
     }
 

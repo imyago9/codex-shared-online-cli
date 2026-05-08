@@ -1,4 +1,5 @@
 const childProcess = require('child_process');
+const net = require('net');
 const path = require('path');
 
 const config = require('../src/config');
@@ -284,6 +285,37 @@ function startRemoteSidecar() {
   return child;
 }
 
+function parseRemoteAgentPort() {
+  try {
+    const url = new URL(config.remoteAgentUrl);
+    if (url.port) {
+      return Number.parseInt(url.port, 10);
+    }
+    return url.protocol === 'https:' ? 443 : 80;
+  } catch (_error) {
+    return 3390;
+  }
+}
+
+function isLoopbackPortOpen(port) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host: '127.0.0.1', port });
+    const finish = (open) => {
+      socket.removeAllListeners();
+      try {
+        socket.destroy();
+      } catch (_error) {
+        // Ignore close races.
+      }
+      resolve(open);
+    };
+    socket.setTimeout(350);
+    socket.once('connect', () => finish(true));
+    socket.once('timeout', () => finish(false));
+    socket.once('error', () => finish(false));
+  });
+}
+
 function stopChild(child, label) {
   if (!child || child.killed || child.exitCode !== null) {
     return;
@@ -299,9 +331,15 @@ function stopChild(child, label) {
 async function start() {
   configureTailscaleServe(config.port);
 
-  const remoteSidecar = config.remoteEnabled === true
-    ? startRemoteSidecar()
-    : null;
+  let remoteSidecar = null;
+  if (config.remoteEnabled === true) {
+    const remotePort = parseRemoteAgentPort();
+    if (await isLoopbackPortOpen(remotePort)) {
+      console.info(`[startup] Remote sidecar already listening on 127.0.0.1:${remotePort}; reusing it.`);
+    } else {
+      remoteSidecar = startRemoteSidecar();
+    }
+  }
 
   let runtime = null;
   runtime = startServer({

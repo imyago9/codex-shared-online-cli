@@ -15,8 +15,6 @@ A Tailscale-first console for native PowerShell terminals, native iOS control su
 - Optional command sidecar for Windows host automation over Tailscale
   - Token-gated command runs, live output streaming, run history, stop support
   - Useful for fetching/pulling on Windows, restarting `npm start`, and closing the Mac/iOS/Windows loop
-- Windows Companion tray app
-  - Production bootstrapper for starting/stopping the server, configuring Tailscale Serve, pairing iOS by QR code, and enabling run-on-startup
 - Native iOS console, stream presets, remote cursor relay, live gateway stats, and desktop shortcut actions
 - Idle session cleanup + max session guardrails
 - Graceful shutdown persistence:
@@ -57,6 +55,12 @@ cp .env.example .env
 
 Then edit `.env` with your local settings.
 
+Useful standalone service commands:
+```bash
+npm run remote-agent
+npm run command-sidecar
+```
+
 ### Tailscale access model
 Tailscale is required. Startup fails if `tailscale status --json` cannot prove the node is connected, or if `tailscale serve --bg http://127.0.0.1:<PORT>` cannot be configured.
 
@@ -67,7 +71,7 @@ The SwiftUI iPhone app lives in `ios/OnlineCLI.xcodeproj`. The Console tab is na
 
 The iOS app is intentionally focused on Console, Remote, and Settings. CLI agents and other tools can still be used normally inside any PowerShell terminal or through the remote desktop.
 
-Run `npm start` or install the Windows Companion first, keep Tailscale connected on the iPhone, then open the Xcode project and build the `OnlineCLI` scheme. When the app is not connected, it opens a pairing screen where the user can scan the Windows Companion QR code or enter the tailnet domain manually.
+Run `npm start`, keep Tailscale connected on the iPhone, then open the Xcode project and build the `OnlineCLI` scheme. When the app is not connected, it opens a simple connection screen where the user enters the printed tailnet URL manually.
 
 The native remote tab uses the backend's capabilities contract instead of guessing: `/api/remote/capabilities` returns stream presets, supported shortcut actions, live gateway counts, input limits, and display metadata. The WebSocket also accepts `set-stream` messages, so the app can switch between Economy, Balanced, Fluid, and Sharp profiles while connected.
 
@@ -104,12 +108,11 @@ The command sidecar is separate from the main server so it can fetch, pull, and 
 
 On Windows:
 ```powershell
-cd command-sidecar
-npm run token
+npm --prefix command-sidecar run token
 $env:COMMAND_SIDECAR_TOKEN = "<generated-token>"
 $env:COMMAND_SIDECAR_ROOTS = "C:\Users\yagof\Projects\codex-shared-online-cli"
 $env:COMMAND_SIDECAR_BASE_PATH = "/cmd"
-npm start
+npm run command-sidecar
 ```
 
 Expose it through Tailscale Serve:
@@ -128,18 +131,6 @@ npm run windows:command -- --powershell --timeout-ms 0 --cwd 'C:\Users\yagof\Pro
 ```
 
 See `command-sidecar/README.md` for the REST API and more examples. The Tailscale docs describe `tailscale serve --set-path` for path-based routing to loopback HTTP services: https://tailscale.com/kb/1242/tailscale-serve
-
-## Windows Companion Tray App
-
-The production Windows-side package lives in `windows/OnlineCLI.Companion`. It is a C# tray app that keeps a tiny bootstrap controller running even when the main Node server is stopped.
-
-Install and launch it from Windows:
-
-```powershell
-.\windows\install-companion.ps1 -Start
-```
-
-The tray panel can start/stop/restart the server, configure Tailscale Serve for `/` and `/companion`, enable run-on-startup, and show/copy the iOS pairing QR payload. The iOS app stores the tailnet URL plus companion token and can call `/companion/api/server/start` when the full server is down.
 
 ## Minimal Shared Setup (Desktop + iPhone + Local Terminal)
 1. Start everything:
@@ -199,6 +190,10 @@ npm install
 - `REMOTE_JPEG_QUALITY` (default: `62`)
 - `REMOTE_INPUT_RATE_LIMIT_PER_SEC` (default: `120`)
 - `REMOTE_INPUT_MAX_QUEUE` (default: `300`)
+- `COMMAND_SIDECAR_PORT` (default: `3777`; used by `npm run command-sidecar`)
+- `COMMAND_SIDECAR_BASE_PATH` (default: empty; use `/cmd` when exposing through Tailscale Serve path routing)
+- `COMMAND_SIDECAR_TOKEN` (required unless `COMMAND_SIDECAR_ALLOW_NO_TOKEN=true`)
+- `COMMAND_SIDECAR_ROOTS` (semicolon-separated allowed working directories)
 - `MAX_SESSIONS` (default: `24`)
 - `SESSION_IDLE_TIMEOUT_MS` (default: `2700000`)
 - `SESSION_SWEEP_INTERVAL_MS` (default: `60000`)
@@ -225,7 +220,6 @@ npm install
 - `src/http/sessionRoutes.js`: session API
 - `public/`: browser app and styles
 - `remote-agent/`: Windows host sidecar service (desktop capture + input automation)
-- `windows/OnlineCLI.Companion/`: C# tray companion and bootstrap API
 - `command-sidecar/`: token-gated Windows command runner for tailnet automation
 - `scripts/windows-command.js`: local client for the command sidecar
 - `docs/tailscale-setup.md`: private tailnet access guide

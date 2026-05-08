@@ -22,6 +22,12 @@ $env:COMMAND_SIDECAR_BASE_PATH = "/cmd"
 npm start
 ```
 
+From the repository root, the equivalent start command is:
+
+```powershell
+npm run command-sidecar
+```
+
 The server binds to `127.0.0.1:3777` by default. Keep that loopback bind and use Tailscale Serve to publish it privately to the tailnet.
 
 ```powershell

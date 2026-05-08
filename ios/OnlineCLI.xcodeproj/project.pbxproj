@@ -17,7 +17,7 @@
 		A10000000000000000000009 /* NativeTerminalClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000A /* NativeTerminalClient.swift */; };
 		A1000000000000000000000A /* NativeTerminalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000B /* NativeTerminalView.swift */; };
 		A1000000000000000000000B /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000C /* Assets.xcassets */; };
-		A1000000000000000000000C /* PairingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000D /* PairingView.swift */; };
+		A1000000000000000000000C /* ConnectionGateView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000D /* ConnectionGateView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -32,7 +32,7 @@
 		A2000000000000000000000A /* NativeTerminalClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeTerminalClient.swift; sourceTree = "<group>"; };
 		A2000000000000000000000B /* NativeTerminalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeTerminalView.swift; sourceTree = "<group>"; };
 		A2000000000000000000000C /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
-		A2000000000000000000000D /* PairingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingView.swift; sourceTree = "<group>"; };
+		A2000000000000000000000D /* ConnectionGateView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionGateView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -66,7 +66,7 @@
 				A2000000000000000000000B /* NativeTerminalView.swift */,
 				A20000000000000000000007 /* Glass.swift */,
 				A20000000000000000000008 /* Views.swift */,
-				A2000000000000000000000D /* PairingView.swift */,
+				A2000000000000000000000D /* ConnectionGateView.swift */,
 				A2000000000000000000000C /* Assets.xcassets */,
 			);
 			path = OnlineCLI;
@@ -158,7 +158,7 @@
 				A1000000000000000000000A /* NativeTerminalView.swift in Sources */,
 				A10000000000000000000007 /* Glass.swift in Sources */,
 				A10000000000000000000008 /* Views.swift in Sources */,
-				A1000000000000000000000C /* PairingView.swift in Sources */,
+				A1000000000000000000000C /* ConnectionGateView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -289,7 +289,6 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = "Online CLI";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
-				INFOPLIST_KEY_NSCameraUsageDescription = "Scan an Online CLI Windows companion pairing code.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -315,7 +314,6 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = "Online CLI";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
-				INFOPLIST_KEY_NSCameraUsageDescription = "Scan an Online CLI Windows companion pairing code.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;

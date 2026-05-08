@@ -6,6 +6,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "remote-agent": "node remote-agent/server.js",
+    "command-sidecar": "node command-sidecar/server.js",
     "windows:command": "node scripts/windows-command.js"
   },
   "dependencies": {
