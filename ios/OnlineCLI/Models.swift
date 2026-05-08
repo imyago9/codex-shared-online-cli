@@ -1,7 +1,8 @@
 import Foundation
 
 struct ServerSettings: Codable, Equatable {
-    var baseURLString = "https://desktop-cguakc2.tailbca5e0.ts.net"
+    var baseURLString = ""
+    var companionToken = ""
     var defaultTerminalProfile: TerminalProfile = .powershell
     var defaultRemoteMode: RemoteMode = .view
     var remoteStreamProfile: RemoteStreamProfile = .balanced
@@ -9,6 +10,7 @@ struct ServerSettings: Codable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case baseURLString
+        case companionToken
         case defaultTerminalProfile
         case defaultRemoteMode
         case remoteStreamProfile
@@ -20,6 +22,7 @@ struct ServerSettings: Codable, Equatable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         baseURLString = try container.decodeIfPresent(String.self, forKey: .baseURLString) ?? baseURLString
+        companionToken = try container.decodeIfPresent(String.self, forKey: .companionToken) ?? companionToken
         defaultTerminalProfile = try container.decodeIfPresent(TerminalProfile.self, forKey: .defaultTerminalProfile) ?? defaultTerminalProfile
         defaultRemoteMode = try container.decodeIfPresent(RemoteMode.self, forKey: .defaultRemoteMode) ?? defaultRemoteMode
         remoteStreamProfile = try container.decodeIfPresent(RemoteStreamProfile.self, forKey: .remoteStreamProfile) ?? remoteStreamProfile
@@ -40,6 +43,10 @@ struct ServerSettings: Codable, Equatable {
         components.query = nil
         components.fragment = nil
         return components.url
+    }
+
+    var trimmedCompanionToken: String {
+        companionToken.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
@@ -224,6 +231,28 @@ struct HealthResponse: Codable {
     let singleConsoleMode: Bool
     let defaultTerminalProfile: TerminalProfile?
     let terminalProfiles: [TerminalProfile]?
+}
+
+struct CompanionStatus: Codable, Equatable {
+    let ok: Bool
+    let companionVersion: String?
+    let serverRunning: Bool
+    let remoteAgentRunning: Bool
+    let runOnStartup: Bool
+    let autoStartServer: Bool
+    let appUrl: String?
+    let tailnetUrl: String?
+    let repoRoot: String?
+    let serverPort: Int?
+    let remotePort: Int?
+    let launcherPort: Int?
+    let message: String?
+}
+
+struct CompanionActionResponse: Codable, Equatable {
+    let ok: Bool
+    let message: String?
+    let status: CompanionStatus?
 }
 
 struct SessionsResponse: Codable {

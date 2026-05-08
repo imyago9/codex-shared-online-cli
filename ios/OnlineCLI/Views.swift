@@ -69,6 +69,21 @@ struct RootView: View {
     @Environment(AppModel.self) private var app
 
     var body: some View {
+        Group {
+            if app.isServerConnected {
+                AppTabsView()
+            } else {
+                ConnectionGateView()
+            }
+        }
+        .task {
+            await app.refreshAll()
+        }
+    }
+}
+
+private struct AppTabsView: View {
+    var body: some View {
         TabView {
             ConsoleTabView()
                 .tabItem { Label("Console", systemImage: "terminal") }
@@ -78,9 +93,6 @@ struct RootView: View {
 
             SettingsView()
                 .tabItem { Label("Settings", systemImage: "gearshape") }
-        }
-        .task {
-            await app.refreshAll()
         }
     }
 }
@@ -3452,6 +3464,7 @@ private extension View {
 struct SettingsView: View {
     @Environment(AppModel.self) private var app
     @State private var draftURL = ""
+    @State private var draftToken = ""
     @State private var draftRemoteMode: RemoteMode = .view
     @State private var draftStreamProfile: RemoteStreamProfile = .balanced
     @State private var preferNativeRemote = true
@@ -3465,12 +3478,49 @@ struct SettingsView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
 
+                    SecureField("Companion token", text: $draftToken)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+
                     Button("Save and Test") {
                         app.settings.baseURLString = draftURL
+                        app.settings.companionToken = draftToken
                         Task { await app.refreshAll() }
                     }
 
                     LabeledContent("Status", value: app.connectionMessage)
+                }
+
+                Section("Windows Companion") {
+                    LabeledContent("Status", value: app.companionMessage)
+
+                    if let status = app.companionStatus {
+                        LabeledContent("Server", value: status.serverRunning ? "Running" : "Stopped")
+                        LabeledContent("Remote", value: status.remoteAgentRunning ? "Ready" : "Stopped")
+                        Toggle("Run on startup", isOn: Binding(
+                            get: { app.companionStatus?.runOnStartup == true },
+                            set: { value in
+                                Task { await app.setRunOnStartup(value) }
+                            }
+                        ))
+                    }
+
+                    HStack {
+                        Button("Start Server") {
+                            Task { await app.startServerFromCompanion() }
+                        }
+                        .disabled(app.isCompanionLoading || app.settings.trimmedCompanionToken.isEmpty)
+
+                        Button("Restart") {
+                            Task { await app.restartServerFromCompanion() }
+                        }
+                        .disabled(app.isCompanionLoading || app.settings.trimmedCompanionToken.isEmpty)
+                    }
+
+                    Button("Stop Server", role: .destructive) {
+                        Task { await app.stopServerFromCompanion() }
+                    }
+                    .disabled(app.isCompanionLoading || app.settings.trimmedCompanionToken.isEmpty)
                 }
 
                 Section("Remote") {
@@ -3516,9 +3566,11 @@ struct SettingsView: View {
             .navigationTitle("Settings")
             .onAppear {
                 draftURL = app.settings.baseURLString
+                draftToken = app.settings.companionToken
                 draftRemoteMode = app.settings.defaultRemoteMode
                 draftStreamProfile = app.settings.remoteStreamProfile
                 preferNativeRemote = app.settings.preferNativeRemote
+                Task { await app.refreshCompanionStatus() }
             }
         }
     }

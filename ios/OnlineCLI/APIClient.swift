@@ -30,6 +30,31 @@ struct OnlineCLIAPI {
         try await request("api/health")
     }
 
+    func companionStatus(token: String? = nil) async throws -> CompanionStatus {
+        try await request("companion/api/status", authToken: token)
+    }
+
+    func startServer(token: String? = nil) async throws -> CompanionActionResponse {
+        try await request("companion/api/server/start", method: "POST", body: EmptyBody(), authToken: token)
+    }
+
+    func stopServer(token: String? = nil) async throws -> CompanionActionResponse {
+        try await request("companion/api/server/stop", method: "POST", body: EmptyBody(), authToken: token)
+    }
+
+    func restartServer(token: String? = nil) async throws -> CompanionActionResponse {
+        try await request("companion/api/server/restart", method: "POST", body: EmptyBody(), authToken: token)
+    }
+
+    func setRunOnStartup(_ enabled: Bool, token: String? = nil) async throws -> CompanionActionResponse {
+        try await request(
+            "companion/api/startup",
+            method: "POST",
+            body: StartupRequest(enabled: enabled),
+            authToken: token
+        )
+    }
+
     func sessions() async throws -> SessionsResponse {
         try await request("api/sessions")
     }
@@ -87,23 +112,33 @@ struct OnlineCLIAPI {
         return url
     }
 
-    private func request<T: Decodable>(_ path: String) async throws -> T {
-        let data = try await requestData(path, method: "GET", body: Optional<EmptyBody>.none)
+    private func request<T: Decodable>(_ path: String, authToken: String? = nil) async throws -> T {
+        let data = try await requestData(path, method: "GET", body: Optional<EmptyBody>.none, authToken: authToken)
         guard !data.isEmpty else {
             throw APIError.emptyResponse
         }
         return try decoder.decode(T.self, from: data)
     }
 
-    private func request<T: Decodable, Body: Encodable>(_ path: String, method: String, body: Body) async throws -> T {
-        let data = try await requestData(path, method: method, body: body)
+    private func request<T: Decodable, Body: Encodable>(
+        _ path: String,
+        method: String,
+        body: Body,
+        authToken: String? = nil
+    ) async throws -> T {
+        let data = try await requestData(path, method: method, body: body, authToken: authToken)
         guard !data.isEmpty else {
             throw APIError.emptyResponse
         }
         return try decoder.decode(T.self, from: data)
     }
 
-    private func requestData<Body: Encodable>(_ path: String, method: String, body: Body?) async throws -> Data {
+    private func requestData<Body: Encodable>(
+        _ path: String,
+        method: String,
+        body: Body?,
+        authToken: String? = nil
+    ) async throws -> Data {
         guard let url = makeURL(path) else {
             throw APIError.invalidBaseURL
         }
@@ -111,6 +146,9 @@ struct OnlineCLIAPI {
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.setValue("application/json", forHTTPHeaderField: "accept")
+        if let authToken = authToken?.trimmingCharacters(in: .whitespacesAndNewlines), !authToken.isEmpty {
+            request.setValue("Bearer \(authToken)", forHTTPHeaderField: "authorization")
+        }
 
         if let body {
             request.setValue("application/json", forHTTPHeaderField: "content-type")
@@ -161,6 +199,10 @@ private struct CommandRequest: Encodable {
 
 private struct ScrollRequest: Encodable {
     let lines: Int
+}
+
+private struct StartupRequest: Encodable {
+    let enabled: Bool
 }
 
 private struct ErrorResponse: Decodable {
