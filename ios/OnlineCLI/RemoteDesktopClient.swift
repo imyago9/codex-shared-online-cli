@@ -113,7 +113,7 @@ final class RemoteDesktopClient {
     private var nextInputSequence = 0
     private var pendingInputSentAt: [Int: TimeInterval] = [:]
     private var lastPointerAckRequestAt: TimeInterval = 0
-    private let pointerAckInterval: TimeInterval = 0.12
+    private let pointerAckInterval: TimeInterval = 0.35
     @ObservationIgnored private var frameDecodeTask: Task<Void, Never>?
     @ObservationIgnored private var pendingFrameData: CompressedRemoteFrame?
     @ObservationIgnored private var pendingDecodedFrame: DecodedRemoteFrame?
@@ -864,7 +864,8 @@ final class RemoteDesktopClient {
         droppedEvents = intValue(payload["droppedEvents"]) ?? droppedEvents
         diagnosticsDraft.droppedInputEvents = droppedEvents
         diagnosticsDraft.inputQueueMax = inputQueueMax
-        publishDiagnosticsIfNeeded(force: true)
+        let status = payload["status"] as? String
+        publishDiagnosticsIfNeeded(force: status == "dropped" || status == "error")
     }
 
     private func schedulePointerFlush(after delay: TimeInterval) {

@@ -126,6 +126,15 @@ function isMouseMoveEvent(event) {
   return inputEventType(event) === 'mouse_move';
 }
 
+function isLatencyCriticalInput(event) {
+  const type = inputEventType(event);
+  return type === 'mouse_button'
+    || type === 'mouse_wheel'
+    || type === 'key'
+    || type === 'text'
+    || type === 'release_all';
+}
+
 function parseRequestQuery(req) {
   try {
     const parsed = new URL(req.url, 'http://localhost');
@@ -2199,6 +2208,36 @@ function createInputController(config, displayBounds, logger) {
     return createUnavailableInputController('disabled-by-env');
   }
 
+  const requestedBackend = typeof config.inputBackend === 'string'
+    ? config.inputBackend.trim().toLowerCase()
+    : 'auto';
+  const preferPowerShell = process.platform === 'win32'
+    && requestedBackend !== 'nut-js'
+    && requestedBackend !== 'nut'
+    && requestedBackend !== 'native';
+
+  if (preferPowerShell) {
+    const fallbackController = createWindowsPowerShellInputController(displayBounds, logger);
+    if (fallbackController.available === true) {
+      logger.info('Low-latency Windows input backend enabled', {
+        backend: fallbackController.backend,
+        requestedBackend
+      });
+      return fallbackController;
+    }
+
+    if (requestedBackend === 'powershell' || requestedBackend === 'win32' || requestedBackend === 'windows') {
+      logger.warn('Requested Windows input backend unavailable, starting in view-only mode', {
+        reason: fallbackController.reason
+      });
+      return fallbackController;
+    }
+
+    logger.warn('Low-latency Windows input backend unavailable, falling back to nut-js', {
+      reason: fallbackController.reason
+    });
+  }
+
   let nut = null;
   try {
     // Optional dependency: if this fails, we intentionally keep view-only streaming.
@@ -2256,6 +2295,7 @@ const config = {
   videoEncoder: process.env.REMOTE_VIDEO_ENCODER || 'libx264',
   videoFfmpegPath: process.env.REMOTE_VIDEO_FFMPEG_PATH || bundledFfmpegPath || 'ffmpeg',
   inputEnabled: parseBoolean(process.env.REMOTE_INPUT_ENABLED, true),
+  inputBackend: process.env.REMOTE_INPUT_BACKEND || (process.platform === 'win32' ? 'powershell' : 'auto'),
   logLevel: process.env.LOG_LEVEL || 'info'
 };
 
@@ -3755,6 +3795,27 @@ inputWss.on('connection', (socket) => {
     clearInputPumpTimer();
   }
 
+  function dropPendingMouseMoves(reason) {
+    if (latestMove) {
+      dropInputEvent(latestMove, reason);
+      latestMove = null;
+    }
+
+    if (inputQueue.length === 0) {
+      return;
+    }
+
+    const retained = [];
+    for (const queuedEvent of inputQueue) {
+      if (isMouseMoveEvent(queuedEvent)) {
+        dropInputEvent(queuedEvent, reason);
+      } else {
+        retained.push(queuedEvent);
+      }
+    }
+    inputQueue = retained;
+  }
+
   function scheduleInputPump() {
     if (inputPumpTimer || controllerBusy || releasedInputState) {
       return;
@@ -3841,6 +3902,10 @@ inputWss.on('connection', (socket) => {
     if (latestMove && Number.isFinite(Number(event.x)) && Number.isFinite(Number(event.y))) {
       dropInputEvent(latestMove, 'superseded-by-absolute-input');
       latestMove = null;
+    }
+
+    if (isLatencyCriticalInput(event)) {
+      dropPendingMouseMoves('superseded-by-critical-input');
     }
 
     if (inputQueue.length >= maxQueuedInputEvents) {

@@ -27,12 +27,12 @@ Default bind: `127.0.0.1:3390`
 - `REMOTE_STREAM_FPS` (default: `10`)
 - `REMOTE_JPEG_QUALITY` (default: `62`)
 - `REMOTE_INPUT_ENABLED` (default: `true`)
+- `REMOTE_INPUT_BACKEND` (Windows default: `powershell`; set `nut-js` to force the optional nut-js backend)
 
 ## Input automation fallback
-Input automation uses optional dependency `@nut-tree-fork/nut-js`.
-On Windows, if it is not installed or fails to load, the sidecar automatically falls back to a built-in PowerShell input controller.
+On Windows, input automation defaults to a persistent Win32/PowerShell controller because it writes directly to the OS input APIs with minimal per-event overhead. The optional `@nut-tree-fork/nut-js` backend is still available by setting `REMOTE_INPUT_BACKEND=nut-js`.
 
-If both `nut-js` and the PowerShell fallback are unavailable, the sidecar starts in **view-only mode**:
+If the selected backend is unavailable and no fallback can be started, the sidecar starts in **view-only mode**:
 - `/stream` remains available
 - `/input` returns a clear unavailable error
 - `/health` reports `input.available=false` with a reason
