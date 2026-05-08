@@ -34,6 +34,9 @@ struct RemoteTelemetrySnapshot: Equatable {
     var receivedFps = 0.0
     var presentedFps = 0.0
     var inputQueueMax: Int?
+    var inputQueueDepth: Int?
+    var inputRttMs: Double?
+    var inputExecutionMs: Double?
     var droppedInputEvents = 0
 
     @MainActor
@@ -50,6 +53,9 @@ struct RemoteTelemetrySnapshot: Equatable {
         receivedFps = diagnostics.receivedFps
         presentedFps = diagnostics.presentedFps
         inputQueueMax = client.inputQueueMax ?? diagnostics.inputQueueMax
+        inputQueueDepth = diagnostics.inputQueueDepth
+        inputRttMs = diagnostics.inputRttMs
+        inputExecutionMs = diagnostics.inputExecutionMs
         droppedInputEvents = client.droppedEvents
         if let display = client.displayInfo, let width = display.width, let height = display.height {
             displaySizeText = "\(width)x\(height)"
@@ -565,6 +571,12 @@ struct RemoteDesktopView: View {
             .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { notification in
                 updateKeyboardHeight(notification)
             }
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
+                client.releaseRemoteInputState()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
+                client.releaseRemoteInputState()
+            }
             .onReceive(telemetryTicker) { _ in
                 refreshTelemetry()
             }
@@ -720,16 +732,22 @@ struct RemoteDesktopView: View {
     }
 
     private var diagnosticsText: String {
-        let queue = telemetry.inputQueueMax.map { "q \($0)" } ?? "q --"
+        let queueDepth = telemetry.inputQueueDepth.map(String.init) ?? "--"
+        let queueMax = telemetry.inputQueueMax.map(String.init) ?? "--"
+        let rtt = telemetry.inputRttMs.map { String(format: "%.0fms", $0) } ?? "--"
+        let execution = telemetry.inputExecutionMs.map { String(format: "%.0fms", $0) } ?? "--"
         let rate = client.inputRateLimitPerSec.map { "\($0)/s" } ?? "--/s"
         return String(
-            format: "rx %.1f • draw %.1f • dec %.1fms • render %.1fms • drop %d • input %@ %@/%d",
+            format: "rx %.1f • draw %.1f • dec %.1fms • render %.1fms • drop %d • input %@ exec %@ q %@/%@ %@ drop %d",
             telemetry.receivedFps,
             telemetry.presentedFps,
             telemetry.decodeMs,
             telemetry.renderMs,
             telemetry.droppedFrames,
-            queue,
+            rtt,
+            execution,
+            queueDepth,
+            queueMax,
             rate,
             telemetry.droppedInputEvents
         )

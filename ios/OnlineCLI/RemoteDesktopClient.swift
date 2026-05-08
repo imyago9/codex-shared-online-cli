@@ -54,6 +54,9 @@ struct RemoteRenderDiagnostics: Equatable {
     var frameBytes = 0
     var captureLatencyMs: Double?
     var inputQueueMax: Int?
+    var inputQueueDepth: Int?
+    var inputRttMs: Double?
+    var inputExecutionMs: Double?
     var droppedInputEvents = 0
 }
 
@@ -107,6 +110,10 @@ final class RemoteDesktopClient {
     private var lastPointerSendAt: TimeInterval = 0
     private var pendingPointer: CGPoint?
     private var pointerFlushTask: Task<Void, Never>?
+    private var nextInputSequence = 0
+    private var pendingInputSentAt: [Int: TimeInterval] = [:]
+    private var lastPointerAckRequestAt: TimeInterval = 0
+    private let pointerAckInterval: TimeInterval = 0.12
     @ObservationIgnored private var frameDecodeTask: Task<Void, Never>?
     @ObservationIgnored private var pendingFrameData: CompressedRemoteFrame?
     @ObservationIgnored private var pendingDecodedFrame: DecodedRemoteFrame?
@@ -195,6 +202,7 @@ final class RemoteDesktopClient {
         monitorLayoutFlushTask?.cancel()
         monitorLayoutFlushTask = nil
         pendingPointer = nil
+        pendingInputSentAt.removeAll(keepingCapacity: true)
         pendingFrameData = nil
         pendingDecodedFrame = nil
         pendingMonitorLayoutOffsets = nil
@@ -363,12 +371,8 @@ final class RemoteDesktopClient {
     }
 
     func releaseRemoteInputState() {
-        sendEnvelope([
-            "type": "input",
-            "event": [
-                "type": "release_all"
-            ]
-        ])
+        cancelPendingPointerMove()
+        sendInput(["type": "release_all"], reportBlocked: false, requiresControl: false, forceAck: true)
     }
 
     func sendText(_ text: String) {
@@ -467,6 +471,9 @@ final class RemoteDesktopClient {
             frameFps = doubleValue(payload["fps"]) ?? frameFps
             frameBytes = intValue(payload["frameBytes"]) ?? frameBytes
             frameLatencyMs = doubleValue(payload["captureLatencyMs"])
+            inputQueueMax = intValue(payload["inputQueueMax"]) ?? inputQueueMax
+            diagnosticsDraft.inputQueueDepth = intValue(payload["inputQueueDepth"]) ?? diagnosticsDraft.inputQueueDepth
+            droppedEvents = intValue(payload["droppedEvents"]) ?? droppedEvents
             diagnosticsDraft.frameBytes = frameBytes
             diagnosticsDraft.captureLatencyMs = frameLatencyMs
             diagnosticsDraft.inputQueueMax = inputQueueMax
@@ -487,10 +494,13 @@ final class RemoteDesktopClient {
             setStatusText("Input throttled")
         case "remote-input-backpressure":
             droppedEvents = intValue(payload["droppedEvents"]) ?? droppedEvents
+            diagnosticsDraft.inputQueueDepth = intValue(payload["queueDepth"]) ?? diagnosticsDraft.inputQueueDepth
             diagnosticsDraft.droppedInputEvents = droppedEvents
             diagnosticsDraft.inputQueueMax = inputQueueMax
             publishDiagnosticsIfNeeded(force: true)
             setStatusText("Input queue is saturated")
+        case "remote-input-ack":
+            handleInputAck(payload)
         case "remote-input-error":
             setStatusText(payload["message"] as? String ?? "Input error")
         case "remote-input-connected":
@@ -755,9 +765,28 @@ final class RemoteDesktopClient {
         gatewayStatus = next
     }
 
-    private func sendInput(_ event: [String: Any], reportBlocked: Bool = true) {
-        guard canSendInput(reportBlocked: reportBlocked) else { return }
-        sendEnvelope(["type": "input", "event": event])
+    private func sendInput(
+        _ event: [String: Any],
+        reportBlocked: Bool = true,
+        requiresControl: Bool = true,
+        forceAck: Bool? = nil
+    ) {
+        if requiresControl {
+            guard canSendInput(reportBlocked: reportBlocked) else { return }
+        }
+
+        var stampedEvent = event
+        if shouldRequestInputAck(for: event, forceAck: forceAck) {
+            nextInputSequence &+= 1
+            let inputId = nextInputSequence
+            pendingInputSentAt[inputId] = ProcessInfo.processInfo.systemUptime
+            trimTrackedInputAcks()
+            stampedEvent["inputId"] = inputId
+            stampedEvent["ack"] = true
+            stampedEvent["clientSentAt"] = Int(Date().timeIntervalSince1970 * 1_000)
+        }
+
+        sendEnvelope(["type": "input", "event": stampedEvent])
     }
 
     private func sendMouseButton(button: String, action: String, at point: CGPoint?) {
@@ -798,6 +827,44 @@ final class RemoteDesktopClient {
             "x": point.x,
             "y": point.y
         ], reportBlocked: false)
+    }
+
+    private func shouldRequestInputAck(for event: [String: Any], forceAck: Bool?) -> Bool {
+        if let forceAck {
+            return forceAck
+        }
+
+        let type = event["type"] as? String ?? ""
+        guard type == "mouse_move" else { return true }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastPointerAckRequestAt >= pointerAckInterval else { return false }
+        lastPointerAckRequestAt = now
+        return true
+    }
+
+    private func trimTrackedInputAcks() {
+        guard pendingInputSentAt.count > 256 else { return }
+        let overflow = pendingInputSentAt.count - 256
+        let expiredIds = pendingInputSentAt.keys.sorted().prefix(overflow)
+        for inputId in expiredIds {
+            pendingInputSentAt[inputId] = nil
+        }
+    }
+
+    private func handleInputAck(_ payload: [String: Any]) {
+        let inputId = intValue(payload["inputId"])
+        let now = ProcessInfo.processInfo.systemUptime
+        if let inputId, let sentAt = pendingInputSentAt.removeValue(forKey: inputId) {
+            diagnosticsDraft.inputRttMs = max(0, (now - sentAt) * 1_000)
+        }
+
+        diagnosticsDraft.inputExecutionMs = doubleValue(payload["sidecarDurationMs"]) ?? diagnosticsDraft.inputExecutionMs
+        diagnosticsDraft.inputQueueDepth = intValue(payload["queueDepth"]) ?? diagnosticsDraft.inputQueueDepth
+        droppedEvents = intValue(payload["droppedEvents"]) ?? droppedEvents
+        diagnosticsDraft.droppedInputEvents = droppedEvents
+        diagnosticsDraft.inputQueueMax = inputQueueMax
+        publishDiagnosticsIfNeeded(force: true)
     }
 
     private func schedulePointerFlush(after delay: TimeInterval) {

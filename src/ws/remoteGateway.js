@@ -180,6 +180,44 @@ function sanitizeModifierMap(rawValue) {
   };
 }
 
+function sanitizeInputId(rawValue) {
+  if (typeof rawValue === 'number' && Number.isSafeInteger(rawValue) && rawValue >= 0) {
+    return rawValue;
+  }
+
+  if (typeof rawValue === 'string') {
+    const trimmed = rawValue.trim();
+    if (trimmed && trimmed.length <= 64) {
+      return trimmed;
+    }
+  }
+
+  return null;
+}
+
+function optionalFiniteNumber(rawValue) {
+  const parsed = Number(rawValue);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function attachInputMetadata(payload, rawValue) {
+  const inputId = sanitizeInputId(rawValue.inputId);
+  if (inputId !== null) {
+    payload.inputId = inputId;
+  }
+
+  const clientSentAt = optionalFiniteNumber(rawValue.clientSentAt);
+  if (clientSentAt !== null) {
+    payload.clientSentAt = clientSentAt;
+  }
+
+  if (rawValue.ack === true) {
+    payload.ack = true;
+  }
+
+  return payload;
+}
+
 function sanitizeInputEvent(rawValue) {
   if (!rawValue || typeof rawValue !== 'object') {
     return null;
@@ -191,10 +229,10 @@ function sanitizeInputEvent(rawValue) {
   }
 
   if (type === 'release_all') {
-    return {
+    return attachInputMetadata({
       type,
       at: Date.now()
-    };
+    }, rawValue);
   }
 
   if (type === 'mouse_move') {
@@ -203,12 +241,12 @@ function sanitizeInputEvent(rawValue) {
     if (x === null || y === null) {
       return null;
     }
-    return {
+    return attachInputMetadata({
       type,
       x,
       y,
       at: Date.now()
-    };
+    }, rawValue);
   }
 
   if (type === 'mouse_button') {
@@ -235,7 +273,7 @@ function sanitizeInputEvent(rawValue) {
       payload.y = y;
     }
 
-    return payload;
+    return attachInputMetadata(payload, rawValue);
   }
 
   if (type === 'mouse_wheel') {
@@ -259,7 +297,7 @@ function sanitizeInputEvent(rawValue) {
       payload.y = y;
     }
 
-    return payload;
+    return attachInputMetadata(payload, rawValue);
   }
 
   if (type === 'key') {
@@ -276,7 +314,7 @@ function sanitizeInputEvent(rawValue) {
       return null;
     }
 
-    return {
+    return attachInputMetadata({
       type,
       action,
       key,
@@ -284,7 +322,7 @@ function sanitizeInputEvent(rawValue) {
       text,
       modifiers: sanitizeModifierMap(rawValue.modifiers),
       at: Date.now()
-    };
+    }, rawValue);
   }
 
   if (type === 'text') {
@@ -293,11 +331,11 @@ function sanitizeInputEvent(rawValue) {
       return null;
     }
 
-    return {
+    return attachInputMetadata({
       type,
       text,
       at: Date.now()
-    };
+    }, rawValue);
   }
 
   return null;
@@ -311,6 +349,10 @@ function inputEventType(event) {
 
 function isMouseMoveEvent(event) {
   return inputEventType(event) === 'mouse_move';
+}
+
+function shouldAckInput(event) {
+  return !!event && (event.ack === true || event.inputId !== undefined && event.inputId !== null);
 }
 
 function isLatencyCriticalInput(event) {
@@ -461,6 +503,49 @@ function createRemoteGateway(server, remoteClient, options = {}) {
       }
     }
 
+    function sendRemoteInputAck(payload = {}) {
+      const now = Date.now();
+      sendControl('remote-input-ack', {
+        inputId: sanitizeInputId(payload.inputId),
+        eventType: typeof payload.eventType === 'string' ? payload.eventType : null,
+        status: typeof payload.status === 'string' ? payload.status : 'ok',
+        clientSentAt: optionalFiniteNumber(payload.clientSentAt),
+        gatewayReceivedAt: optionalFiniteNumber(payload.gatewayReceivedAt),
+        gatewaySentAt: optionalFiniteNumber(payload.gatewaySentAt),
+        gatewayAckAt: now,
+        sidecarReceivedAt: optionalFiniteNumber(payload.sidecarReceivedAt),
+        sidecarStartedAt: optionalFiniteNumber(payload.sidecarStartedAt),
+        sidecarCompletedAt: optionalFiniteNumber(payload.sidecarCompletedAt),
+        sidecarDurationMs: optionalFiniteNumber(payload.sidecarDurationMs),
+        reason: typeof payload.reason === 'string' ? payload.reason : null,
+        queueDepth: optionalFiniteNumber(payload.queueDepth) ?? context.inputQueue.length,
+        queueMax: inputQueueMax,
+        droppedEvents: context.droppedEvents
+      });
+    }
+
+    function recordDroppedInput(event, reason) {
+      context.droppedEvents += 1;
+      if (shouldAckInput(event)) {
+        sendRemoteInputAck({
+          inputId: event.inputId,
+          eventType: inputEventType(event),
+          status: 'dropped',
+          reason,
+          clientSentAt: event.clientSentAt,
+          gatewayReceivedAt: event.gatewayReceivedAt || event.at,
+          gatewaySentAt: event.gatewaySentAt,
+          sidecarDurationMs: 0
+        });
+      }
+    }
+
+    function dropAllQueuedInputs(reason) {
+      while (context.inputQueue.length > 0) {
+        recordDroppedInput(context.inputQueue.shift(), reason);
+      }
+    }
+
     function closeConnection(code, reason) {
       if (!isWsOpen(clientSocket)) {
         return;
@@ -485,9 +570,13 @@ function createRemoteGateway(server, remoteClient, options = {}) {
       }
 
       try {
+        const outboundEvent = {
+          ...event,
+          gatewaySentAt: Date.now()
+        };
         context.inputSocket.send(JSON.stringify({
           type: 'input',
-          event
+          event: outboundEvent
         }));
         return true;
       } catch (error) {
@@ -503,7 +592,7 @@ function createRemoteGateway(server, remoteClient, options = {}) {
         at: Date.now()
       };
 
-      context.inputQueue.length = 0;
+      dropAllQueuedInputs('release-all');
       sendInputEventDirect(event);
     }
 
@@ -742,30 +831,34 @@ function createRemoteGateway(server, remoteClient, options = {}) {
       }, 1);
     }
 
-    function dropQueuedMouseMoves() {
-      let writeIndex = 0;
+    function dropQueuedMouseMoves(reason = 'coalesced') {
+      const retained = [];
       for (const event of context.inputQueue) {
         if (!isMouseMoveEvent(event)) {
-          context.inputQueue[writeIndex] = event;
-          writeIndex += 1;
+          retained.push(event);
+        } else {
+          recordDroppedInput(event, reason);
         }
       }
-      context.inputQueue.length = writeIndex;
+      context.inputQueue = retained;
     }
 
     function queueInputForSocketOpen(event) {
       if (isMouseMoveEvent(event)) {
-        dropQueuedMouseMoves();
+        dropQueuedMouseMoves('coalesced');
       } else if (isLatencyCriticalInput(event)) {
-        dropQueuedMouseMoves();
+        dropQueuedMouseMoves('superseded-by-critical-input');
       }
 
       if (context.inputQueue.length >= inputQueueMax) {
         if (isMouseMoveEvent(event)) {
-          context.droppedEvents += 1;
+          recordDroppedInput(event, 'queue-full');
           return false;
         }
-        context.inputQueue.shift();
+        const droppedEvent = context.inputQueue.shift();
+        if (droppedEvent) {
+          recordDroppedInput(droppedEvent, 'queue-overflow');
+        }
       }
 
       context.inputQueue.push(event);
@@ -778,12 +871,16 @@ function createRemoteGateway(server, remoteClient, options = {}) {
 
       if (context.inputSocket && context.inputSocket.readyState === WebSocket.OPEN) {
         if (isLatencyCriticalInput(event)) {
-          context.inputQueue.length = 0;
+          dropAllQueuedInputs('superseded-by-critical-input');
         } else if (context.inputQueue.length > 0) {
           flushInputQueue();
         }
         clearInputFlushTimer();
-        return sendInputEventDirect(event);
+        const sent = sendInputEventDirect(event);
+        if (!sent) {
+          recordDroppedInput(event, 'input-socket-send-failed');
+        }
+        return sent;
       }
 
       const queued = queueInputForSocketOpen(event);
@@ -793,6 +890,7 @@ function createRemoteGateway(server, remoteClient, options = {}) {
           context.lastBackpressureNoticeAt = now;
           sendControl('remote-input-backpressure', {
             queueMax: inputQueueMax,
+            queueDepth: context.inputQueue.length,
             droppedEvents: context.droppedEvents
           });
         }
@@ -802,7 +900,7 @@ function createRemoteGateway(server, remoteClient, options = {}) {
 
     function flushInputQueue() {
       if (context.closed || context.mode !== 'control') {
-        context.inputQueue.length = 0;
+        dropAllQueuedInputs('control-disabled');
         return;
       }
 
@@ -812,19 +910,14 @@ function createRemoteGateway(server, remoteClient, options = {}) {
           scheduleInputFlush();
           return;
         }
-        context.inputQueue.length = 0;
+        dropAllQueuedInputs('input-socket-unavailable');
         return;
       }
 
       while (context.inputQueue.length > 0 && context.inputSocket.readyState === WebSocket.OPEN) {
         const eventPayload = context.inputQueue.shift();
-        try {
-          context.inputSocket.send(JSON.stringify({
-            type: 'input',
-            event: eventPayload
-          }));
-        } catch (error) {
-          context.lastInputError = error && error.message ? error.message : 'input-send-failed';
+        if (!sendInputEventDirect(eventPayload)) {
+          recordDroppedInput(eventPayload, 'input-socket-send-failed');
           break;
         }
       }
@@ -873,6 +966,16 @@ function createRemoteGateway(server, remoteClient, options = {}) {
         }
 
         if (!payload || typeof payload !== 'object') {
+          return;
+        }
+
+        if (payload.type === 'ack' || payload.type === 'input-ack') {
+          if (payload.status === 'dropped') {
+            context.droppedEvents += 1;
+            publishGatewaySnapshot();
+          }
+
+          sendRemoteInputAck(payload);
           return;
         }
 
@@ -1044,7 +1147,10 @@ function createRemoteGateway(server, remoteClient, options = {}) {
           sendControl('remote-stats', {
             ...frameStats,
             display: payload.display || null,
-            monitors: Array.isArray(payload.displays) ? payload.displays : []
+            monitors: Array.isArray(payload.displays) ? payload.displays : [],
+            inputQueueDepth: context.inputQueue.length,
+            inputQueueMax,
+            droppedEvents: context.droppedEvents
           });
           return;
         }
@@ -1204,8 +1310,10 @@ function createRemoteGateway(server, remoteClient, options = {}) {
         });
         return;
       }
+      sanitizedEvent.gatewayReceivedAt = sanitizedEvent.at || Date.now();
 
       if (!consumeRateBudget(sanitizedEvent)) {
+        recordDroppedInput(sanitizedEvent, 'rate-limit');
         return;
       }
 

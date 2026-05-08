@@ -3661,9 +3661,12 @@ inputWss.on('connection', (socket) => {
     }));
   }
 
-  let pending = Promise.resolve();
-  let pendingMove = null;
-  let moveFlushTimer = null;
+  const maxQueuedInputEvents = 240;
+  let inputQueue = [];
+  let latestMove = null;
+  let inputPumpTimer = null;
+  let controllerBusy = false;
+  let activeInputPromise = null;
   let releasedInputState = false;
 
   function handleInputError(error) {
@@ -3680,57 +3683,172 @@ inputWss.on('connection', (socket) => {
     }
   }
 
-  function enqueueControllerEvent(event) {
-    pending = pending
-      .then(async () => {
+  function shouldAckInput(event) {
+    return !!event && (event.ack === true || event.inputId !== undefined && event.inputId !== null);
+  }
+
+  function optionalFiniteNumber(value) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  function pendingInputDepth() {
+    return inputQueue.length + (latestMove ? 1 : 0);
+  }
+
+  function sendInputAck(event, status, extra = {}) {
+    if (!shouldAckInput(event) || !isWsOpen(socket)) {
+      return;
+    }
+
+    const completedAt = optionalFiniteNumber(extra.sidecarCompletedAt) || Date.now();
+    const startedAt = optionalFiniteNumber(extra.sidecarStartedAt);
+    const durationMs = optionalFiniteNumber(extra.sidecarDurationMs)
+      ?? (startedAt !== null ? Math.max(0, completedAt - startedAt) : null);
+
+    try {
+      socket.send(JSON.stringify({
+        type: 'ack',
+        inputId: event.inputId ?? null,
+        eventType: inputEventType(event),
+        status,
+        clientSentAt: optionalFiniteNumber(event.clientSentAt),
+        gatewayReceivedAt: optionalFiniteNumber(event.gatewayReceivedAt ?? event.at),
+        gatewaySentAt: optionalFiniteNumber(event.gatewaySentAt),
+        sidecarReceivedAt: optionalFiniteNumber(event.sidecarReceivedAt),
+        sidecarStartedAt: startedAt,
+        sidecarCompletedAt: completedAt,
+        sidecarDurationMs: durationMs,
+        reason: typeof extra.reason === 'string' ? extra.reason : null,
+        queueDepth: pendingInputDepth()
+      }));
+    } catch (_error) {
+      // Best-effort diagnostic ACK.
+    }
+  }
+
+  function dropInputEvent(event, reason) {
+    sendInputAck(event, 'dropped', {
+      reason,
+      sidecarCompletedAt: Date.now(),
+      sidecarDurationMs: 0
+    });
+  }
+
+  function clearInputPumpTimer() {
+    if (inputPumpTimer) {
+      clearImmediate(inputPumpTimer);
+      inputPumpTimer = null;
+    }
+  }
+
+  function dropPendingInputs(reason) {
+    if (latestMove) {
+      dropInputEvent(latestMove, reason);
+      latestMove = null;
+    }
+
+    while (inputQueue.length > 0) {
+      dropInputEvent(inputQueue.shift(), reason);
+    }
+
+    clearInputPumpTimer();
+  }
+
+  function scheduleInputPump() {
+    if (inputPumpTimer || controllerBusy || releasedInputState) {
+      return;
+    }
+
+    inputPumpTimer = setImmediate(runInputPump);
+    inputPumpTimer.unref?.();
+  }
+
+  function nextInputEvent() {
+    if (inputQueue.length > 0) {
+      return inputQueue.shift();
+    }
+
+    if (latestMove) {
+      const event = latestMove;
+      latestMove = null;
+      return event;
+    }
+
+    return null;
+  }
+
+  async function runInputPump() {
+    inputPumpTimer = null;
+    if (controllerBusy || releasedInputState) {
+      return;
+    }
+
+    const event = nextInputEvent();
+    if (!event) {
+      return;
+    }
+
+    controllerBusy = true;
+    const startedAt = Date.now();
+    activeInputPromise = (async () => {
+      try {
         await inputController.handleEvent(event);
-      })
-      .catch(handleInputError);
-  }
+        const completedAt = Date.now();
+        sendInputAck(event, 'ok', {
+          sidecarStartedAt: startedAt,
+          sidecarCompletedAt: completedAt,
+          sidecarDurationMs: completedAt - startedAt
+        });
+      } catch (error) {
+        const completedAt = Date.now();
+        handleInputError(error);
+        sendInputAck(event, 'error', {
+          reason: error && error.message ? error.message : 'input-execution-failed',
+          sidecarStartedAt: startedAt,
+          sidecarCompletedAt: completedAt,
+          sidecarDurationMs: completedAt - startedAt
+        });
+      } finally {
+        controllerBusy = false;
+        activeInputPromise = null;
+        if (!releasedInputState && pendingInputDepth() > 0) {
+          scheduleInputPump();
+        }
+      }
+    })();
 
-  function clearPendingMove() {
-    pendingMove = null;
-    if (moveFlushTimer) {
-      clearImmediate(moveFlushTimer);
-      moveFlushTimer = null;
-    }
-  }
-
-  function flushPendingMove() {
-    if (moveFlushTimer) {
-      clearImmediate(moveFlushTimer);
-      moveFlushTimer = null;
-    }
-    if (!pendingMove || releasedInputState) {
-      pendingMove = null;
-      return;
-    }
-    const event = pendingMove;
-    pendingMove = null;
-    enqueueControllerEvent(event);
-  }
-
-  function schedulePendingMoveFlush() {
-    if (moveFlushTimer || releasedInputState) {
-      return;
-    }
-    moveFlushTimer = setImmediate(flushPendingMove);
-    moveFlushTimer.unref?.();
+    await activeInputPromise;
   }
 
   function enqueueSocketInputEvent(event) {
     if (releasedInputState) {
+      dropInputEvent(event, 'released');
       return;
     }
+
+    event.sidecarReceivedAt = Date.now();
 
     if (isMouseMoveEvent(event)) {
-      pendingMove = event;
-      schedulePendingMoveFlush();
+      if (latestMove) {
+        dropInputEvent(latestMove, 'coalesced');
+      }
+      latestMove = event;
+      scheduleInputPump();
       return;
     }
 
-    clearPendingMove();
-    enqueueControllerEvent(event);
+    if (latestMove && Number.isFinite(Number(event.x)) && Number.isFinite(Number(event.y))) {
+      dropInputEvent(latestMove, 'superseded-by-absolute-input');
+      latestMove = null;
+    }
+
+    if (inputQueue.length >= maxQueuedInputEvents) {
+      dropInputEvent(inputQueue.shift(), 'sidecar-queue-overflow');
+    }
+
+    inputQueue.push(event);
+    scheduleInputPump();
   }
 
   function releaseSocketInputState(reason) {
@@ -3738,9 +3856,18 @@ inputWss.on('connection', (socket) => {
       return;
     }
     releasedInputState = true;
-    clearPendingMove();
-    pending = pending
-      .then(async () => {
+    dropPendingInputs('release-all');
+
+    const releaseAfterActiveInput = async () => {
+      if (activeInputPromise) {
+        try {
+          await activeInputPromise;
+        } catch (_error) {
+          // The active input path already reports its own error.
+        }
+      }
+
+      try {
         if (typeof inputController.releaseAll === 'function') {
           await inputController.releaseAll(reason);
           return;
@@ -3749,13 +3876,15 @@ inputWss.on('connection', (socket) => {
           type: 'release_all',
           reason
         });
-      })
-      .catch((error) => {
+      } catch (error) {
         logger.warn('Input release-all failed', {
           reason,
           message: error && error.message ? error.message : 'release-all-failed'
         });
-      });
+      }
+    };
+
+    releaseAfterActiveInput();
   }
 
   socket.on('message', (rawValue, isBinary) => {
