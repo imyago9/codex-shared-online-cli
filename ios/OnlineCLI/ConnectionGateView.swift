@@ -4,6 +4,7 @@ struct ConnectionGateView: View {
     @Environment(AppModel.self) private var app
     @State private var draftURL = ""
     @State private var localMessage = ""
+    @State private var didAttemptDefaultConnection = false
 
     var body: some View {
         NavigationStack {
@@ -22,7 +23,13 @@ struct ConnectionGateView: View {
             .navigationBarTitleDisplayMode(.inline)
             .task {
                 draftURL = app.settings.baseURLString
-                await app.refreshAll()
+                if draftURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                   let defaultURL = ServerSettings.defaultConnectionCandidate {
+                    draftURL = defaultURL
+                    await connect(using: defaultURL, defaultAttempt: true)
+                } else {
+                    await app.refreshAll()
+                }
             }
         }
     }
@@ -68,17 +75,41 @@ struct ConnectionGateView: View {
             }
             .buttonStyle(.borderedProminent)
             .disabled(app.isLoading || draftURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+            if let defaultURL = ServerSettings.defaultConnectionCandidate,
+               ServerSettings.normalizedURLString(draftURL) != defaultURL {
+                Button {
+                    draftURL = defaultURL
+                    connect()
+                } label: {
+                    Label("Use Tailscale Default", systemImage: "sparkle.magnifyingglass")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .disabled(app.isLoading)
+            }
         }
         .padding(16)
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 
     private func connect() {
-        app.settings.baseURLString = ServerSettings.normalizedURLString(draftURL)
-        localMessage = "Checking connection"
         Task {
-            await app.refreshAll()
-            localMessage = app.isServerConnected ? "Connected" : app.connectionMessage
+            await connect(using: draftURL, defaultAttempt: false)
         }
+    }
+
+    private func connect(using urlString: String, defaultAttempt: Bool) async {
+        if defaultAttempt {
+            guard !didAttemptDefaultConnection else { return }
+            didAttemptDefaultConnection = true
+            localMessage = "Finding Online CLI on Tailscale"
+        } else {
+            localMessage = "Checking connection"
+        }
+        app.settings.baseURLString = ServerSettings.normalizedURLString(urlString)
+        await app.refreshAll()
+        draftURL = app.settings.baseURLString
+        localMessage = app.isServerConnected ? "Connected" : app.connectionMessage
     }
 }

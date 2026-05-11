@@ -17,6 +17,18 @@ struct ServerSettings: Codable, Equatable {
 
     init() {}
 
+    static var bundledDefaultURLString: String {
+        guard let rawValue = Bundle.main.object(forInfoDictionaryKey: "OnlineCLIDefaultServerURL") as? String else {
+            return ""
+        }
+        return normalizedURLString(rawValue)
+    }
+
+    static var defaultConnectionCandidate: String? {
+        let candidate = bundledDefaultURLString
+        return candidate.isEmpty ? nil : candidate
+    }
+
     static func normalizedURLString(_ value: String) -> String {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {

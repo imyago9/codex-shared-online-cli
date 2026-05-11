@@ -24,6 +24,8 @@
 	<string>public.app-category.productivity</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>OnlineCLIDefaultServerURL</key>
+	<string>https://desktop-cguakc2.tailbca5e0.ts.net</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
