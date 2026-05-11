@@ -12,8 +12,10 @@ private enum RemoteViewportSettings {
 private enum RemoteChromeSpacing {
     static let edgeInset: CGFloat = 2
     static let portraitTabInset: CGFloat = 84
-    static let monitorPanelDockGap: CGFloat = 54
+    static let monitorPanelDockGap: CGFloat = 12
     static let quickDockHeight: CGFloat = 50
+    static let commandDockHeight: CGFloat = 64
+    static let commandDockGap: CGFloat = 10
     static let controlsLauncherGap: CGFloat = 8
     static let controlsDockGap: CGFloat = 12
     static let controlsDockHeight = quickDockHeight + controlsLauncherGap + quickDockHeight
@@ -393,12 +395,9 @@ struct RemoteDesktopView: View {
     @State private var client = RemoteDesktopClient()
     @State private var desiredMode: RemoteMode = .view
     @State private var streamProfile: RemoteStreamProfile = .balanced
-    @State private var gestureMode: RemoteGestureMode = .direct
+    @State private var gestureMode: RemoteGestureMode = .viewport
     @State private var zoom = 1.0
     @State private var panOffset = CGSize.zero
-    @State private var joystickSensitivity = 1.0
-    @State private var controlsCollapsed = true
-    @State private var controlsOffset = CGSize.zero
     @State private var interfaceIsLandscape = false
     @State private var keyboardHeight: CGFloat = 0
     @State private var keyboardAnimationDuration = 0.25
@@ -407,6 +406,7 @@ struct RemoteDesktopView: View {
     @State private var monitorDragMode = false
     @State private var monitorLayoutOffsets: [String: CGSize] = [:]
     @State private var selectedMonitorIds: Set<String> = []
+    @State private var focusedMonitorId: String?
     @State private var remoteKeyboardVisible = false
     @State private var remoteKeyboardFocusToken = 0
     @State private var remoteKeyboardDismissToken = 0
@@ -418,10 +418,11 @@ struct RemoteDesktopView: View {
                 let isLandscape = proxy.size.width > proxy.size.height || verticalSizeClass == .compact || interfaceIsLandscape
                 let useLandscapeEdgeOutsets = isLandscape && keyboardHeight <= 0
                 let leadingChromeOutset = useLandscapeEdgeOutsets ? edgeOutset(proxy.safeAreaInsets.leading) : 0
-                let trailingChromeOutset = useLandscapeEdgeOutsets ? edgeOutset(proxy.safeAreaInsets.trailing) : 0
-                let bottomChromeOutset = isLandscape && keyboardHeight <= 0 ? edgeOutset(proxy.safeAreaInsets.bottom) : 0
                 let quickDockInset = quickDockBottomInset(isLandscape: isLandscape)
-                let controlsBottomInset = controlsBottomInset(quickDockBottomInset: quickDockInset)
+                let dockSideInset = max(RemoteChromeSpacing.edgeInset + 8, max(proxy.safeAreaInsets.leading, proxy.safeAreaInsets.trailing) + 8)
+                let dockBottomInset = max(quickDockInset, proxy.safeAreaInsets.bottom + RemoteChromeSpacing.edgeInset + 8)
+                let monitorPanelBottomInset = dockBottomInset + RemoteChromeSpacing.commandDockHeight + RemoteChromeSpacing.monitorPanelDockGap
+                let dockMaxWidth = min(max(220, proxy.size.width - (dockSideInset * 2)), isLandscape ? 760 : 430)
                 ZStack {
                     Color.black.ignoresSafeArea()
 
@@ -444,7 +445,9 @@ struct RemoteDesktopView: View {
                         displayInfo: client.displayInfo,
                         monitors: availableMonitors,
                         selectedMonitorIds: effectiveSelectedMonitorIds,
-                        monitorLayoutOffsets: monitorLayoutOffsets
+                        monitorLayoutOffsets: monitorLayoutOffsets,
+                        focusedMonitorId: $focusedMonitorId,
+                        onKeyboardShortcut: toggleRemoteKeyboard
                     )
                     .allowsHitTesting(!(monitorPanelPresented && monitorDragMode))
                     .ignoresSafeArea(edges: .bottom)
@@ -486,71 +489,42 @@ struct RemoteDesktopView: View {
                                     onResetViews: resetMonitorViews
                                 )
                                 .frame(width: min(isLandscape ? 310 : 340, proxy.size.width - (RemoteChromeSpacing.edgeInset * 2)))
-                                .padding(.trailing, RemoteChromeSpacing.edgeInset)
-                                .padding(.bottom, controlsBottomInset + RemoteChromeSpacing.monitorPanelDockGap)
-                                .offset(x: trailingChromeOutset, y: bottomChromeOutset)
+                                .padding(.trailing, dockSideInset)
+                                .padding(.bottom, monitorPanelBottomInset)
                             }
                         }
                         .transition(.opacity)
                         .zIndex(40)
                     }
 
-                    FloatingRemoteControls(
-                        client: client,
-                        zoom: $zoom,
-                        panOffset: $panOffset,
-                        joystickSensitivity: $joystickSensitivity,
-                        isCollapsed: $controlsCollapsed,
-                        offset: $controlsOffset,
-                        containerSize: proxy.size,
-                        compact: isLandscape,
-                        diagnosticsText: diagnosticsText,
-                        actions: app.remoteCapabilities?.actions ?? [],
-                        keyboardVisible: remoteKeyboardVisible,
-                        onKeyboardFocus: focusRemoteKeyboard,
-                        anchor: .trailing
-                    )
-                    .padding(RemoteChromeSpacing.edgeInset)
-                    .offset(x: trailingChromeOutset, y: bottomChromeOutset - controlsBottomInset)
-                    .animation(.easeOut(duration: keyboardAnimationDuration), value: controlsBottomInset)
-                    .zIndex(45)
-
                     VStack {
                         Spacer()
-                        HStack(alignment: .bottom) {
-                            if keyboardHeight > 0 {
-                                RemoteEscButton {
-                                    client.sendKey("Escape", code: "Escape")
-                                }
-                                .transition(.scale(scale: 0.92).combined(with: .opacity))
-                            }
-
+                        HStack {
                             Spacer(minLength: 0)
-
-                            VStack(alignment: .trailing, spacing: RemoteChromeSpacing.controlsLauncherGap) {
-                                RemoteControlsLauncherButton(isActive: !controlsCollapsed) {
-                                    withAnimation(.spring(response: 0.24, dampingFraction: 0.82)) {
-                                        controlsCollapsed.toggle()
-                                    }
-                                }
-
-                                RemoteQuickDock(
-                                    mode: desiredMode,
-                                    monitorActive: monitorPanelPresented,
-                                    monitorCount: availableMonitors.count,
-                                    keyboardFocused: remoteKeyboardVisible,
-                                    onControlToggle: toggleControlMode,
-                                    onMonitorToggle: toggleMonitorPanel,
-                                    onKeyboardToggle: toggleRemoteKeyboard
-                                )
-                            }
+                            RemoteCommandDock(
+                                client: client,
+                                mode: desiredMode,
+                                gestureMode: gestureMode,
+                                streamProfile: streamProfile,
+                                monitorActive: monitorPanelPresented,
+                                monitorCount: availableMonitors.count,
+                                keyboardFocused: remoteKeyboardVisible,
+                                controlAvailable: remoteControlAvailable,
+                                telemetry: telemetry,
+                                actions: app.remoteCapabilities?.actions ?? [],
+                                onControlToggle: toggleControlMode,
+                                onGestureModeChange: setGestureMode,
+                                onMonitorToggle: toggleMonitorPanel,
+                                onKeyboardToggle: toggleRemoteKeyboard,
+                                onStreamProfileChange: setStreamProfile,
+                                onResetViewport: resetViewport
+                            )
+                            .frame(maxWidth: dockMaxWidth)
+                            Spacer(minLength: 0)
                         }
-                        .padding(.leading, RemoteChromeSpacing.edgeInset)
-                        .padding(.trailing, RemoteChromeSpacing.edgeInset)
-                        .padding(.bottom, quickDockInset)
-                        .offset(x: trailingChromeOutset, y: bottomChromeOutset)
-                        .animation(.easeOut(duration: keyboardAnimationDuration), value: quickDockInset)
-                        .animation(.spring(response: 0.22, dampingFraction: 0.86), value: keyboardHeight > 0)
+                        .padding(.horizontal, dockSideInset)
+                        .padding(.bottom, dockBottomInset)
+                        .animation(.easeOut(duration: keyboardAnimationDuration), value: dockBottomInset)
                     }
                     .zIndex(55)
 
@@ -562,6 +536,7 @@ struct RemoteDesktopView: View {
             .ignoresSafeArea(.keyboard, edges: .bottom)
             .onAppear {
                 desiredMode = app.settings.defaultRemoteMode
+                gestureMode = app.settings.defaultRemoteMode == .control ? .direct : .viewport
                 streamProfile = app.settings.remoteStreamProfile
                 updateInterfaceOrientation()
                 refreshTelemetry()
@@ -621,8 +596,15 @@ struct RemoteDesktopView: View {
 
     private func setRemoteMode(_ mode: RemoteMode) {
         desiredMode = mode
-        if mode != .control {
+        switch mode {
+        case .view:
+            gestureMode = .viewport
             dismissRemoteKeyboard()
+        case .control:
+            focusedMonitorId = nil
+            if gestureMode == .viewport {
+                gestureMode = .direct
+            }
         }
         client.setMode(mode)
         refreshTelemetry()
@@ -630,6 +612,30 @@ struct RemoteDesktopView: View {
 
     private func toggleControlMode() {
         setRemoteMode(desiredMode == .control ? .view : .control)
+    }
+
+    private func setGestureMode(_ mode: RemoteGestureMode) {
+        if gestureMode != mode {
+            gestureMode = mode
+        }
+        switch mode {
+        case .direct, .trackpad:
+            if desiredMode != .control {
+                setRemoteMode(.control)
+            }
+        case .viewport:
+            if desiredMode != .view {
+                setRemoteMode(.view)
+            }
+        }
+    }
+
+    private func setStreamProfile(_ profile: RemoteStreamProfile) {
+        guard streamProfile != profile else { return }
+        streamProfile = profile
+        app.settings.remoteStreamProfile = profile
+        client.setStreamProfile(profile)
+        refreshTelemetry()
     }
 
     private func toggleMonitorPanel() {
@@ -650,6 +656,9 @@ struct RemoteDesktopView: View {
         let availableIds = Set(availableMonitors.map(\.id))
         let nextIds = monitorIds.intersection(availableIds)
         selectedMonitorIds = nextIds.isEmpty ? availableIds : nextIds
+        if let focusedMonitorId, !selectedMonitorIds.contains(focusedMonitorId) {
+            self.focusedMonitorId = nil
+        }
         client.setVisibleMonitors(selectedMonitorIds)
     }
 
@@ -720,12 +729,21 @@ struct RemoteDesktopView: View {
         return max(restingInset, keyboardInset)
     }
 
-    private func controlsBottomInset(quickDockBottomInset: CGFloat) -> CGFloat {
-        quickDockBottomInset + RemoteChromeSpacing.controlsDockHeight + RemoteChromeSpacing.controlsDockGap
-    }
-
     private func edgeOutset(_ safeInset: CGFloat) -> CGFloat {
         max(0, safeInset - RemoteChromeSpacing.edgeInset)
+    }
+
+    private func setZoom(_ value: Double) {
+        zoom = min(RemoteViewportSettings.maximumZoom, max(RemoteViewportSettings.minimumZoom, value))
+        if zoom <= 1.01 {
+            panOffset = .zero
+        }
+    }
+
+    private func resetViewport() {
+        focusedMonitorId = nil
+        setZoom(RemoteViewportSettings.minimumZoom)
+        panOffset = .zero
     }
 
     private func updateKeyboardHeight(_ notification: Notification) {
@@ -741,28 +759,6 @@ struct RemoteDesktopView: View {
         withAnimation(.easeOut(duration: duration)) {
             keyboardHeight = nextHeight > 12 ? nextHeight : 0
         }
-    }
-
-    private var diagnosticsText: String {
-        let queueDepth = telemetry.inputQueueDepth.map(String.init) ?? "--"
-        let queueMax = telemetry.inputQueueMax.map(String.init) ?? "--"
-        let rtt = telemetry.inputRttMs.map { String(format: "%.0fms", $0) } ?? "--"
-        let execution = telemetry.inputExecutionMs.map { String(format: "%.0fms", $0) } ?? "--"
-        let rate = client.inputRateLimitPerSec.map { "\($0)/s" } ?? "--/s"
-        return String(
-            format: "rx %.1f • draw %.1f • dec %.1fms • render %.1fms • drop %d • input %@ exec %@ q %@/%@ %@ drop %d",
-            telemetry.receivedFps,
-            telemetry.presentedFps,
-            telemetry.decodeMs,
-            telemetry.renderMs,
-            telemetry.droppedFrames,
-            rtt,
-            execution,
-            queueDepth,
-            queueMax,
-            rate,
-            telemetry.droppedInputEvents
-        )
     }
 
     private var availableMonitors: [RemoteMonitorDescriptor] {
@@ -784,6 +780,12 @@ struct RemoteDesktopView: View {
         let current = selectedMonitorIds.intersection(availableIds)
         return current.isEmpty ? availableIds : current
     }
+
+    private var remoteControlAvailable: Bool {
+        client.controlAllowed
+            || app.remoteCapabilities?.controlAvailable == true
+            || app.remoteStatus?.sidecar.inputAvailable == true
+    }
 }
 
 struct RemoteStageHost: View {
@@ -797,6 +799,8 @@ struct RemoteStageHost: View {
     let monitors: [RemoteMonitorDescriptor]
     let selectedMonitorIds: Set<String>
     let monitorLayoutOffsets: [String: CGSize]
+    @Binding var focusedMonitorId: String?
+    let onKeyboardShortcut: () -> Void
 
     var body: some View {
         RemoteStageSurface(
@@ -810,6 +814,8 @@ struct RemoteStageHost: View {
             monitors: monitors,
             selectedMonitorIds: selectedMonitorIds,
             monitorLayoutOffsets: monitorLayoutOffsets,
+            focusedMonitorId: $focusedMonitorId,
+            onKeyboardShortcut: onKeyboardShortcut,
             onClick: { point in client.sendClick(at: point) },
             onRightClick: { point in client.sendClick(button: "right", at: point) },
             onPointerMove: { point in client.sendPointerMove(point) },
@@ -831,6 +837,8 @@ private struct RemoteStageSurface: UIViewRepresentable {
     let monitors: [RemoteMonitorDescriptor]
     let selectedMonitorIds: Set<String>
     let monitorLayoutOffsets: [String: CGSize]
+    @Binding var focusedMonitorId: String?
+    let onKeyboardShortcut: () -> Void
     let onClick: (CGPoint) -> Void
     let onRightClick: (CGPoint) -> Void
     let onPointerMove: (CGPoint) -> Void
@@ -847,6 +855,7 @@ private struct RemoteStageSurface: UIViewRepresentable {
     func updateUIView(_ uiView: RemoteStageSurfaceView, context: Context) {
         let zoomBinding = $zoom
         let panOffsetBinding = $panOffset
+        let focusedMonitorIdBinding = $focusedMonitorId
 
         attachSinks(to: uiView)
         uiView.configure(
@@ -859,6 +868,9 @@ private struct RemoteStageSurface: UIViewRepresentable {
             monitors: monitors,
             selectedMonitorIds: selectedMonitorIds,
             monitorLayoutOffsets: monitorLayoutOffsets,
+            focusedMonitorId: focusedMonitorId,
+            onFocusedMonitorChange: { focusedMonitorIdBinding.wrappedValue = $0 },
+            onKeyboardShortcut: onKeyboardShortcut,
             onZoomChange: { zoomBinding.wrappedValue = $0 },
             onPanOffsetChange: { panOffsetBinding.wrappedValue = $0 },
             onClick: onClick,
@@ -954,6 +966,8 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         let visualFrame: CGRect
         let monitorFrames: [RemoteMonitorStageFrame]
         let usesMonitorLayers: Bool
+        let focusedMonitorId: String?
+        let focusedRotation: CGFloat
     }
 
     private let imageView = UIView()
@@ -981,6 +995,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     private var monitors: [RemoteMonitorDescriptor] = []
     private var selectedMonitorIds: Set<String> = []
     private var monitorLayoutOffsets: [String: CGSize] = [:]
+    private var focusedMonitorId: String?
     private var monitorLayers: [String: MonitorLayers] = [:]
 
     private var onZoomChange: ((Double) -> Void)?
@@ -991,6 +1006,8 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     private var onDragStart: ((CGPoint) -> Void)?
     private var onDragMove: ((CGPoint) -> Void)?
     private var onDragEnd: ((CGPoint) -> Void)?
+    private var onFocusedMonitorChange: ((String?) -> Void)?
+    private var onKeyboardShortcut: (() -> Void)?
     private var onFramePresented: ((Double) -> Void)?
 
     private weak var twoFingerPanRecognizer: UIPanGestureRecognizer?
@@ -1035,6 +1052,9 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         monitors: [RemoteMonitorDescriptor],
         selectedMonitorIds: Set<String>,
         monitorLayoutOffsets: [String: CGSize],
+        focusedMonitorId: String?,
+        onFocusedMonitorChange: @escaping (String?) -> Void,
+        onKeyboardShortcut: @escaping () -> Void,
         onZoomChange: @escaping (Double) -> Void,
         onPanOffsetChange: @escaping (CGSize) -> Void,
         onClick: @escaping (CGPoint) -> Void,
@@ -1089,6 +1109,14 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
             self.monitorLayoutOffsets = monitorLayoutOffsets
             needsLayout = true
         }
+        let nextFocusedMonitorId = monitors.contains { $0.id == focusedMonitorId } ? focusedMonitorId : nil
+        if self.focusedMonitorId != nextFocusedMonitorId {
+            self.focusedMonitorId = nextFocusedMonitorId
+            needsLayout = true
+            if focusedMonitorId != nextFocusedMonitorId {
+                onFocusedMonitorChange(nextFocusedMonitorId)
+            }
+        }
 
         self.onZoomChange = onZoomChange
         self.onPanOffsetChange = onPanOffsetChange
@@ -1098,6 +1126,8 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         self.onDragStart = onDragStart
         self.onDragMove = onDragMove
         self.onDragEnd = onDragEnd
+        self.onFocusedMonitorChange = onFocusedMonitorChange
+        self.onKeyboardShortcut = onKeyboardShortcut
         self.onFramePresented = onFramePresented
 
         if needsLayout {
@@ -1252,19 +1282,20 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
 
     @objc private func handleDoubleTap(_ recognizer: UITapGestureRecognizer) {
         guard isUserInteractionEnabled, recognizer.state == .ended, hasRenderableFrame, gestureMode == .viewport else { return }
-        if zoomValue > 1.01 {
-            setViewport(zoom: RemoteViewportSettings.minimumZoom, panOffset: .zero, notify: true)
+        cancelTrackedTouch()
+        if focusedMonitorId != nil {
+            focusMonitor(nil)
             return
         }
 
-        let targetZoom = clampedZoom(RemoteViewportSettings.doubleTapZoom)
-        let pan = anchoredPanOffset(
-            from: panOffsetValue,
-            oldZoom: zoomValue,
-            newZoom: targetZoom,
-            anchor: recognizer.location(in: self)
-        )
-        setViewport(zoom: targetZoom, panOffset: pan, notify: true)
+        guard let frame = monitorFrame(at: recognizer.location(in: self)) else { return }
+        focusMonitor(frame.id)
+    }
+
+    @objc private func handleThreeFingerTap(_ recognizer: UITapGestureRecognizer) {
+        guard isUserInteractionEnabled, recognizer.state == .ended, hasRenderableFrame else { return }
+        cancelTrackedTouch()
+        onKeyboardShortcut?()
     }
 
     @objc private func handleLongPress(_ recognizer: UILongPressGestureRecognizer) {
@@ -1287,7 +1318,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     }
 
     @objc private func handleTwoFingerPan(_ recognizer: UIPanGestureRecognizer) {
-        guard isUserInteractionEnabled, hasRenderableFrame else { return }
+        guard isUserInteractionEnabled, hasRenderableFrame, focusedMonitorId == nil else { return }
 
         switch recognizer.state {
         case .began:
@@ -1310,7 +1341,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     }
 
     @objc private func handlePinch(_ recognizer: UIPinchGestureRecognizer) {
-        guard isUserInteractionEnabled, hasRenderableFrame else { return }
+        guard isUserInteractionEnabled, hasRenderableFrame, focusedMonitorId == nil else { return }
 
         switch recognizer.state {
         case .began:
@@ -1435,8 +1466,11 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
         guard isUserInteractionEnabled else { return false }
         if let tap = gestureRecognizer as? UITapGestureRecognizer {
+            if tap.numberOfTouchesRequired == 3 {
+                return hasRenderableFrame
+            }
             if tap.numberOfTapsRequired == 1 {
-                return gestureMode == .trackpad
+                return tap.numberOfTouchesRequired == 1 && gestureMode == .trackpad
             }
             if tap.numberOfTapsRequired == 2 {
                 return gestureMode == .viewport
@@ -1528,6 +1562,11 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         doubleTap.numberOfTapsRequired = 2
         doubleTap.delegate = self
 
+        let threeFingerTap = UITapGestureRecognizer(target: self, action: #selector(handleThreeFingerTap(_:)))
+        threeFingerTap.numberOfTouchesRequired = 3
+        threeFingerTap.delegate = self
+        threeFingerTap.cancelsTouchesInView = true
+
         let longPress = UILongPressGestureRecognizer(target: self, action: #selector(handleLongPress(_:)))
         longPress.minimumPressDuration = longPressMinimumDuration
         longPress.allowableMovement = longPressMovementLimit
@@ -1536,6 +1575,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
 
         addGestureRecognizer(singleTap)
         addGestureRecognizer(doubleTap)
+        addGestureRecognizer(threeFingerTap)
         addGestureRecognizer(longPress)
         longPressRecognizer = longPress
     }
@@ -1551,6 +1591,18 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
             onZoomChange?(nextZoom)
             onPanOffsetChange?(nextPanOffset)
         }
+    }
+
+    private func focusMonitor(_ monitorId: String?) {
+        guard focusedMonitorId != monitorId else { return }
+        focusedMonitorId = monitorId
+        onFocusedMonitorChange?(monitorId)
+        setViewport(zoom: RemoteViewportSettings.minimumZoom, panOffset: .zero, notify: true)
+    }
+
+    private func monitorFrame(at location: CGPoint) -> RemoteMonitorStageFrame? {
+        guard let geometry = stageGeometry(panOffset: panOffsetValue, zoom: zoomValue) else { return nil }
+        return geometry.monitorFrames.first { $0.rect.insetBy(dx: -8, dy: -8).contains(location) }
     }
 
     private func flushVideoLayer(removeImage: Bool) {
@@ -1572,6 +1624,10 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     }
 
     private func updateCursor(geometry: StageGeometry) {
+        if geometry.focusedRotation != 0 {
+            cursorView.isHidden = true
+            return
+        }
         guard hasRenderableFrame, let remoteCursor else {
             cursorView.isHidden = true
             return
@@ -1601,7 +1657,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
             layers.imageLayer.isHidden = false
             layers.imageLayer.contents = image
             layers.imageLayer.contentsRect = contentsRect(for: frame.sourceRect, sourceBounds: geometry.sourceBounds)
-            layers.imageLayer.frame = pixelAlignedEdges(frame.rect)
+            applyMonitorContentFrame(frame, to: layers.imageLayer)
             layers.videoContainerLayer.isHidden = true
         }
 
@@ -1618,7 +1674,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
             layers.imageLayer.isHidden = true
             layers.imageLayer.contents = nil
             layers.videoContainerLayer.isHidden = false
-            layers.videoContainerLayer.frame = pixelAlignedEdges(frame.rect)
+            applyMonitorContentFrame(frame, to: layers.videoContainerLayer)
             layers.videoLayer.frame = videoLayerFrame(for: frame, sourceBounds: geometry.sourceBounds)
             if let sampleBuffer, let copiedSampleBuffer = deepCopySampleBuffer(sampleBuffer) {
                 if layers.videoLayer.sampleBufferRenderer.status == .failed {
@@ -1628,6 +1684,16 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
                 enqueue(copiedSampleBuffer, on: layers.videoLayer)
             }
         }
+    }
+
+    private func applyMonitorContentFrame(_ frame: RemoteMonitorStageFrame, to layer: CALayer) {
+        let rect = pixelAlignedEdges(frame.rect)
+        layer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+        layer.bounds = CGRect(origin: .zero, size: rect.size)
+        layer.position = rect.center
+        layer.transform = frame.rotation == 0
+            ? CATransform3DIdentity
+            : CATransform3DMakeRotation(frame.rotation, 0, 0, 1)
     }
 
     private func enqueue(_ sampleBuffer: CMSampleBuffer, on layer: AVSampleBufferDisplayLayer) {
@@ -1822,6 +1888,52 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         let sourceBounds = streamSourceBounds()
         guard sourceBounds.width > 0, sourceBounds.height > 0 else { return nil }
 
+        if let focusedMonitor = focusedMonitor() {
+            let layout = RemoteMonitorLayoutGeometry(monitors: monitors, offsets: monitorLayoutOffsets)
+            let visualBounds = layout.rect(for: focusedMonitor)
+            guard visualBounds.width > 0, visualBounds.height > 0 else { return nil }
+
+            let rotation = focusedMonitorRotation(for: focusedMonitor)
+            let frameSize = rotation == 0
+                ? visualBounds.size
+                : CGSize(width: visualBounds.height, height: visualBounds.width)
+            let frame = pixelAligned(contentFrame(
+                for: frameSize,
+                panOffset: .zero,
+                zoom: RemoteViewportSettings.minimumZoom
+            ))
+            let layerSize = rotation == 0
+                ? frame.size
+                : CGSize(width: frame.height, height: frame.width)
+            let monitorFrame = RemoteMonitorStageFrame(
+                id: focusedMonitor.id,
+                monitor: focusedMonitor,
+                rect: CGRect(
+                    x: frame.midX - (layerSize.width / 2),
+                    y: frame.midY - (layerSize.height / 2),
+                    width: layerSize.width,
+                    height: layerSize.height
+                ),
+                desktopRect: visualBounds,
+                sourceRect: CGRect(
+                    x: CGFloat(focusedMonitor.left),
+                    y: CGFloat(focusedMonitor.top),
+                    width: CGFloat(focusedMonitor.width),
+                    height: CGFloat(focusedMonitor.height)
+                ),
+                rotation: rotation
+            )
+            return StageGeometry(
+                sourceBounds: sourceBounds,
+                visualBounds: visualBounds,
+                visualFrame: frame,
+                monitorFrames: [monitorFrame],
+                usesMonitorLayers: true,
+                focusedMonitorId: focusedMonitor.id,
+                focusedRotation: rotation
+            )
+        }
+
         let selectedMonitors = stageMonitors()
         let selectedMonitorIds = Set(selectedMonitors.map(\.id))
         let hasLayoutOffsets = !monitorLayoutOffsets.isEmpty
@@ -1838,8 +1950,22 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
             visualBounds: visualBounds,
             visualFrame: frame,
             monitorFrames: monitorFrames(in: frame, visualBounds: visualBounds, monitors: usesMonitorLayers ? selectedMonitors : monitors),
-            usesMonitorLayers: usesMonitorLayers
+            usesMonitorLayers: usesMonitorLayers,
+            focusedMonitorId: nil,
+            focusedRotation: 0
         )
+    }
+
+    private func focusedMonitor() -> RemoteMonitorDescriptor? {
+        guard let focusedMonitorId else { return nil }
+        return stageMonitors().first { $0.id == focusedMonitorId }
+    }
+
+    private func focusedMonitorRotation(for monitor: RemoteMonitorDescriptor) -> CGFloat {
+        let monitorIsLandscape = monitor.width >= monitor.height
+        let viewIsLandscape = bounds.width >= bounds.height
+        guard monitorIsLandscape != viewIsLandscape else { return 0 }
+        return monitorIsLandscape ? .pi / 2 : -.pi / 2
     }
 
     private func monitorFrames(
@@ -1940,7 +2066,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     }
 
     private func handleOneFingerViewportPan(to location: CGPoint) {
-        guard hasRenderableFrame else { return }
+        guard hasRenderableFrame, focusedMonitorId == nil else { return }
         let translation = CGSize(
             width: location.x - touchStartLocation.x,
             height: location.y - touchStartLocation.y
@@ -1980,6 +2106,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     }
 
     private func clampedPanOffset(_ offset: CGSize) -> CGSize {
+        guard focusedMonitorId == nil else { return .zero }
         guard hasRenderableFrame, let geometry = stageGeometry(panOffset: .zero, zoom: zoomValue), zoomValue > 1.01 else {
             return .zero
         }
@@ -2270,6 +2397,387 @@ private struct RemoteMonitorStageFrame: Identifiable {
     let rect: CGRect
     var desktopRect: CGRect = .zero
     var sourceRect: CGRect = .zero
+    var rotation: CGFloat = 0
+}
+
+struct RemoteCommandDock: View {
+    let client: RemoteDesktopClient
+    let mode: RemoteMode
+    let gestureMode: RemoteGestureMode
+    let streamProfile: RemoteStreamProfile
+    let monitorActive: Bool
+    let monitorCount: Int
+    let keyboardFocused: Bool
+    let controlAvailable: Bool
+    let telemetry: RemoteTelemetrySnapshot
+    let actions: [RemoteActionDescriptor]
+    let onControlToggle: () -> Void
+    let onGestureModeChange: (RemoteGestureMode) -> Void
+    let onMonitorToggle: () -> Void
+    let onKeyboardToggle: () -> Void
+    let onStreamProfileChange: (RemoteStreamProfile) -> Void
+    let onResetViewport: () -> Void
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                RemoteCommandStatusChip(
+                    state: telemetry.state,
+                    telemetry: telemetry,
+                    controlAvailable: controlAvailable
+                )
+
+                RemoteCommandButton(
+                    systemName: mode == .control ? "cursorarrow.rays" : "eye",
+                    title: mode.title,
+                    isActive: mode == .control,
+                    accessibilityLabel: mode == .control ? "Switch to view mode" : "Switch to control mode",
+                    action: onControlToggle
+                )
+
+                RemoteGestureModeMenu(selection: gestureMode, onChange: onGestureModeChange)
+
+                RemoteCommandButton(
+                    systemName: keyboardFocused ? "keyboard.chevron.compact.down" : "keyboard",
+                    title: keyboardFocused ? "Hide" : "Keys",
+                    isActive: keyboardFocused,
+                    accessibilityLabel: keyboardFocused ? "Hide remote keyboard" : "Show remote keyboard",
+                    action: onKeyboardToggle
+                )
+
+                RemoteCommandButton(
+                    systemName: "rectangle.on.rectangle",
+                    title: monitorCount > 1 ? "\(monitorCount) Views" : "Views",
+                    isActive: monitorActive,
+                    accessibilityLabel: monitorCount > 1 ? "Choose visible monitors" : "Show monitor layout",
+                    action: onMonitorToggle
+                )
+
+                RemoteStreamProfileMenu(selection: streamProfile, onChange: onStreamProfileChange)
+
+                RemoteShortcutCommandMenu(
+                    client: client,
+                    actions: actions,
+                    isDisabled: inputDisabled
+                )
+
+                RemoteCommandButton(
+                    systemName: "arrow.up",
+                    title: "Up",
+                    isDisabled: inputDisabled,
+                    accessibilityLabel: "Scroll up"
+                ) {
+                    client.sendWheel(deltaY: -360)
+                }
+
+                RemoteCommandButton(
+                    systemName: "arrow.down",
+                    title: "Down",
+                    isDisabled: inputDisabled,
+                    accessibilityLabel: "Scroll down"
+                ) {
+                    client.sendWheel(deltaY: 360)
+                }
+
+                RemoteCommandButton(
+                    systemName: "xmark.circle",
+                    title: "Esc",
+                    isDisabled: inputDisabled,
+                    accessibilityLabel: "Escape"
+                ) {
+                    client.sendKey("Escape", code: "Escape")
+                }
+
+                RemoteCommandButton(
+                    systemName: "arrow.right.to.line",
+                    title: "Tab",
+                    isDisabled: inputDisabled,
+                    accessibilityLabel: "Tab"
+                ) {
+                    client.sendKey("Tab", code: "Tab")
+                }
+
+                RemoteCommandButton(
+                    systemName: "scope",
+                    title: "Fit",
+                    accessibilityLabel: "Reset view",
+                    action: onResetViewport
+                )
+            }
+            .padding(.horizontal, 1)
+        }
+        .padding(10)
+        .frame(height: RemoteChromeSpacing.commandDockHeight)
+        .remoteFloatingSurface(cornerRadius: 24)
+    }
+
+    private var inputDisabled: Bool {
+        mode != .control || !controlAvailable
+    }
+
+}
+
+struct RemoteCommandStatusChip: View {
+    let state: RemoteConnectionState
+    let telemetry: RemoteTelemetrySnapshot
+    let controlAvailable: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: iconName)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(iconColor)
+                .frame(width: 18)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.caption.weight(.bold))
+                    .lineLimit(1)
+                Text(detail)
+                    .font(.caption2.monospacedDigit().weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 44)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color(uiColor: .tertiarySystemBackground).opacity(0.96))
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(.white.opacity(0.14), lineWidth: 1)
+        }
+        .accessibilityLabel("\(title), \(detail)")
+    }
+
+    private var title: String {
+        switch state {
+        case .failed:
+            return "Attention"
+        default:
+            return state.title
+        }
+    }
+
+    private var detail: String {
+        let fps = telemetry.presentedFps > 0.1 ? telemetry.presentedFps : telemetry.receivedFps
+        let fpsText = fps > 0.1 ? "\(Int(round(fps)))fps" : "--fps"
+        let inputText: String
+        if let rtt = telemetry.inputRttMs {
+            inputText = "\(Int(round(rtt)))ms"
+        } else {
+            inputText = controlAvailable ? "input" : "view"
+        }
+        return "\(fpsText) \(inputText)"
+    }
+
+    private var iconName: String {
+        switch state {
+        case .connected:
+            return "dot.radiowaves.left.and.right"
+        case .connecting:
+            return "antenna.radiowaves.left.and.right"
+        case .failed:
+            return "exclamationmark.triangle.fill"
+        case .disconnected:
+            return "pause.circle"
+        }
+    }
+
+    private var iconColor: Color {
+        switch state {
+        case .connected:
+            return .green
+        case .connecting:
+            return .orange
+        case .failed:
+            return .red
+        case .disconnected:
+            return .secondary
+        }
+    }
+}
+
+struct RemoteCommandButton: View {
+    let systemName: String
+    let title: String
+    var isActive = false
+    var isDisabled = false
+    var minWidth: CGFloat = 54
+    let accessibilityLabel: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 3) {
+                Image(systemName: systemName)
+                    .font(.system(size: 15, weight: .semibold))
+                Text(title)
+                    .font(.caption2.weight(.bold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+            }
+            .foregroundStyle(isActive ? .white : .primary)
+            .frame(minWidth: minWidth)
+            .frame(height: 44)
+            .padding(.horizontal, 2)
+            .background(buttonBackground)
+            .overlay {
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .stroke(.white.opacity(isActive ? 0.24 : 0.12), lineWidth: 1)
+            }
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .opacity(isDisabled ? 0.44 : 1)
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    private var buttonBackground: some View {
+        RoundedRectangle(cornerRadius: 16, style: .continuous)
+            .fill(isActive ? Color.accentColor : Color(uiColor: .tertiarySystemBackground).opacity(0.98))
+    }
+}
+
+struct RemoteCommandMenuLabel: View {
+    let systemName: String
+    let title: String
+    var isActive = false
+    var minWidth: CGFloat = 62
+
+    var body: some View {
+        VStack(spacing: 3) {
+            Image(systemName: systemName)
+                .font(.system(size: 15, weight: .semibold))
+            Text(title)
+                .font(.caption2.weight(.bold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.72)
+        }
+        .foregroundStyle(isActive ? .white : .primary)
+        .frame(minWidth: minWidth)
+        .frame(height: 44)
+        .padding(.horizontal, 2)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(isActive ? Color.accentColor : Color(uiColor: .tertiarySystemBackground).opacity(0.98))
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(.white.opacity(isActive ? 0.24 : 0.12), lineWidth: 1)
+        }
+    }
+}
+
+struct RemoteGestureModeMenu: View {
+    let selection: RemoteGestureMode
+    let onChange: (RemoteGestureMode) -> Void
+
+    var body: some View {
+        Menu {
+            ForEach(RemoteGestureMode.allCases) { mode in
+                Button {
+                    onChange(mode)
+                } label: {
+                    Label(mode.title, systemImage: mode == selection ? "checkmark" : mode.systemImage)
+                }
+            }
+        } label: {
+            RemoteCommandMenuLabel(
+                systemName: selection.systemImage,
+                title: selection.title,
+                isActive: selection != .viewport,
+                minWidth: 74
+            )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Touch mode")
+    }
+}
+
+struct RemoteStreamProfileMenu: View {
+    let selection: RemoteStreamProfile
+    let onChange: (RemoteStreamProfile) -> Void
+
+    var body: some View {
+        Menu {
+            ForEach(RemoteStreamProfile.allCases) { profile in
+                Button {
+                    onChange(profile)
+                } label: {
+                    Label(profile.title, systemImage: profile == selection ? "checkmark" : profile.systemImage)
+                }
+            }
+        } label: {
+            RemoteCommandMenuLabel(
+                systemName: selection.systemImage,
+                title: selection.title,
+                isActive: false,
+                minWidth: 76
+            )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Stream profile")
+    }
+}
+
+struct RemoteShortcutCommandMenu: View {
+    let client: RemoteDesktopClient
+    let actions: [RemoteActionDescriptor]
+    let isDisabled: Bool
+
+    var body: some View {
+        Menu {
+            if actions.isEmpty {
+                ForEach(RemoteShortcut.allCases) { shortcut in
+                    Button {
+                        client.sendShortcut(shortcut)
+                    } label: {
+                        Label(shortcut.title, systemImage: shortcut.systemImage)
+                    }
+                }
+            } else {
+                ForEach(actions) { action in
+                    Button {
+                        client.sendAction(action)
+                    } label: {
+                        Label(action.label, systemImage: systemImage(for: action.id))
+                    }
+                }
+            }
+        } label: {
+            RemoteCommandMenuLabel(systemName: "command", title: "More", minWidth: 58)
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .opacity(isDisabled ? 0.44 : 1)
+        .accessibilityLabel("Remote shortcuts")
+    }
+
+    private func systemImage(for actionId: String) -> String {
+        switch actionId {
+        case "copy":
+            return "doc.on.doc"
+        case "paste":
+            return "clipboard"
+        case "selectAll":
+            return "textformat"
+        case "altTab", "winTab":
+            return "rectangle.stack"
+        case "showDesktop":
+            return "desktopcomputer"
+        case "taskManager":
+            return "speedometer"
+        case "lock":
+            return "lock"
+        case "screenshot":
+            return "camera.viewfinder"
+        default:
+            return "command"
+        }
+    }
 }
 
 struct RemoteQuickDock: View {
@@ -3458,6 +3966,12 @@ private extension View {
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                     .stroke(.white.opacity(0.16), lineWidth: 1)
             }
+    }
+}
+
+private extension CGRect {
+    var center: CGPoint {
+        CGPoint(x: midX, y: midY)
     }
 }
 

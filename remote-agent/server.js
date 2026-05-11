@@ -1837,7 +1837,7 @@ public static class NativeInput {
   public static extern bool SetCursorPos(int X, int Y);
 
   [DllImport("user32.dll", SetLastError=true)]
-  public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
+  public static extern void mouse_event(uint dwFlags, uint dx, uint dy, int dwData, UIntPtr dwExtraInfo);
 
   [DllImport("user32.dll", SetLastError=true)]
   public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
@@ -1931,7 +1931,8 @@ function Invoke-MouseButton([string]$button, [string]$action) {
 
 function Invoke-MouseWheel([int]$deltaY) {
   if ($deltaY -eq 0) { return }
-  [NativeInput]::mouse_event([uint32]$MOUSEEVENTF_WHEEL, 0, 0, [uint32]$deltaY, [UIntPtr]::Zero)
+  $wheelDelta = -1 * $deltaY
+  [NativeInput]::mouse_event([uint32]$MOUSEEVENTF_WHEEL, 0, 0, [int]$wheelDelta, [UIntPtr]::Zero)
 }
 
 function Invoke-ReleaseInputState() {
@@ -2292,6 +2293,7 @@ const config = {
   videoMaxWidth: clampInteger(parseInteger(process.env.REMOTE_VIDEO_MAX_WIDTH, 4096), 640, 7680),
   videoMaxHeight: clampInteger(parseInteger(process.env.REMOTE_VIDEO_MAX_HEIGHT, 2304), 360, 4320),
   videoScaleFlags: process.env.REMOTE_VIDEO_SCALE_FLAGS || 'bicubic',
+  videoDrawMouse: parseBoolean(process.env.REMOTE_VIDEO_DRAW_MOUSE, false),
   videoEncoder: process.env.REMOTE_VIDEO_ENCODER || 'libx264',
   videoFfmpegPath: process.env.REMOTE_VIDEO_FFMPEG_PATH || bundledFfmpegPath || 'ffmpeg',
   inputEnabled: parseBoolean(process.env.REMOTE_INPUT_ENABLED, true),
@@ -3050,7 +3052,7 @@ function buildFfmpegVideoArgs(plan) {
     '-rtbufsize', '256M',
     '-f', 'gdigrab',
     '-framerate', String(fps),
-    '-draw_mouse', '1',
+    '-draw_mouse', config.videoDrawMouse ? '1' : '0',
     '-offset_x', String(plan.bounds.left),
     '-offset_y', String(plan.bounds.top),
     '-video_size', `${plan.bounds.width}x${plan.bounds.height}`,
@@ -3376,6 +3378,7 @@ function startVideoStream(reason) {
     fps: videoState.activeFps,
     bitrateKbps: videoState.activeBitrateKbps,
     encoder: config.videoEncoder,
+    drawMouse: config.videoDrawMouse,
     capture: plan.bounds,
     output: plan.output
   });
@@ -3497,6 +3500,7 @@ app.get('/health', (_req, res) => {
       encoder: config.videoEncoder,
       maxWidth: config.videoMaxWidth,
       maxHeight: config.videoMaxHeight,
+      drawMouse: config.videoDrawMouse,
       clients: getOpenVideoClientCount(),
       processRunning: Boolean(videoState.process),
       lastFrameBytes: videoState.lastFrameBytes,
