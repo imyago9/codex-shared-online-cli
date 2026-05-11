@@ -2334,6 +2334,7 @@ const videoState = {
   framer: null,
   cursorTimer: null,
   statsTimer: null,
+  stallTimer: null,
   activeFps: config.videoFps,
   activeBitrateKbps: config.videoBitrateKbps,
   activeMonitorIds: [],
@@ -3246,6 +3247,10 @@ function stopVideoProcess(reason) {
     clearInterval(videoState.statsTimer);
     videoState.statsTimer = null;
   }
+  if (videoState.stallTimer) {
+    clearInterval(videoState.stallTimer);
+    videoState.stallTimer = null;
+  }
   videoState.framer = null;
   if (videoState.process) {
     const child = videoState.process;
@@ -3271,6 +3276,41 @@ function scheduleVideoRestart(reason, delayMs = 120) {
     startVideoStream(reason);
   }, Math.max(50, delayMs));
   videoState.restartTimer.unref();
+}
+
+function checkVideoStreamLiveness() {
+  if (!videoState.process || getOpenVideoClientCount() === 0) {
+    return;
+  }
+
+  const now = Date.now();
+  const streamAgeMs = now - videoState.processStartedAt;
+  if (streamAgeMs < 4_000) {
+    return;
+  }
+
+  const lastFrameAt = videoState.lastAccessUnitAt || videoState.firstFrameAt || 0;
+  const stalled = lastFrameAt <= 0 || (now - lastFrameAt) > 3_000;
+  if (!stalled) {
+    return;
+  }
+
+  videoState.failureCount += 1;
+  videoState.lastError = lastFrameAt <= 0
+    ? 'video-stream-no-frames'
+    : 'video-stream-stalled';
+  logger.warn('Video stream stalled, restarting ffmpeg', {
+    message: videoState.lastError,
+    streamAgeMs,
+    lastFrameAgeMs: lastFrameAt > 0 ? now - lastFrameAt : null,
+    failureCount: videoState.failureCount
+  });
+  broadcastVideoControl({
+    type: 'restarting',
+    message: videoState.lastError,
+    failureCount: videoState.failureCount
+  });
+  scheduleVideoRestart(videoState.lastError, Math.min(2_000, 120 + (videoState.failureCount * 180)));
 }
 
 function recomputeVideoSettings() {
@@ -3461,6 +3501,8 @@ function startVideoStream(reason) {
   videoState.cursorTimer.unref();
   videoState.statsTimer = setInterval(broadcastVideoStats, 1000);
   videoState.statsTimer.unref();
+  videoState.stallTimer = setInterval(checkVideoStreamLiveness, 1000);
+  videoState.stallTimer.unref();
 }
 
 function stopVideoStreamIfIdle() {

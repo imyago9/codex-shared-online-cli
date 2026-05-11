@@ -1,5 +1,6 @@
 import SwiftUI
 import AVFoundation
+import AVKit
 import UIKit
 
 private enum RemoteViewportSettings {
@@ -11,16 +12,22 @@ private enum RemoteViewportSettings {
 
 private enum RemoteChromeSpacing {
     static let edgeInset: CGFloat = 2
-    static let portraitTabInset: CGFloat = 84
+    static let portraitTabInset: CGFloat = 4
     static let monitorPanelDockGap: CGFloat = 12
     static let quickDockHeight: CGFloat = 50
     static let commandDockHeight: CGFloat = 64
-    static let commandDockGap: CGFloat = 10
+    static let commandDockHiddenGap: CGFloat = 24
+    static let commandDockRevealStripHeight: CGFloat = 34
     static let controlsLauncherGap: CGFloat = 8
     static let controlsDockGap: CGFloat = 12
     static let controlsDockHeight = quickDockHeight + controlsLauncherGap + quickDockHeight
     static let portraitKeyboardDockOverlap: CGFloat = 78
     static let landscapeKeyboardDockGap: CGFloat = 8
+}
+
+private enum RemoteChromeBehavior {
+    static let commandDockIdleDelay: TimeInterval = 3.0
+    static let commandDockActivityThrottle: TimeInterval = 0.25
 }
 
 struct RemoteTelemetrySnapshot: Equatable {
@@ -392,6 +399,7 @@ struct TerminalSessionController: View {
 struct RemoteDesktopView: View {
     @Environment(AppModel.self) private var app
     @Environment(\.verticalSizeClass) private var verticalSizeClass
+    @Environment(\.scenePhase) private var scenePhase
     @State private var client = RemoteDesktopClient()
     @State private var desiredMode: RemoteMode = .view
     @State private var streamProfile: RemoteStreamProfile = .balanced
@@ -410,19 +418,29 @@ struct RemoteDesktopView: View {
     @State private var remoteKeyboardVisible = false
     @State private var remoteKeyboardFocusToken = 0
     @State private var remoteKeyboardDismissToken = 0
+    @State private var didApplyInitialRemoteSettings = false
+    @State private var reconnectOnNextActivation = false
+    @State private var commandDockHidden = false
+    @State private var lastCommandDockActivityUptime: TimeInterval = 0
+    @State private var lastStreamRecoveryUptime: TimeInterval = 0
+    @State private var streamRecoveryAttemptCount = 0
+    @State private var preferredStreamTransport: RemoteStreamTransport = .video
     private let telemetryTicker = Timer.publish(every: 0.33, on: .main, in: .common).autoconnect()
 
     var body: some View {
         NavigationStack {
             GeometryReader { proxy in
                 let isLandscape = proxy.size.width > proxy.size.height || verticalSizeClass == .compact || interfaceIsLandscape
-                let useLandscapeEdgeOutsets = isLandscape && keyboardHeight <= 0
-                let leadingChromeOutset = useLandscapeEdgeOutsets ? edgeOutset(proxy.safeAreaInsets.leading) : 0
                 let quickDockInset = quickDockBottomInset(isLandscape: isLandscape)
-                let dockSideInset = max(RemoteChromeSpacing.edgeInset + 8, max(proxy.safeAreaInsets.leading, proxy.safeAreaInsets.trailing) + 8)
-                let dockBottomInset = max(quickDockInset, proxy.safeAreaInsets.bottom + RemoteChromeSpacing.edgeInset + 8)
+                let dockSideInset: CGFloat = 0
+                let panelSideInset = max(RemoteChromeSpacing.edgeInset + 8, max(proxy.safeAreaInsets.leading, proxy.safeAreaInsets.trailing) + 8)
+                let telemetryLeadingInset = max(RemoteChromeSpacing.edgeInset + 8, proxy.safeAreaInsets.leading + 8)
+                let dockBottomInset = quickDockInset
+                let commandDockHiddenOffset = dockBottomInset + RemoteChromeSpacing.commandDockHeight + RemoteChromeSpacing.commandDockHiddenGap
+                let telemetryBottomInset = commandDockHidden
+                    ? RemoteChromeSpacing.edgeInset + 8
+                    : dockBottomInset + RemoteChromeSpacing.commandDockHeight + 6
                 let monitorPanelBottomInset = dockBottomInset + RemoteChromeSpacing.commandDockHeight + RemoteChromeSpacing.monitorPanelDockGap
-                let dockMaxWidth = min(max(220, proxy.size.width - (dockSideInset * 2)), isLandscape ? 760 : 430)
                 ZStack {
                     Color.black.ignoresSafeArea()
 
@@ -447,32 +465,11 @@ struct RemoteDesktopView: View {
                         selectedMonitorIds: effectiveSelectedMonitorIds,
                         monitorLayoutOffsets: monitorLayoutOffsets,
                         focusedMonitorId: $focusedMonitorId,
-                        onKeyboardShortcut: toggleRemoteKeyboard
+                        onKeyboardShortcut: toggleRemoteKeyboard,
+                        onUserActivity: noteRemoteChromeActivity
                     )
                     .allowsHitTesting(!(monitorPanelPresented && monitorDragMode))
                     .ignoresSafeArea(edges: .bottom)
-
-                    VStack(spacing: 0) {
-                        HStack {
-                            RemoteQuickDockButton(
-                                systemName: client.isConnected ? "pause.fill" : "play.fill",
-                                isActive: client.isConnected,
-                                accessibilityLabel: client.isConnected ? "Pause remote stream" : "Start remote stream"
-                            ) {
-                                if client.isConnected {
-                                    disconnect()
-                                } else {
-                                    connect()
-                                }
-                            }
-                            .padding(.leading, RemoteChromeSpacing.edgeInset)
-                            .padding(.top, RemoteChromeSpacing.edgeInset)
-                            .offset(x: -leadingChromeOutset)
-                            Spacer(minLength: 0)
-                        }
-                        Spacer()
-                    }
-                    .zIndex(50)
 
                     if monitorPanelPresented {
                         VStack {
@@ -489,7 +486,7 @@ struct RemoteDesktopView: View {
                                     onResetViews: resetMonitorViews
                                 )
                                 .frame(width: min(isLandscape ? 310 : 340, proxy.size.width - (RemoteChromeSpacing.edgeInset * 2)))
-                                .padding(.trailing, dockSideInset)
+                                .padding(.trailing, panelSideInset)
                                 .padding(.bottom, monitorPanelBottomInset)
                             }
                         }
@@ -500,33 +497,62 @@ struct RemoteDesktopView: View {
                     VStack {
                         Spacer()
                         HStack {
-                            Spacer(minLength: 0)
-                            RemoteCommandDock(
-                                client: client,
-                                mode: desiredMode,
-                                gestureMode: gestureMode,
-                                streamProfile: streamProfile,
-                                monitorActive: monitorPanelPresented,
-                                monitorCount: availableMonitors.count,
-                                keyboardFocused: remoteKeyboardVisible,
-                                controlAvailable: remoteControlAvailable,
-                                telemetry: telemetry,
-                                actions: app.remoteCapabilities?.actions ?? [],
-                                onControlToggle: toggleControlMode,
-                                onGestureModeChange: setGestureMode,
-                                onMonitorToggle: toggleMonitorPanel,
-                                onKeyboardToggle: toggleRemoteKeyboard,
-                                onStreamProfileChange: setStreamProfile,
-                                onResetViewport: resetViewport
+                            RemoteTelemetryReadout(
+                                telemetry: telemetry
                             )
-                            .frame(maxWidth: dockMaxWidth)
                             Spacer(minLength: 0)
                         }
+                        .padding(.leading, telemetryLeadingInset)
+                        .padding(.bottom, telemetryBottomInset)
+                        .animation(.easeOut(duration: 0.2), value: commandDockHidden)
+                    }
+                    .zIndex(54)
+
+                    VStack {
+                        Spacer()
+                        RemoteCommandDock(
+                            client: client,
+                            mode: desiredMode,
+                            monitorActive: monitorPanelPresented,
+                            monitorCount: availableMonitors.count,
+                            keyboardFocused: remoteKeyboardVisible,
+                            controlAvailable: remoteControlAvailable,
+                            scrollToTrailingOnAppear: !isLandscape,
+                            actions: app.remoteCapabilities?.actions ?? [],
+                            onActivity: noteRemoteChromeActivity,
+                            onRefresh: refreshRemoteStream,
+                            onControlToggle: toggleControlMode,
+                            onMonitorToggle: toggleMonitorPanel,
+                            onKeyboardToggle: toggleRemoteKeyboard
+                        )
+                        .frame(maxWidth: .infinity)
                         .padding(.horizontal, dockSideInset)
                         .padding(.bottom, dockBottomInset)
+                        .offset(y: commandDockHidden ? commandDockHiddenOffset : 0)
+                        .animation(.spring(response: 0.28, dampingFraction: 0.86), value: commandDockHidden)
                         .animation(.easeOut(duration: keyboardAnimationDuration), value: dockBottomInset)
                     }
                     .zIndex(55)
+
+                    if commandDockHidden {
+                        VStack {
+                            Spacer()
+                            Color.clear
+                                .contentShape(Rectangle())
+                                .frame(height: RemoteChromeSpacing.commandDockRevealStripHeight)
+                                .onTapGesture {
+                                    noteRemoteChromeActivity(force: true)
+                                }
+                                .gesture(
+                                    DragGesture(minimumDistance: 0)
+                                        .onChanged { _ in
+                                            noteRemoteChromeActivity(force: true)
+                                        }
+                                )
+                        }
+                        .ignoresSafeArea(edges: .bottom)
+                        .zIndex(56)
+                    }
 
                 }
                 .ignoresSafeArea(.keyboard, edges: .bottom)
@@ -535,19 +561,23 @@ struct RemoteDesktopView: View {
             }
             .ignoresSafeArea(.keyboard, edges: .bottom)
             .onAppear {
-                desiredMode = app.settings.defaultRemoteMode
-                gestureMode = app.settings.defaultRemoteMode == .control ? .direct : .viewport
-                streamProfile = app.settings.remoteStreamProfile
+                applyInitialRemoteSettingsIfNeeded()
                 updateInterfaceOrientation()
                 refreshTelemetry()
+                noteRemoteChromeActivity(force: true)
                 Task {
-                    await app.refreshRemoteStatus()
-                    await app.refreshRemoteCapabilities()
-                    reconcileMonitorSelection(availableMonitors)
+                    await refreshRemoteMetadata()
+                    ensureRemoteStream()
                 }
             }
             .onChange(of: client.monitors) { _, monitors in
                 reconcileMonitorSelection(monitors)
+            }
+            .onChange(of: app.settings.remoteStreamProfile) { _, profile in
+                setStreamProfile(profile)
+            }
+            .onChange(of: scenePhase) { _, phase in
+                handleScenePhaseChange(phase)
             }
             .onReceive(NotificationCenter.default.publisher(for: UIDevice.orientationDidChangeNotification)) { _ in
                 updateInterfaceOrientation()
@@ -566,9 +596,12 @@ struct RemoteDesktopView: View {
             }
             .onReceive(telemetryTicker) { _ in
                 refreshTelemetry()
+                updateCommandDockIdleState()
+                recoverStaleRemoteStreamIfNeeded()
             }
             .onDisappear {
-                disconnect()
+                client.releaseRemoteInputState()
+                dismissRemoteKeyboard()
             }
         }
     }
@@ -582,16 +615,72 @@ struct RemoteDesktopView: View {
             baseURL: url,
             desiredMode: desiredMode,
             streamProfile: streamProfile,
+            transport: preferredStreamTransport,
             visibleMonitorIds: effectiveSelectedMonitorIds,
             monitorLayoutOffsets: monitorLayoutOffsets
         )
         refreshTelemetry()
     }
 
-    private func disconnect() {
-        client.disconnect()
-        dismissRemoteKeyboard()
-        refreshTelemetry()
+    private func ensureRemoteStream(forceReconnect: Bool = false) {
+        if forceReconnect {
+            connect()
+            return
+        }
+
+        switch client.connectionState {
+        case .connected:
+            client.setStreamProfile(streamProfile)
+            client.setVisibleMonitors(effectiveSelectedMonitorIds)
+            client.setMonitorLayoutOffsets(monitorLayoutOffsets)
+            refreshTelemetry()
+        case .connecting:
+            break
+        case .disconnected, .failed:
+            connect()
+        }
+    }
+
+    private func applyInitialRemoteSettingsIfNeeded() {
+        guard !didApplyInitialRemoteSettings else { return }
+        didApplyInitialRemoteSettings = true
+        desiredMode = app.settings.defaultRemoteMode
+        gestureMode = app.settings.defaultRemoteMode == .control ? .direct : .viewport
+        streamProfile = app.settings.remoteStreamProfile
+    }
+
+    private func refreshRemoteStream() {
+        preferredStreamTransport = .video
+        streamRecoveryAttemptCount = 0
+        lastStreamRecoveryUptime = 0
+        Task {
+            await refreshRemoteMetadata()
+            ensureRemoteStream(forceReconnect: true)
+        }
+    }
+
+    private func refreshRemoteMetadata() async {
+        await app.refreshRemoteStatus()
+        await app.refreshRemoteCapabilities()
+        reconcileMonitorSelection(availableMonitors)
+    }
+
+    private func handleScenePhaseChange(_ phase: ScenePhase) {
+        switch phase {
+        case .active:
+            noteRemoteChromeActivity(force: true)
+            let shouldForceReconnect = reconnectOnNextActivation
+            reconnectOnNextActivation = false
+            Task {
+                await refreshRemoteMetadata()
+                ensureRemoteStream(forceReconnect: shouldForceReconnect)
+            }
+        case .inactive, .background:
+            reconnectOnNextActivation = true
+            client.releaseRemoteInputState()
+        @unknown default:
+            break
+        }
     }
 
     private func setRemoteMode(_ mode: RemoteMode) {
@@ -614,26 +703,9 @@ struct RemoteDesktopView: View {
         setRemoteMode(desiredMode == .control ? .view : .control)
     }
 
-    private func setGestureMode(_ mode: RemoteGestureMode) {
-        if gestureMode != mode {
-            gestureMode = mode
-        }
-        switch mode {
-        case .direct, .trackpad:
-            if desiredMode != .control {
-                setRemoteMode(.control)
-            }
-        case .viewport:
-            if desiredMode != .view {
-                setRemoteMode(.view)
-            }
-        }
-    }
-
     private func setStreamProfile(_ profile: RemoteStreamProfile) {
         guard streamProfile != profile else { return }
         streamProfile = profile
-        app.settings.remoteStreamProfile = profile
         client.setStreamProfile(profile)
         refreshTelemetry()
     }
@@ -713,6 +785,62 @@ struct RemoteDesktopView: View {
         }
     }
 
+    private func noteRemoteChromeActivity() {
+        noteRemoteChromeActivity(force: false)
+    }
+
+    private func noteRemoteChromeActivity(force: Bool) {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard force
+            || commandDockHidden
+            || now - lastCommandDockActivityUptime >= RemoteChromeBehavior.commandDockActivityThrottle
+        else { return }
+
+        lastCommandDockActivityUptime = now
+        guard commandDockHidden else { return }
+        withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+            commandDockHidden = false
+        }
+    }
+
+    private func updateCommandDockIdleState() {
+        guard lastCommandDockActivityUptime > 0 else { return }
+        guard !commandDockHidden else { return }
+        guard ProcessInfo.processInfo.systemUptime - lastCommandDockActivityUptime >= RemoteChromeBehavior.commandDockIdleDelay else { return }
+
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.9)) {
+            commandDockHidden = true
+        }
+    }
+
+    private func recoverStaleRemoteStreamIfNeeded() {
+        guard scenePhase == .active else { return }
+        let shouldRecover: Bool
+        let shouldPreferFallback: Bool
+
+        switch client.connectionState {
+        case .connected:
+            guard let stallKind = client.streamStallKind() else { return }
+            shouldRecover = true
+            shouldPreferFallback = stallKind == .render
+        case .failed, .disconnected:
+            shouldRecover = true
+            shouldPreferFallback = false
+        case .connecting:
+            return
+        }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        guard shouldRecover else { return }
+        guard now - lastStreamRecoveryUptime >= 3.0 else { return }
+        lastStreamRecoveryUptime = now
+        streamRecoveryAttemptCount += 1
+        if shouldPreferFallback || streamRecoveryAttemptCount >= 2 {
+            preferredStreamTransport = .jpeg
+        }
+        ensureRemoteStream(forceReconnect: true)
+    }
+
     private func updateInterfaceOrientation() {
         interfaceIsLandscape = UIApplication.shared.connectedScenes
             .compactMap { ($0 as? UIWindowScene)?.interfaceOrientation }
@@ -729,10 +857,6 @@ struct RemoteDesktopView: View {
         return max(restingInset, keyboardInset)
     }
 
-    private func edgeOutset(_ safeInset: CGFloat) -> CGFloat {
-        max(0, safeInset - RemoteChromeSpacing.edgeInset)
-    }
-
     private func setZoom(_ value: Double) {
         zoom = min(RemoteViewportSettings.maximumZoom, max(RemoteViewportSettings.minimumZoom, value))
         if zoom <= 1.01 {
@@ -742,7 +866,7 @@ struct RemoteDesktopView: View {
 
     private func resetViewport() {
         focusedMonitorId = nil
-        setZoom(RemoteViewportSettings.minimumZoom)
+        zoom = RemoteViewportSettings.minimumZoom
         panOffset = .zero
     }
 
@@ -801,6 +925,7 @@ struct RemoteStageHost: View {
     let monitorLayoutOffsets: [String: CGSize]
     @Binding var focusedMonitorId: String?
     let onKeyboardShortcut: () -> Void
+    let onUserActivity: () -> Void
 
     var body: some View {
         RemoteStageSurface(
@@ -816,6 +941,7 @@ struct RemoteStageHost: View {
             monitorLayoutOffsets: monitorLayoutOffsets,
             focusedMonitorId: $focusedMonitorId,
             onKeyboardShortcut: onKeyboardShortcut,
+            onUserActivity: onUserActivity,
             onClick: { point in client.sendClick(at: point) },
             onRightClick: { point in client.sendClick(button: "right", at: point) },
             onPointerMove: { point in client.sendPointerMove(point) },
@@ -839,6 +965,7 @@ private struct RemoteStageSurface: UIViewRepresentable {
     let monitorLayoutOffsets: [String: CGSize]
     @Binding var focusedMonitorId: String?
     let onKeyboardShortcut: () -> Void
+    let onUserActivity: () -> Void
     let onClick: (CGPoint) -> Void
     let onRightClick: (CGPoint) -> Void
     let onPointerMove: (CGPoint) -> Void
@@ -871,6 +998,7 @@ private struct RemoteStageSurface: UIViewRepresentable {
             focusedMonitorId: focusedMonitorId,
             onFocusedMonitorChange: { focusedMonitorIdBinding.wrappedValue = $0 },
             onKeyboardShortcut: onKeyboardShortcut,
+            onUserActivity: onUserActivity,
             onZoomChange: { zoomBinding.wrappedValue = $0 },
             onPanOffsetChange: { panOffsetBinding.wrappedValue = $0 },
             onClick: onClick,
@@ -904,7 +1032,7 @@ private struct RemoteStageSurface: UIViewRepresentable {
     }
 }
 
-private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate {
+private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate, AVPictureInPictureControllerDelegate {
     private final class MonitorLayers {
         let imageLayer = CALayer()
         let videoContainerLayer = CALayer()
@@ -960,6 +1088,133 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         }
     }
 
+    private final class SystemPictureInPictureContentView: UIView {
+        private let imageLayer = CALayer()
+        private let videoContainerLayer = CALayer()
+        private var videoLayer = SystemPictureInPictureContentView.makeVideoLayer()
+        private var sourceBounds = CGRect.zero
+        private var sourceRect = CGRect.zero
+
+        var aspectRatio: CGFloat {
+            guard sourceRect.width > 1, sourceRect.height > 1 else { return 16.0 / 9.0 }
+            return sourceRect.width / sourceRect.height
+        }
+
+        override init(frame: CGRect) {
+            super.init(frame: frame)
+            commonInit()
+        }
+
+        required init?(coder: NSCoder) {
+            nil
+        }
+
+        func configure(sourceBounds: CGRect, sourceRect: CGRect) {
+            self.sourceBounds = sourceBounds
+            self.sourceRect = sourceRect
+            imageLayer.contentsRect = Self.contentsRect(for: sourceRect, sourceBounds: sourceBounds)
+            setNeedsLayout()
+        }
+
+        func presentImage(_ image: CGImage?) {
+            imageLayer.contents = image
+            imageLayer.isHidden = image == nil
+            videoContainerLayer.isHidden = true
+            videoLayer.sampleBufferRenderer.flush()
+        }
+
+        func prepareForVideo() {
+            imageLayer.isHidden = true
+            imageLayer.contents = nil
+            videoContainerLayer.isHidden = false
+        }
+
+        func presentVideo(_ sampleBuffer: CMSampleBuffer) {
+            prepareForVideo()
+            let renderer = videoLayer.sampleBufferRenderer
+            if renderer.status == .failed || renderer.requiresFlushToResumeDecoding {
+                resetVideoLayer()
+            }
+            guard videoLayer.sampleBufferRenderer.isReadyForMoreMediaData else { return }
+            videoLayer.sampleBufferRenderer.enqueue(sampleBuffer)
+        }
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            imageLayer.frame = bounds
+            videoContainerLayer.frame = bounds
+            videoLayer.frame = Self.videoLayerFrame(
+                for: sourceRect,
+                sourceBounds: sourceBounds,
+                in: videoContainerLayer.bounds
+            )
+        }
+
+        private func commonInit() {
+            isOpaque = true
+            backgroundColor = .black
+            clipsToBounds = true
+            isUserInteractionEnabled = false
+
+            imageLayer.contentsGravity = .resize
+            imageLayer.magnificationFilter = .linear
+            imageLayer.minificationFilter = .linear
+            imageLayer.contentsScale = UIScreen.main.scale
+            layer.addSublayer(imageLayer)
+
+            videoContainerLayer.masksToBounds = true
+            videoContainerLayer.isHidden = true
+            layer.addSublayer(videoContainerLayer)
+            videoContainerLayer.addSublayer(videoLayer)
+        }
+
+        private func resetVideoLayer() {
+            videoLayer.removeFromSuperlayer()
+            videoLayer = SystemPictureInPictureContentView.makeVideoLayer()
+            videoContainerLayer.addSublayer(videoLayer)
+            setNeedsLayout()
+        }
+
+        private static func makeVideoLayer() -> AVSampleBufferDisplayLayer {
+            let layer = AVSampleBufferDisplayLayer()
+            layer.videoGravity = .resize
+            layer.backgroundColor = UIColor.black.cgColor
+            layer.contentsScale = UIScreen.main.scale
+            return layer
+        }
+
+        private static func contentsRect(for sourceRect: CGRect, sourceBounds: CGRect) -> CGRect {
+            guard sourceBounds.width > 0, sourceBounds.height > 0 else {
+                return CGRect(x: 0, y: 0, width: 1, height: 1)
+            }
+            let x = (sourceRect.minX - sourceBounds.minX) / sourceBounds.width
+            let y = (sourceRect.minY - sourceBounds.minY) / sourceBounds.height
+            let width = sourceRect.width / sourceBounds.width
+            let height = sourceRect.height / sourceBounds.height
+            return CGRect(
+                x: min(1, max(0, x)),
+                y: min(1, max(0, y)),
+                width: min(1, max(0, width)),
+                height: min(1, max(0, height))
+            )
+        }
+
+        private static func videoLayerFrame(for sourceRect: CGRect, sourceBounds: CGRect, in bounds: CGRect) -> CGRect {
+            guard sourceBounds.width > 0, sourceBounds.height > 0, sourceRect.width > 0, sourceRect.height > 0 else {
+                return bounds
+            }
+
+            let scaleX = bounds.width / sourceRect.width
+            let scaleY = bounds.height / sourceRect.height
+            return CGRect(
+                x: -(sourceRect.minX - sourceBounds.minX) * scaleX,
+                y: -(sourceRect.minY - sourceBounds.minY) * scaleY,
+                width: sourceBounds.width * scaleX,
+                height: sourceBounds.height * scaleY
+            )
+        }
+    }
+
     private struct StageGeometry {
         let sourceBounds: CGRect
         let visualBounds: CGRect
@@ -970,8 +1225,13 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         let focusedRotation: CGFloat
     }
 
+    private struct PipDescriptor {
+        let sourceBounds: CGRect
+        let sourceRect: CGRect
+    }
+
     private let imageView = UIView()
-    private let videoLayer = AVSampleBufferDisplayLayer()
+    private var videoLayer = RemoteStageSurfaceView.makeVideoLayer()
     private let placeholderView = UIStackView()
     private let placeholderIcon = UIImageView(image: UIImage(systemName: "display.trianglebadge.exclamationmark"))
     private let placeholderLabel = UILabel()
@@ -983,6 +1243,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     private var renderedVideoSequence: UInt64?
     private var presentedSequence: UInt64?
     private var presentedVideoSequence: UInt64?
+    private var lastVideoSequenceEnqueued: UInt64?
     private var latestImage: CGImage?
     private var videoActive = false
     private var desktopSize = CGSize(width: 1280, height: 720)
@@ -997,6 +1258,9 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     private var monitorLayoutOffsets: [String: CGSize] = [:]
     private var focusedMonitorId: String?
     private var monitorLayers: [String: MonitorLayers] = [:]
+    private var pictureInPictureController: AVPictureInPictureController?
+    private var pictureInPictureContentController: AVPictureInPictureVideoCallViewController?
+    private var pictureInPictureContentView: SystemPictureInPictureContentView?
 
     private var onZoomChange: ((Double) -> Void)?
     private var onPanOffsetChange: ((CGSize) -> Void)?
@@ -1008,6 +1272,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     private var onDragEnd: ((CGPoint) -> Void)?
     private var onFocusedMonitorChange: ((String?) -> Void)?
     private var onKeyboardShortcut: (() -> Void)?
+    private var onUserActivity: (() -> Void)?
     private var onFramePresented: ((Double) -> Void)?
 
     private weak var twoFingerPanRecognizer: UIPanGestureRecognizer?
@@ -1023,12 +1288,19 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     private var touchMovedBeyondLongPress = false
     private var singleFingerViewportPanActive = false
     private var remoteDragActive = false
+    private var viewportTapCount = 0
+    private var lastViewportTapLocation = CGPoint.zero
+    private var lastViewportTapUptime: TimeInterval = 0
+    private var primaryVideoDropCount = 0
     private var initialPanOffset = CGSize.zero
     private var initialZoom = RemoteViewportSettings.minimumZoom
     private var initialPinchLocation = CGPoint.zero
     private let dragActivationDistance: CGFloat = 4
+    private let tripleTapInterval: TimeInterval = 0.48
+    private let tripleTapMovementLimit: CGFloat = 22
     private let longPressMinimumDuration: TimeInterval = 0.60
     private let longPressMovementLimit: CGFloat = 6
+    private let videoLayerDropResetThreshold = 4
     private var hasRenderableFrame: Bool {
         latestImage != nil || videoActive
     }
@@ -1040,6 +1312,20 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
 
     required init?(coder: NSCoder) {
         nil
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+        releasePictureInPictureContent()
+    }
+
+    private static func makeVideoLayer() -> AVSampleBufferDisplayLayer {
+        let layer = AVSampleBufferDisplayLayer()
+        layer.videoGravity = .resize
+        layer.backgroundColor = UIColor.black.cgColor
+        layer.contentsScale = UIScreen.main.scale
+        layer.isHidden = true
+        return layer
     }
 
     func configure(
@@ -1055,6 +1341,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         focusedMonitorId: String?,
         onFocusedMonitorChange: @escaping (String?) -> Void,
         onKeyboardShortcut: @escaping () -> Void,
+        onUserActivity: @escaping () -> Void,
         onZoomChange: @escaping (Double) -> Void,
         onPanOffsetChange: @escaping (CGSize) -> Void,
         onClick: @escaping (CGPoint) -> Void,
@@ -1128,6 +1415,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         self.onDragEnd = onDragEnd
         self.onFocusedMonitorChange = onFocusedMonitorChange
         self.onKeyboardShortcut = onKeyboardShortcut
+        self.onUserActivity = onUserActivity
         self.onFramePresented = onFramePresented
 
         if needsLayout {
@@ -1140,6 +1428,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         renderedSequence = update.sequence
         if update.image != nil, videoActive {
             videoActive = false
+            lastVideoSequenceEnqueued = nil
             flushVideoLayer(removeImage: true)
             videoLayer.isHidden = true
             hideMonitorVideoLayers()
@@ -1147,6 +1436,11 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         latestImage = update.image
         desktopSize = update.pixelSize
         imageView.layer.contents = update.image
+        if let image = update.image {
+            pictureInPictureContentView?.presentImage(image)
+        } else if !videoActive {
+            pictureInPictureContentView?.presentImage(nil)
+        }
         if update.image == nil, !videoActive {
             flushVideoLayer(removeImage: true)
             videoLayer.isHidden = true
@@ -1162,8 +1456,10 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         renderedVideoSequence = update.sequence
         guard let sampleBuffer = update.sampleBuffer else {
             videoActive = false
+            lastVideoSequenceEnqueued = nil
             flushVideoLayer(removeImage: true)
             videoLayer.isHidden = true
+            pictureInPictureContentView?.presentImage(latestImage)
             placeholderView.isHidden = latestImage != nil
             cursorView.isHidden = latestImage == nil || remoteCursor == nil
             setNeedsLayout()
@@ -1172,6 +1468,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
 
         let wasVideoActive = videoActive
         let previousDesktopSize = desktopSize
+        var didEnqueueVideo = false
         latestImage = nil
         imageView.layer.contents = nil
         videoActive = true
@@ -1188,18 +1485,26 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         if let geometry = stageGeometry(panOffset: panOffsetValue, zoom: zoomValue), geometry.usesMonitorLayers {
             videoLayer.isHidden = true
             monitorContentLayer.isHidden = false
-            updateMonitorVideoLayers(geometry: geometry, sampleBuffer: sampleBuffer)
+            didEnqueueVideo = updateMonitorVideoLayers(geometry: geometry, sampleBuffer: sampleBuffer)
             updateMonitorOverlay(frames: geometry.monitorFrames)
         } else {
             hideMonitorVideoLayers()
             monitorContentLayer.isHidden = true
-            enqueue(sampleBuffer, on: videoLayer)
+            didEnqueueVideo = enqueuePrimaryVideo(sampleBuffer)
+        }
+        if let pictureInPictureContentView, let copiedSampleBuffer = deepCopySampleBuffer(sampleBuffer) {
+            pictureInPictureContentView.presentVideo(copiedSampleBuffer)
+        } else {
+            pictureInPictureContentView?.prepareForVideo()
         }
         CATransaction.commit()
         if geometryChanged {
             setNeedsLayout()
         }
-        if renderedVideoSequence != presentedVideoSequence {
+        if didEnqueueVideo {
+            lastVideoSequenceEnqueued = update.sequence
+        }
+        if didEnqueueVideo, renderedVideoSequence != presentedVideoSequence {
             presentedVideoSequence = renderedVideoSequence
             onFramePresented?((CACurrentMediaTime() - renderStartedAt) * 1_000)
         }
@@ -1264,11 +1569,12 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         }
 
         CATransaction.commit()
-
         if latestImage != nil, renderedSequence != presentedSequence {
             presentedSequence = renderedSequence
             onFramePresented?((CACurrentMediaTime() - renderStartedAt) * 1_000)
-        } else if videoActive, renderedVideoSequence != presentedVideoSequence {
+        } else if videoActive,
+                  renderedVideoSequence != presentedVideoSequence,
+                  renderedVideoSequence == lastVideoSequenceEnqueued {
             presentedVideoSequence = renderedVideoSequence
             onFramePresented?((CACurrentMediaTime() - renderStartedAt) * 1_000)
         }
@@ -1276,12 +1582,14 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
 
     @objc private func handleSingleTap(_ recognizer: UITapGestureRecognizer) {
         guard isUserInteractionEnabled, recognizer.state == .ended, controlMode, gestureMode == .trackpad else { return }
+        onUserActivity?()
         guard let normalized = normalizedPoint(for: recognizer.location(in: self)) else { return }
         onClick?(normalized)
     }
 
     @objc private func handleDoubleTap(_ recognizer: UITapGestureRecognizer) {
         guard isUserInteractionEnabled, recognizer.state == .ended, hasRenderableFrame, gestureMode == .viewport else { return }
+        onUserActivity?()
         cancelTrackedTouch()
         if focusedMonitorId != nil {
             focusMonitor(nil)
@@ -1292,8 +1600,22 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         focusMonitor(frame.id)
     }
 
+    @objc private func handleTripleTap(_ recognizer: UITapGestureRecognizer) {
+        guard isUserInteractionEnabled, recognizer.state == .ended, hasRenderableFrame, gestureMode == .viewport else { return }
+        onUserActivity?()
+        cancelTrackedTouch()
+        viewportTapCount = 0
+        guard let descriptor = pipDescriptor(at: recognizer.location(in: self)) else { return }
+        showPip(descriptor)
+    }
+
+    @objc private func handleApplicationDidBecomeActive() {
+        stopPictureInPictureForForegroundReturn()
+    }
+
     @objc private func handleThreeFingerTap(_ recognizer: UITapGestureRecognizer) {
         guard isUserInteractionEnabled, recognizer.state == .ended, hasRenderableFrame else { return }
+        onUserActivity?()
         cancelTrackedTouch()
         onKeyboardShortcut?()
     }
@@ -1301,6 +1623,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     @objc private func handleLongPress(_ recognizer: UILongPressGestureRecognizer) {
         guard recognizer.state == .began else { return }
         guard isUserInteractionEnabled, controlMode, gestureMode != .viewport, hasRenderableFrame else { return }
+        onUserActivity?()
         guard let trackedTouch else { return }
         guard !touchMovedBeyondLongPress, !singleFingerViewportPanActive, !remoteDragActive else { return }
 
@@ -1318,12 +1641,14 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     }
 
     @objc private func handleTwoFingerPan(_ recognizer: UIPanGestureRecognizer) {
-        guard isUserInteractionEnabled, hasRenderableFrame, focusedMonitorId == nil else { return }
+        guard isUserInteractionEnabled, hasRenderableFrame else { return }
 
         switch recognizer.state {
         case .began:
+            onUserActivity?()
             initialPanOffset = panOffsetValue
         case .changed:
+            onUserActivity?()
             let translation = recognizer.translation(in: self)
             setViewport(
                 zoom: zoomValue,
@@ -1341,14 +1666,16 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     }
 
     @objc private func handlePinch(_ recognizer: UIPinchGestureRecognizer) {
-        guard isUserInteractionEnabled, hasRenderableFrame, focusedMonitorId == nil else { return }
+        guard isUserInteractionEnabled, hasRenderableFrame else { return }
 
         switch recognizer.state {
         case .began:
+            onUserActivity?()
             initialZoom = zoomValue
             initialPanOffset = panOffsetValue
             initialPinchLocation = recognizer.location(in: self)
         case .changed:
+            onUserActivity?()
             let nextZoom = clampedZoom(initialZoom * recognizer.scale)
             let nextPan = anchoredPanOffset(
                 from: initialPanOffset,
@@ -1368,6 +1695,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         super.touchesBegan(touches, with: event)
         guard isUserInteractionEnabled, hasRenderableFrame, trackedTouch == nil else { return }
         guard activeTouchCount(in: event) == 1, let touch = touches.first else { return }
+        onUserActivity?()
 
         trackedTouch = touch
         touchStartLocation = touch.location(in: self)
@@ -1396,6 +1724,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
             cancelTrackedTouch()
             return
         }
+        onUserActivity?()
         let location = trackedTouch.location(in: self)
         if distance(from: touchStartLocation, to: location) > longPressMovementLimit {
             touchMovedBeyondLongPress = true
@@ -1432,6 +1761,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesEnded(touches, with: event)
         guard let trackedTouch, touches.contains(trackedTouch) else { return }
+        onUserActivity?()
         if longPressConsumed || singleFingerViewportPanActive {
             if remoteDragActive, let point = touchLastPoint ?? touchStartPoint {
                 onDragEnd?(point)
@@ -1448,6 +1778,8 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
             if let clickTarget {
                 onClick?(clickTarget)
             }
+        } else if !controlMode, gestureMode == .viewport, distance(from: touchStartLocation, to: trackedTouch.location(in: self)) < dragActivationDistance {
+            registerViewportTap(at: trackedTouch.location(in: self))
         }
         clearTrackedTouch()
     }
@@ -1471,6 +1803,9 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
             }
             if tap.numberOfTapsRequired == 1 {
                 return tap.numberOfTouchesRequired == 1 && gestureMode == .trackpad
+            }
+            if tap.numberOfTapsRequired == 3 {
+                return tap.numberOfTouchesRequired == 1 && gestureMode == .viewport && hasRenderableFrame
             }
             if tap.numberOfTapsRequired == 2 {
                 return gestureMode == .viewport
@@ -1500,9 +1835,6 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         imageView.layer.contentsScale = UIScreen.main.scale
         addSubview(imageView)
 
-        videoLayer.videoGravity = .resize
-        videoLayer.backgroundColor = UIColor.black.cgColor
-        videoLayer.isHidden = true
         layer.addSublayer(videoLayer)
 
         monitorContentLayer.masksToBounds = false
@@ -1562,6 +1894,12 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         doubleTap.numberOfTapsRequired = 2
         doubleTap.delegate = self
 
+        let tripleTap = UITapGestureRecognizer(target: self, action: #selector(handleTripleTap(_:)))
+        tripleTap.numberOfTapsRequired = 3
+        tripleTap.numberOfTouchesRequired = 1
+        tripleTap.delegate = self
+        doubleTap.require(toFail: tripleTap)
+
         let threeFingerTap = UITapGestureRecognizer(target: self, action: #selector(handleThreeFingerTap(_:)))
         threeFingerTap.numberOfTouchesRequired = 3
         threeFingerTap.delegate = self
@@ -1575,9 +1913,17 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
 
         addGestureRecognizer(singleTap)
         addGestureRecognizer(doubleTap)
+        addGestureRecognizer(tripleTap)
         addGestureRecognizer(threeFingerTap)
         addGestureRecognizer(longPress)
         longPressRecognizer = longPress
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleApplicationDidBecomeActive),
+            name: UIApplication.didBecomeActiveNotification,
+            object: nil
+        )
     }
 
     private func setViewport(zoom: Double, panOffset: CGSize, notify: Bool) {
@@ -1605,12 +1951,269 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         return geometry.monitorFrames.first { $0.rect.insetBy(dx: -8, dy: -8).contains(location) }
     }
 
+    private func registerViewportTap(at location: CGPoint) {
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - lastViewportTapUptime <= tripleTapInterval
+            && distance(from: lastViewportTapLocation, to: location) <= tripleTapMovementLimit {
+            viewportTapCount += 1
+        } else {
+            viewportTapCount = 1
+        }
+        lastViewportTapLocation = location
+        lastViewportTapUptime = now
+
+        guard viewportTapCount >= 3 else { return }
+        viewportTapCount = 0
+        guard let descriptor = pipDescriptor(at: location) else { return }
+        showPip(descriptor)
+    }
+
+    private func pipDescriptor(at location: CGPoint) -> PipDescriptor? {
+        guard let geometry = stageGeometry(panOffset: panOffsetValue, zoom: zoomValue) else { return nil }
+
+        if geometry.focusedMonitorId != nil, let frame = geometry.monitorFrames.first {
+            guard geometry.visualFrame.insetBy(dx: -8, dy: -8).contains(location) else { return nil }
+            return makePipDescriptor(
+                sourceBounds: geometry.sourceBounds,
+                sourceRect: visibleSourceRect(for: frame, in: geometry)
+            )
+        }
+
+        if let frame = geometry.monitorFrames.first(where: { $0.rect.insetBy(dx: -8, dy: -8).contains(location) }) {
+            let shouldUseVisibleCrop = geometry.monitorFrames.count <= 1
+            return makePipDescriptor(
+                sourceBounds: geometry.sourceBounds,
+                sourceRect: shouldUseVisibleCrop ? visibleSourceRect(for: frame, in: geometry) : frame.sourceRect
+            )
+        }
+
+        guard geometry.monitorFrames.isEmpty, geometry.visualFrame.insetBy(dx: -8, dy: -8).contains(location) else {
+            return nil
+        }
+        return makePipDescriptor(
+            sourceBounds: geometry.sourceBounds,
+            sourceRect: visibleSourceRect(visualFrame: geometry.visualFrame, visualBounds: geometry.visualBounds)
+        )
+    }
+
+    private func makePipDescriptor(sourceBounds: CGRect, sourceRect: CGRect) -> PipDescriptor? {
+        let crop = sourceRect.intersection(sourceBounds)
+        guard !crop.isNull, crop.width > 1, crop.height > 1 else { return nil }
+        return PipDescriptor(sourceBounds: sourceBounds, sourceRect: crop)
+    }
+
+    private func visibleSourceRect(for frame: RemoteMonitorStageFrame, in geometry: StageGeometry) -> CGRect {
+        let visibleFrame = frame.rotation == 0 ? frame.rect : geometry.visualFrame
+        let visibleRect = bounds.intersection(visibleFrame)
+        guard !visibleRect.isNull, visibleRect.width > 1, visibleRect.height > 1 else {
+            return frame.sourceRect
+        }
+
+        let normalizedPoints = [
+            visibleRect.origin,
+            CGPoint(x: visibleRect.maxX, y: visibleRect.minY),
+            CGPoint(x: visibleRect.minX, y: visibleRect.maxY),
+            CGPoint(x: visibleRect.maxX, y: visibleRect.maxY)
+        ].map { normalizedSourcePoint(for: $0, frame: frame) }
+
+        let minX = max(0, normalizedPoints.map(\.x).min() ?? 0)
+        let maxX = min(1, normalizedPoints.map(\.x).max() ?? 1)
+        let minY = max(0, normalizedPoints.map(\.y).min() ?? 0)
+        let maxY = min(1, normalizedPoints.map(\.y).max() ?? 1)
+        guard maxX > minX, maxY > minY else { return frame.sourceRect }
+
+        return CGRect(
+            x: frame.sourceRect.minX + frame.sourceRect.width * minX,
+            y: frame.sourceRect.minY + frame.sourceRect.height * minY,
+            width: frame.sourceRect.width * (maxX - minX),
+            height: frame.sourceRect.height * (maxY - minY)
+        )
+    }
+
+    private func visibleSourceRect(visualFrame: CGRect, visualBounds: CGRect) -> CGRect {
+        let visibleRect = bounds.intersection(visualFrame)
+        guard !visibleRect.isNull, visibleRect.width > 1, visibleRect.height > 1 else {
+            return visualBounds
+        }
+
+        let minX = max(0, min(1, (visibleRect.minX - visualFrame.minX) / visualFrame.width))
+        let maxX = max(0, min(1, (visibleRect.maxX - visualFrame.minX) / visualFrame.width))
+        let minY = max(0, min(1, (visibleRect.minY - visualFrame.minY) / visualFrame.height))
+        let maxY = max(0, min(1, (visibleRect.maxY - visualFrame.minY) / visualFrame.height))
+        guard maxX > minX, maxY > minY else { return visualBounds }
+
+        return CGRect(
+            x: visualBounds.minX + visualBounds.width * minX,
+            y: visualBounds.minY + visualBounds.height * minY,
+            width: visualBounds.width * (maxX - minX),
+            height: visualBounds.height * (maxY - minY)
+        )
+    }
+
+    private func normalizedSourcePoint(for point: CGPoint, frame: RemoteMonitorStageFrame) -> CGPoint {
+        let localPoint: CGPoint
+        if frame.rotation == 0 {
+            localPoint = point
+        } else {
+            let center = frame.rect.center
+            let dx = point.x - center.x
+            let dy = point.y - center.y
+            let inverseRotation = -Double(frame.rotation)
+            let cosine = CGFloat(cos(inverseRotation))
+            let sine = CGFloat(sin(inverseRotation))
+            localPoint = CGPoint(
+                x: center.x + dx * cosine - dy * sine,
+                y: center.y + dx * sine + dy * cosine
+            )
+        }
+
+        guard frame.rect.width > 0, frame.rect.height > 0 else {
+            return CGPoint(x: 0.5, y: 0.5)
+        }
+        return CGPoint(
+            x: (localPoint.x - frame.rect.minX) / frame.rect.width,
+            y: (localPoint.y - frame.rect.minY) / frame.rect.height
+        )
+    }
+
+    private func showPip(_ descriptor: PipDescriptor) {
+        guard AVPictureInPictureController.isPictureInPictureSupported() else { return }
+        preparePictureInPictureSession()
+        preparePictureInPictureContentIfNeeded()
+        configurePictureInPictureContent(descriptor)
+
+        if pictureInPictureController == nil, let contentController = pictureInPictureContentController {
+            let contentSource = AVPictureInPictureController.ContentSource(
+                activeVideoCallSourceView: self,
+                contentViewController: contentController
+            )
+            let controller = AVPictureInPictureController(contentSource: contentSource)
+            controller.delegate = self
+            controller.canStartPictureInPictureAutomaticallyFromInline = true
+            pictureInPictureController = controller
+        }
+
+        guard let controller = pictureInPictureController else { return }
+        if controller.isPictureInPictureActive || controller.isPictureInPictureSuspended {
+            return
+        }
+        controller.startPictureInPicture()
+    }
+
+    private func preparePictureInPictureContentIfNeeded() {
+        guard pictureInPictureContentController == nil || pictureInPictureContentView == nil else { return }
+
+        let contentController = AVPictureInPictureVideoCallViewController()
+        contentController.view.backgroundColor = .black
+
+        let contentView = SystemPictureInPictureContentView()
+        contentView.translatesAutoresizingMaskIntoConstraints = false
+        contentController.view.addSubview(contentView)
+        NSLayoutConstraint.activate([
+            contentView.leadingAnchor.constraint(equalTo: contentController.view.leadingAnchor),
+            contentView.trailingAnchor.constraint(equalTo: contentController.view.trailingAnchor),
+            contentView.topAnchor.constraint(equalTo: contentController.view.topAnchor),
+            contentView.bottomAnchor.constraint(equalTo: contentController.view.bottomAnchor)
+        ])
+
+        pictureInPictureContentController = contentController
+        pictureInPictureContentView = contentView
+    }
+
+    private func configurePictureInPictureContent(_ descriptor: PipDescriptor) {
+        pictureInPictureContentController?.preferredContentSize = preferredPictureInPictureContentSize(for: descriptor.sourceRect)
+        pictureInPictureContentView?.configure(sourceBounds: descriptor.sourceBounds, sourceRect: descriptor.sourceRect)
+
+        if let latestImage {
+            pictureInPictureContentView?.presentImage(latestImage)
+        } else if videoActive {
+            pictureInPictureContentView?.prepareForVideo()
+        } else {
+            pictureInPictureContentView?.presentImage(nil)
+        }
+    }
+
+    private func preferredPictureInPictureContentSize(for sourceRect: CGRect) -> CGSize {
+        let aspectRatio = sourceRect.width > 1 && sourceRect.height > 1
+            ? sourceRect.width / sourceRect.height
+            : 16.0 / 9.0
+        let longEdge: CGFloat = 480
+        let shortEdgeFloor: CGFloat = 120
+
+        if aspectRatio >= 1 {
+            let width = longEdge
+            let height = max(shortEdgeFloor, width / aspectRatio)
+            return CGSize(width: width.rounded(), height: height.rounded())
+        }
+
+        let height = longEdge
+        let width = max(shortEdgeFloor, height * aspectRatio)
+        return CGSize(width: width.rounded(), height: height.rounded())
+    }
+
+    private func preparePictureInPictureSession() {
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers])
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch {}
+    }
+
+    private func releasePictureInPictureContent() {
+        pictureInPictureController?.delegate = nil
+        pictureInPictureController = nil
+        pictureInPictureContentController = nil
+        pictureInPictureContentView = nil
+    }
+
+    private func stopPictureInPictureForForegroundReturn() {
+        guard let controller = pictureInPictureController else { return }
+        if controller.isPictureInPictureActive || controller.isPictureInPictureSuspended {
+            controller.stopPictureInPicture()
+        } else {
+            releasePictureInPictureContent()
+        }
+    }
+
+    func pictureInPictureController(
+        _ pictureInPictureController: AVPictureInPictureController,
+        failedToStartPictureInPictureWithError error: Error
+    ) {
+        releasePictureInPictureContent()
+    }
+
+    func pictureInPictureControllerDidStopPictureInPicture(
+        _ pictureInPictureController: AVPictureInPictureController
+    ) {
+        releasePictureInPictureContent()
+    }
+
+    func pictureInPictureController(
+        _ pictureInPictureController: AVPictureInPictureController,
+        restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void
+    ) {
+        completionHandler(true)
+    }
+
     private func flushVideoLayer(removeImage: Bool) {
         if removeImage {
             videoLayer.sampleBufferRenderer.flush(removingDisplayedImage: true) {}
         } else {
             videoLayer.sampleBufferRenderer.flush()
         }
+    }
+
+    private func resetPrimaryVideoLayer() {
+        let wasHidden = videoLayer.isHidden
+        let frame = videoLayer.frame
+        let contentsRect = videoLayer.contentsRect
+        videoLayer.removeFromSuperlayer()
+
+        let nextLayer = Self.makeVideoLayer()
+        nextLayer.isHidden = wasHidden
+        nextLayer.frame = frame
+        nextLayer.contentsRect = contentsRect
+        videoLayer = nextLayer
+        layer.insertSublayer(nextLayer, below: monitorContentLayer)
     }
 
     private func anchoredPanOffset(from panOffset: CGSize, oldZoom: Double, newZoom: Double, anchor: CGPoint) -> CGSize {
@@ -1664,10 +2267,12 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
         updateMonitorOverlay(frames: geometry.monitorFrames)
     }
 
-    private func updateMonitorVideoLayers(geometry: StageGeometry, sampleBuffer: CMSampleBuffer? = nil) {
+    @discardableResult
+    private func updateMonitorVideoLayers(geometry: StageGeometry, sampleBuffer: CMSampleBuffer? = nil) -> Bool {
         monitorContentLayer.isHidden = false
         let activeIds = Set(geometry.monitorFrames.map(\.id))
         removeInactiveMonitorLayers(activeIds: activeIds)
+        var didEnqueue = false
 
         for frame in geometry.monitorFrames {
             let layers = monitorLayers[frame.id] ?? makeMonitorLayers(for: frame.id)
@@ -1677,13 +2282,15 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
             applyMonitorContentFrame(frame, to: layers.videoContainerLayer)
             layers.videoLayer.frame = videoLayerFrame(for: frame, sourceBounds: geometry.sourceBounds)
             if let sampleBuffer, let copiedSampleBuffer = deepCopySampleBuffer(sampleBuffer) {
-                if layers.videoLayer.sampleBufferRenderer.status == .failed {
+                if layers.videoLayer.sampleBufferRenderer.status == .failed || layers.videoLayer.sampleBufferRenderer.requiresFlushToResumeDecoding {
                     layers.resetVideoLayer()
                     layers.videoLayer.frame = videoLayerFrame(for: frame, sourceBounds: geometry.sourceBounds)
                 }
-                enqueue(copiedSampleBuffer, on: layers.videoLayer)
+                didEnqueue = enqueue(copiedSampleBuffer, on: layers.videoLayer) || didEnqueue
             }
         }
+
+        return didEnqueue
     }
 
     private func applyMonitorContentFrame(_ frame: RemoteMonitorStageFrame, to layer: CALayer) {
@@ -1696,15 +2303,35 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
             : CATransform3DMakeRotation(frame.rotation, 0, 0, 1)
     }
 
-    private func enqueue(_ sampleBuffer: CMSampleBuffer, on layer: AVSampleBufferDisplayLayer) {
+    private func enqueuePrimaryVideo(_ sampleBuffer: CMSampleBuffer) -> Bool {
+        let renderer = videoLayer.sampleBufferRenderer
+        if renderer.status == .failed || renderer.requiresFlushToResumeDecoding {
+            resetPrimaryVideoLayer()
+        }
+
+        if enqueue(sampleBuffer, on: videoLayer) {
+            primaryVideoDropCount = 0
+            return true
+        }
+
+        primaryVideoDropCount += 1
+        guard primaryVideoDropCount >= videoLayerDropResetThreshold else { return false }
+
+        primaryVideoDropCount = 0
+        resetPrimaryVideoLayer()
+        return enqueue(sampleBuffer, on: videoLayer)
+    }
+
+    private func enqueue(_ sampleBuffer: CMSampleBuffer, on layer: AVSampleBufferDisplayLayer) -> Bool {
         let renderer = layer.sampleBufferRenderer
         if renderer.status == .failed || renderer.requiresFlushToResumeDecoding {
             renderer.flush()
         }
         if !renderer.isReadyForMoreMediaData {
-            return
+            return false
         }
         renderer.enqueue(sampleBuffer)
+        return true
     }
 
     private func deepCopySampleBuffer(_ sampleBuffer: CMSampleBuffer) -> CMSampleBuffer? {
@@ -1899,8 +2526,8 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
                 : CGSize(width: visualBounds.height, height: visualBounds.width)
             let frame = pixelAligned(contentFrame(
                 for: frameSize,
-                panOffset: .zero,
-                zoom: RemoteViewportSettings.minimumZoom
+                panOffset: panOffset,
+                zoom: zoom
             ))
             let layerSize = rotation == 0
                 ? frame.size
@@ -2066,7 +2693,7 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     }
 
     private func handleOneFingerViewportPan(to location: CGPoint) {
-        guard hasRenderableFrame, focusedMonitorId == nil else { return }
+        guard hasRenderableFrame else { return }
         let translation = CGSize(
             width: location.x - touchStartLocation.x,
             height: location.y - touchStartLocation.y
@@ -2106,7 +2733,6 @@ private final class RemoteStageSurfaceView: UIView, UIGestureRecognizerDelegate 
     }
 
     private func clampedPanOffset(_ offset: CGSize) -> CGSize {
-        guard focusedMonitorId == nil else { return .zero }
         guard hasRenderableFrame, let geometry = stageGeometry(panOffset: .zero, zoom: zoomValue), zoomValue > 1.01 else {
             return .zero
         }
@@ -2403,191 +3029,179 @@ private struct RemoteMonitorStageFrame: Identifiable {
 struct RemoteCommandDock: View {
     let client: RemoteDesktopClient
     let mode: RemoteMode
-    let gestureMode: RemoteGestureMode
-    let streamProfile: RemoteStreamProfile
     let monitorActive: Bool
     let monitorCount: Int
     let keyboardFocused: Bool
     let controlAvailable: Bool
-    let telemetry: RemoteTelemetrySnapshot
+    let scrollToTrailingOnAppear: Bool
     let actions: [RemoteActionDescriptor]
+    let onActivity: () -> Void
+    let onRefresh: () -> Void
     let onControlToggle: () -> Void
-    let onGestureModeChange: (RemoteGestureMode) -> Void
     let onMonitorToggle: () -> Void
     let onKeyboardToggle: () -> Void
-    let onStreamProfileChange: (RemoteStreamProfile) -> Void
-    let onResetViewport: () -> Void
 
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                RemoteCommandStatusChip(
-                    state: telemetry.state,
-                    telemetry: telemetry,
-                    controlAvailable: controlAvailable
-                )
+        GeometryReader { proxy in
+            ScrollViewReader { scrollProxy in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        RemoteCommandButton(
+                            systemName: "rectangle.on.rectangle",
+                            title: monitorCount > 1 ? "\(monitorCount) Views" : "Views",
+                            isActive: monitorActive,
+                            accessibilityLabel: monitorCount > 1 ? "Choose visible monitors" : "Show monitor layout",
+                            action: perform(onMonitorToggle)
+                        )
 
-                RemoteCommandButton(
-                    systemName: mode == .control ? "cursorarrow.rays" : "eye",
-                    title: mode.title,
-                    isActive: mode == .control,
-                    accessibilityLabel: mode == .control ? "Switch to view mode" : "Switch to control mode",
-                    action: onControlToggle
-                )
+                        RemoteCommandButton(
+                            systemName: "arrow.clockwise",
+                            title: "Refresh",
+                            minWidth: 64,
+                            accessibilityLabel: "Refresh remote stream",
+                            action: perform(onRefresh)
+                        )
 
-                RemoteGestureModeMenu(selection: gestureMode, onChange: onGestureModeChange)
+                        RemoteCommandButton(
+                            systemName: keyboardFocused ? "keyboard.chevron.compact.down" : "keyboard",
+                            title: keyboardFocused ? "Hide" : "Keys",
+                            isActive: keyboardFocused,
+                            accessibilityLabel: keyboardFocused ? "Hide remote keyboard" : "Show remote keyboard",
+                            action: perform(onKeyboardToggle)
+                        )
 
-                RemoteCommandButton(
-                    systemName: keyboardFocused ? "keyboard.chevron.compact.down" : "keyboard",
-                    title: keyboardFocused ? "Hide" : "Keys",
-                    isActive: keyboardFocused,
-                    accessibilityLabel: keyboardFocused ? "Hide remote keyboard" : "Show remote keyboard",
-                    action: onKeyboardToggle
-                )
+                        RemoteCommandButton(
+                            systemName: "arrow.up",
+                            title: "Up",
+                            isDisabled: inputDisabled,
+                            accessibilityLabel: "Scroll up"
+                        ) {
+                            onActivity()
+                            client.sendWheel(deltaY: -360)
+                        }
 
-                RemoteCommandButton(
-                    systemName: "rectangle.on.rectangle",
-                    title: monitorCount > 1 ? "\(monitorCount) Views" : "Views",
-                    isActive: monitorActive,
-                    accessibilityLabel: monitorCount > 1 ? "Choose visible monitors" : "Show monitor layout",
-                    action: onMonitorToggle
-                )
+                        RemoteCommandButton(
+                            systemName: "arrow.down",
+                            title: "Down",
+                            isDisabled: inputDisabled,
+                            accessibilityLabel: "Scroll down"
+                        ) {
+                            onActivity()
+                            client.sendWheel(deltaY: 360)
+                        }
 
-                RemoteStreamProfileMenu(selection: streamProfile, onChange: onStreamProfileChange)
+                        RemoteShortcutCommandMenu(
+                            client: client,
+                            actions: actions,
+                            isDisabled: inputDisabled,
+                            onActivity: onActivity
+                        )
 
-                RemoteShortcutCommandMenu(
-                    client: client,
-                    actions: actions,
-                    isDisabled: inputDisabled
-                )
+                        RemoteCommandButton(
+                            systemName: "xmark.circle",
+                            title: "Esc",
+                            isDisabled: inputDisabled,
+                            accessibilityLabel: "Escape"
+                        ) {
+                            onActivity()
+                            client.sendKey("Escape", code: "Escape")
+                        }
 
-                RemoteCommandButton(
-                    systemName: "arrow.up",
-                    title: "Up",
-                    isDisabled: inputDisabled,
-                    accessibilityLabel: "Scroll up"
-                ) {
-                    client.sendWheel(deltaY: -360)
+                        Spacer(minLength: 8)
+
+                        RemoteControlModeButton(
+                            client: client,
+                            mode: mode,
+                            controlAvailable: controlAvailable,
+                            onActivity: onActivity,
+                            onToggle: onControlToggle
+                        )
+                        .id(Self.controlButtonScrollID)
+                    }
+                    .padding(.horizontal, RemoteChromeSpacing.edgeInset)
+                    .padding(.top, 6)
+                    .frame(minWidth: proxy.size.width, minHeight: RemoteChromeSpacing.commandDockHeight, alignment: .bottom)
                 }
-
-                RemoteCommandButton(
-                    systemName: "arrow.down",
-                    title: "Down",
-                    isDisabled: inputDisabled,
-                    accessibilityLabel: "Scroll down"
-                ) {
-                    client.sendWheel(deltaY: 360)
+                .onAppear {
+                    scrollTrailingIfNeeded(scrollProxy)
                 }
-
-                RemoteCommandButton(
-                    systemName: "xmark.circle",
-                    title: "Esc",
-                    isDisabled: inputDisabled,
-                    accessibilityLabel: "Escape"
-                ) {
-                    client.sendKey("Escape", code: "Escape")
+                .onChange(of: scrollToTrailingOnAppear) { _, _ in
+                    scrollTrailingIfNeeded(scrollProxy)
                 }
-
-                RemoteCommandButton(
-                    systemName: "arrow.right.to.line",
-                    title: "Tab",
-                    isDisabled: inputDisabled,
-                    accessibilityLabel: "Tab"
-                ) {
-                    client.sendKey("Tab", code: "Tab")
+                .onChange(of: proxy.size.width) { _, _ in
+                    scrollTrailingIfNeeded(scrollProxy)
                 }
-
-                RemoteCommandButton(
-                    systemName: "scope",
-                    title: "Fit",
-                    accessibilityLabel: "Reset view",
-                    action: onResetViewport
-                )
+                .onChange(of: keyboardFocused) { _, _ in
+                    scrollTrailingIfNeeded(scrollProxy)
+                }
             }
-            .padding(.horizontal, 1)
         }
-        .padding(10)
+        .frame(maxWidth: .infinity)
         .frame(height: RemoteChromeSpacing.commandDockHeight)
-        .remoteFloatingSurface(cornerRadius: 24)
     }
 
     private var inputDisabled: Bool {
         mode != .control || !controlAvailable
     }
 
+    private func perform(_ action: @escaping () -> Void) -> () -> Void {
+        {
+            onActivity()
+            action()
+        }
+    }
+
+    private static let controlButtonScrollID = "remote-command-dock-control"
+
+    private func scrollTrailingIfNeeded(_ proxy: ScrollViewProxy) {
+        guard scrollToTrailingOnAppear else { return }
+        DispatchQueue.main.async {
+            proxy.scrollTo(Self.controlButtonScrollID, anchor: .trailing)
+        }
+    }
+
 }
 
-struct RemoteCommandStatusChip: View {
-    let state: RemoteConnectionState
+struct RemoteTelemetryReadout: View {
     let telemetry: RemoteTelemetrySnapshot
-    let controlAvailable: Bool
 
     var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: iconName)
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(iconColor)
-                .frame(width: 18)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.caption.weight(.bold))
-                    .lineLimit(1)
-                Text(detail)
-                    .font(.caption2.monospacedDigit().weight(.semibold))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-        }
-        .padding(.horizontal, 10)
-        .frame(height: 44)
-        .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(Color(uiColor: .tertiarySystemBackground).opacity(0.96))
-        )
-        .overlay {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(.white.opacity(0.14), lineWidth: 1)
-        }
-        .accessibilityLabel("\(title), \(detail)")
+        Text(readoutText)
+            .font(.caption.monospacedDigit().weight(.heavy))
+            .foregroundStyle(readoutColor)
+            .shadow(color: .black.opacity(0.95), radius: 2, x: 0, y: 1)
+            .lineLimit(1)
+            .accessibilityLabel(accessibilityText)
     }
 
-    private var title: String {
-        switch state {
-        case .failed:
-            return "Attention"
-        default:
-            return state.title
-        }
+    private var readoutText: String {
+        "\(fpsText) \(latencyText)"
     }
 
-    private var detail: String {
+    private var accessibilityText: String {
+        "Remote performance, \(fpsText), \(latencyText)"
+    }
+
+    private var fpsText: String {
         let fps = telemetry.presentedFps > 0.1 ? telemetry.presentedFps : telemetry.receivedFps
-        let fpsText = fps > 0.1 ? "\(Int(round(fps)))fps" : "--fps"
-        let inputText: String
+        return fps > 0.1 ? "\(Int(round(fps)))fps" : "--fps"
+    }
+
+    private var latencyText: String {
         if let rtt = telemetry.inputRttMs {
-            inputText = "\(Int(round(rtt)))ms"
-        } else {
-            inputText = controlAvailable ? "input" : "view"
+            return "\(Int(round(rtt)))ms"
         }
-        return "\(fpsText) \(inputText)"
+        if let latency = telemetry.latency {
+            return "\(Int(round(latency)))ms"
+        }
+        if telemetry.renderMs > 0.1 {
+            return "\(Int(round(telemetry.renderMs)))ms"
+        }
+        return "--ms"
     }
 
-    private var iconName: String {
-        switch state {
-        case .connected:
-            return "dot.radiowaves.left.and.right"
-        case .connecting:
-            return "antenna.radiowaves.left.and.right"
-        case .failed:
-            return "exclamationmark.triangle.fill"
-        case .disconnected:
-            return "pause.circle"
-        }
-    }
-
-    private var iconColor: Color {
-        switch state {
+    private var readoutColor: Color {
+        switch telemetry.state {
         case .connected:
             return .green
         case .connecting:
@@ -2619,25 +3233,103 @@ struct RemoteCommandButton: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.75)
             }
-            .foregroundStyle(isActive ? .white : .primary)
+            .foregroundStyle(isActive ? .white : .white.opacity(0.9))
             .frame(minWidth: minWidth)
             .frame(height: 44)
             .padding(.horizontal, 2)
-            .background(buttonBackground)
-            .overlay {
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .stroke(.white.opacity(isActive ? 0.24 : 0.12), lineWidth: 1)
-            }
+            .remoteCommandBubbleSurface(cornerRadius: 16, isActive: isActive)
         }
         .buttonStyle(.plain)
         .disabled(isDisabled)
         .opacity(isDisabled ? 0.44 : 1)
         .accessibilityLabel(accessibilityLabel)
     }
+}
 
-    private var buttonBackground: some View {
-        RoundedRectangle(cornerRadius: 16, style: .continuous)
-            .fill(isActive ? Color.accentColor : Color(uiColor: .tertiarySystemBackground).opacity(0.98))
+struct RemoteControlModeButton: View {
+    let client: RemoteDesktopClient
+    let mode: RemoteMode
+    let controlAvailable: Bool
+    let onActivity: () -> Void
+    let onToggle: () -> Void
+
+    @State private var lastDragTranslation = CGSize.zero
+
+    var body: some View {
+        if inputDisabled {
+            buttonSurface
+        } else {
+            buttonSurface
+                .highPriorityGesture(trackpadDrag)
+                .contextMenu {
+                    Button {
+                        onActivity()
+                        client.sendClick(button: "left")
+                    } label: {
+                        Label("Left", systemImage: "cursorarrow.click")
+                    }
+
+                    Button {
+                        onActivity()
+                        client.sendClick(button: "right")
+                    } label: {
+                        Label("Right", systemImage: "cursorarrow")
+                    }
+
+                    Button {
+                        onActivity()
+                        client.sendDoubleClick()
+                    } label: {
+                        Label("Double Left", systemImage: "cursorarrow.click")
+                    }
+                }
+        }
+    }
+
+    private var buttonSurface: some View {
+        RemoteCommandMenuLabel(
+            systemName: mode == .control ? "cursorarrow" : "eye",
+            title: mode.title,
+            isActive: mode == .control,
+            minWidth: 68
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .onTapGesture {
+            onActivity()
+            onToggle()
+        }
+        .accessibilityLabel(mode == .control ? "Switch to view mode" : "Switch to control mode")
+        .accessibilityHint(mode == .control ? "Drag to move the remote pointer. Long press for click actions." : "Tap to enter control mode.")
+    }
+
+    private var inputDisabled: Bool {
+        mode != .control || !controlAvailable
+    }
+
+    private var trackpadDrag: some Gesture {
+        DragGesture(minimumDistance: 4, coordinateSpace: .local)
+            .onChanged { value in
+                guard !inputDisabled else { return }
+                onActivity()
+                let delta = CGSize(
+                    width: value.translation.width - lastDragTranslation.width,
+                    height: value.translation.height - lastDragTranslation.height
+                )
+                lastDragTranslation = value.translation
+
+                guard abs(delta.width) > 0.1 || abs(delta.height) > 0.1 else { return }
+                client.nudgePointer(
+                    dx: delta.width / pointerDragScale,
+                    dy: delta.height / pointerDragScale
+                )
+            }
+            .onEnded { _ in
+                lastDragTranslation = .zero
+            }
+    }
+
+    private var pointerDragScale: CGFloat {
+        900
     }
 }
 
@@ -2656,70 +3348,11 @@ struct RemoteCommandMenuLabel: View {
                 .lineLimit(1)
                 .minimumScaleFactor(0.72)
         }
-        .foregroundStyle(isActive ? .white : .primary)
+        .foregroundStyle(isActive ? .white : .white.opacity(0.9))
         .frame(minWidth: minWidth)
         .frame(height: 44)
         .padding(.horizontal, 2)
-        .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(isActive ? Color.accentColor : Color(uiColor: .tertiarySystemBackground).opacity(0.98))
-        )
-        .overlay {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(.white.opacity(isActive ? 0.24 : 0.12), lineWidth: 1)
-        }
-    }
-}
-
-struct RemoteGestureModeMenu: View {
-    let selection: RemoteGestureMode
-    let onChange: (RemoteGestureMode) -> Void
-
-    var body: some View {
-        Menu {
-            ForEach(RemoteGestureMode.allCases) { mode in
-                Button {
-                    onChange(mode)
-                } label: {
-                    Label(mode.title, systemImage: mode == selection ? "checkmark" : mode.systemImage)
-                }
-            }
-        } label: {
-            RemoteCommandMenuLabel(
-                systemName: selection.systemImage,
-                title: selection.title,
-                isActive: selection != .viewport,
-                minWidth: 74
-            )
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Touch mode")
-    }
-}
-
-struct RemoteStreamProfileMenu: View {
-    let selection: RemoteStreamProfile
-    let onChange: (RemoteStreamProfile) -> Void
-
-    var body: some View {
-        Menu {
-            ForEach(RemoteStreamProfile.allCases) { profile in
-                Button {
-                    onChange(profile)
-                } label: {
-                    Label(profile.title, systemImage: profile == selection ? "checkmark" : profile.systemImage)
-                }
-            }
-        } label: {
-            RemoteCommandMenuLabel(
-                systemName: selection.systemImage,
-                title: selection.title,
-                isActive: false,
-                minWidth: 76
-            )
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Stream profile")
+        .remoteCommandBubbleSurface(cornerRadius: 16, isActive: isActive)
     }
 }
 
@@ -2727,20 +3360,25 @@ struct RemoteShortcutCommandMenu: View {
     let client: RemoteDesktopClient
     let actions: [RemoteActionDescriptor]
     let isDisabled: Bool
+    let onActivity: () -> Void
 
     var body: some View {
         Menu {
-            if actions.isEmpty {
-                ForEach(RemoteShortcut.allCases) { shortcut in
-                    Button {
-                        client.sendShortcut(shortcut)
-                    } label: {
-                        Label(shortcut.title, systemImage: shortcut.systemImage)
-                    }
+            ForEach(RemoteShortcut.allCases) { shortcut in
+                Button {
+                    onActivity()
+                    client.sendShortcut(shortcut)
+                } label: {
+                    Label(shortcut.title, systemImage: shortcut.systemImage)
                 }
-            } else {
-                ForEach(actions) { action in
+            }
+
+            if !customActions.isEmpty {
+                Divider()
+
+                ForEach(customActions) { action in
                     Button {
+                        onActivity()
                         client.sendAction(action)
                     } label: {
                         Label(action.label, systemImage: systemImage(for: action.id))
@@ -2756,24 +3394,82 @@ struct RemoteShortcutCommandMenu: View {
         .accessibilityLabel("Remote shortcuts")
     }
 
+    private var customActions: [RemoteActionDescriptor] {
+        actions.filter { RemoteShortcut(rawValue: $0.id) == nil }
+    }
+
     private func systemImage(for actionId: String) -> String {
         switch actionId {
         case "copy":
             return "doc.on.doc"
         case "paste":
             return "clipboard"
+        case "cut":
+            return "scissors"
+        case "undo":
+            return "arrow.uturn.backward"
+        case "redo":
+            return "arrow.uturn.forward"
         case "selectAll":
             return "textformat"
+        case "find", "search":
+            return "magnifyingglass"
+        case "save":
+            return "square.and.arrow.down"
+        case "print":
+            return "printer"
+        case "newTab":
+            return "plus.square.on.square"
+        case "closeTab":
+            return "xmark.square"
+        case "nextTab":
+            return "arrow.right.square"
+        case "previousTab":
+            return "arrow.left.square"
+        case "reopenClosedTab":
+            return "arrow.uturn.backward"
+        case "newWindow":
+            return "plus.rectangle"
+        case "addressBar":
+            return "link"
+        case "browserBack":
+            return "chevron.backward"
+        case "browserForward":
+            return "chevron.forward"
         case "altTab", "winTab":
             return "rectangle.stack"
+        case "altShiftTab":
+            return "rectangle.stack.badge.minus"
         case "showDesktop":
             return "desktopcomputer"
         case "taskManager":
             return "speedometer"
+        case "runDialog":
+            return "terminal"
+        case "fileExplorer":
+            return "folder"
+        case "settings":
+            return "gearshape"
+        case "clipboardHistory":
+            return "clipboard"
+        case "minimizeAll":
+            return "rectangle.compress.vertical"
+        case "restoreWindows":
+            return "rectangle.expand.vertical"
         case "lock":
             return "lock"
         case "screenshot":
             return "camera.viewfinder"
+        case "screenSnip":
+            return "crop"
+        case "devTools":
+            return "hammer"
+        case "properties":
+            return "info.circle"
+        case "windowMenu":
+            return "list.bullet"
+        case "closeWindow":
+            return "xmark.rectangle"
         default:
             return "command"
         }
@@ -3838,16 +4534,18 @@ struct RemoteShortcutMenu: View {
 
     var body: some View {
         Menu {
-            if actions.isEmpty {
-                ForEach(RemoteShortcut.allCases) { shortcut in
-                    Button {
-                        client.sendShortcut(shortcut)
-                    } label: {
-                        Label(shortcut.title, systemImage: shortcut.systemImage)
-                    }
+            ForEach(RemoteShortcut.allCases) { shortcut in
+                Button {
+                    client.sendShortcut(shortcut)
+                } label: {
+                    Label(shortcut.title, systemImage: shortcut.systemImage)
                 }
-            } else {
-                ForEach(actions) { action in
+            }
+
+            if !customActions.isEmpty {
+                Divider()
+
+                ForEach(customActions) { action in
                     Button {
                         client.sendAction(action)
                     } label: {
@@ -3864,24 +4562,82 @@ struct RemoteShortcutMenu: View {
         .accessibilityLabel("Remote shortcuts")
     }
 
+    private var customActions: [RemoteActionDescriptor] {
+        actions.filter { RemoteShortcut(rawValue: $0.id) == nil }
+    }
+
     private func systemImage(for actionId: String) -> String {
         switch actionId {
         case "copy":
             return "doc.on.doc"
         case "paste":
             return "clipboard"
+        case "cut":
+            return "scissors"
+        case "undo":
+            return "arrow.uturn.backward"
+        case "redo":
+            return "arrow.uturn.forward"
         case "selectAll":
             return "textformat"
+        case "find", "search":
+            return "magnifyingglass"
+        case "save":
+            return "square.and.arrow.down"
+        case "print":
+            return "printer"
+        case "newTab":
+            return "plus.square.on.square"
+        case "closeTab":
+            return "xmark.square"
+        case "nextTab":
+            return "arrow.right.square"
+        case "previousTab":
+            return "arrow.left.square"
+        case "reopenClosedTab":
+            return "arrow.uturn.backward"
+        case "newWindow":
+            return "plus.rectangle"
+        case "addressBar":
+            return "link"
+        case "browserBack":
+            return "chevron.backward"
+        case "browserForward":
+            return "chevron.forward"
         case "altTab", "winTab":
             return "rectangle.stack"
+        case "altShiftTab":
+            return "rectangle.stack.badge.minus"
         case "showDesktop":
             return "desktopcomputer"
         case "taskManager":
             return "speedometer"
+        case "runDialog":
+            return "terminal"
+        case "fileExplorer":
+            return "folder"
+        case "settings":
+            return "gearshape"
+        case "clipboardHistory":
+            return "clipboard"
+        case "minimizeAll":
+            return "rectangle.compress.vertical"
+        case "restoreWindows":
+            return "rectangle.expand.vertical"
         case "lock":
             return "lock"
         case "screenshot":
             return "camera.viewfinder"
+        case "screenSnip":
+            return "crop"
+        case "devTools":
+            return "hammer"
+        case "properties":
+            return "info.circle"
+        case "windowMenu":
+            return "list.bullet"
+        case "closeWindow":
+            return "xmark.rectangle"
         default:
             return "command"
         }
@@ -3943,6 +4699,24 @@ struct RemoteIconButton: View {
 }
 
 private extension View {
+    func remoteCommandBubbleSurface(cornerRadius: CGFloat, isActive: Bool) -> some View {
+        self
+            .background {
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .fill(.ultraThinMaterial)
+                    .opacity(isActive ? 0.72 : 0.34)
+            }
+            .background {
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .fill(isActive ? Color.accentColor.opacity(0.42) : Color.white.opacity(0.07))
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .stroke(.white.opacity(isActive ? 0.36 : 0.18), lineWidth: 1)
+            }
+            .shadow(color: .black.opacity(isActive ? 0.18 : 0.10), radius: 10, x: 0, y: 4)
+    }
+
     func remoteFloatingSurface(cornerRadius: CGFloat, shadow: Bool = true) -> some View {
         self
             .background(

@@ -45,6 +45,11 @@ enum RemoteStreamTransport: String {
     case video
 }
 
+enum RemoteStreamStallKind {
+    case receive
+    case render
+}
+
 struct RemoteRenderDiagnostics: Equatable {
     var decodeMs: Double = 0
     var renderMs: Double = 0
@@ -132,6 +137,10 @@ final class RemoteDesktopClient {
     @ObservationIgnored private var streamTransport: RemoteStreamTransport = .video
     @ObservationIgnored private var videoUsesAccessUnitFraming = false
     @ObservationIgnored private var h264Decoder = RemoteH264AnnexBDecoder()
+    @ObservationIgnored private var connectedAt: TimeInterval = 0
+    @ObservationIgnored private var firstFrameReceivedAt: TimeInterval = 0
+    @ObservationIgnored private var lastFrameReceivedAt: TimeInterval = 0
+    @ObservationIgnored private var lastFramePresentedAt: TimeInterval = 0
     private var lastControlPromptAt: TimeInterval = 0
     private let monitorLayoutSendInterval: TimeInterval = 1.0 / 30.0
     private var lastMonitorLayoutSendAt: TimeInterval = 0
@@ -149,6 +158,7 @@ final class RemoteDesktopClient {
         baseURL: URL,
         desiredMode: RemoteMode,
         streamProfile: RemoteStreamProfile,
+        transport: RemoteStreamTransport = .video,
         visibleMonitorIds: Set<String> = [],
         monitorLayoutOffsets: [String: CGSize] = [:]
     ) {
@@ -156,10 +166,11 @@ final class RemoteDesktopClient {
 
         do {
             let api = OnlineCLIAPI(baseURL: baseURL)
+            let requestedFps = transport == .video ? streamProfile.videoFps : streamProfile.fps
             var queryItems = [
                 URLQueryItem(name: "mode", value: desiredMode.rawValue),
-                URLQueryItem(name: "transport", value: "video"),
-                URLQueryItem(name: "fps", value: "\(streamProfile.videoFps)"),
+                URLQueryItem(name: "transport", value: transport.rawValue),
+                URLQueryItem(name: "fps", value: "\(requestedFps)"),
                 URLQueryItem(name: "quality", value: "\(streamProfile.jpegQuality)")
             ]
             if !visibleMonitorIds.isEmpty {
@@ -175,7 +186,12 @@ final class RemoteDesktopClient {
             currentURL = url
             mode = desiredMode
             self.streamProfile = streamProfile
+            streamTransport = transport
             connectionState = .connecting
+            connectedAt = 0
+            firstFrameReceivedAt = 0
+            lastFrameReceivedAt = 0
+            lastFramePresentedAt = 0
             statusText = "Opening remote stream"
 
             let task = URLSession.shared.webSocketTask(with: url)
@@ -209,6 +225,10 @@ final class RemoteDesktopClient {
         h264Decoder.reset()
         streamTransport = .video
         videoUsesAccessUnitFraming = false
+        connectedAt = 0
+        firstFrameReceivedAt = 0
+        lastFrameReceivedAt = 0
+        lastFramePresentedAt = 0
         webSocketTask?.cancel(with: .goingAway, reason: nil)
         webSocketTask = nil
         frameImage = nil
@@ -442,10 +462,10 @@ final class RemoteDesktopClient {
             if let rawMode = payload["mode"] as? String, let nextMode = RemoteMode(rawValue: rawMode) {
                 mode = nextMode
             }
-            connectionState = .connected
+            markConnected()
             setStatusText(controlAllowed ? "Control available" : "View only")
         case "remote-stream-connected":
-            connectionState = .connected
+            markConnected()
             setStatusText("Stream connected")
         case "remote-stream-config":
             if let transport = streamTransportValue(payload["transport"]) {
@@ -541,9 +561,7 @@ final class RemoteDesktopClient {
             sequence: videoSequence,
             receivedAt: sample.receivedAt
         ))
-        if connectionState != .connected {
-            connectionState = .connected
-        }
+        markConnected()
     }
 
     private func enqueueFrameData(_ data: Data) {
@@ -625,9 +643,7 @@ final class RemoteDesktopClient {
             decodeMs: frame.decodeMs,
             receivedAt: frame.receivedAt
         ))
-        if connectionState != .connected {
-            connectionState = .connected
-        }
+        markConnected()
         considerAdaptiveStream()
     }
 
@@ -657,6 +673,7 @@ final class RemoteDesktopClient {
 
     func recordFramePresented(renderMs: Double) {
         let now = ProcessInfo.processInfo.systemUptime
+        lastFramePresentedAt = now
         diagnosticsDraft.renderMs = renderMs
         if presentedFpsWindowStartedAt == 0 {
             presentedFpsWindowStartedAt = now
@@ -677,6 +694,10 @@ final class RemoteDesktopClient {
     }
 
     private func recordReceivedFrame(byteCount: Int, at now: TimeInterval) {
+        if firstFrameReceivedAt <= 0 {
+            firstFrameReceivedAt = now
+        }
+        lastFrameReceivedAt = now
         frameBytes = byteCount
         diagnosticsDraft.frameBytes = byteCount
         diagnosticsDraft.inputQueueMax = inputQueueMax
@@ -763,6 +784,41 @@ final class RemoteDesktopClient {
     private func updateGatewayStatus(_ next: RemoteGatewayStatus?) {
         guard let next, next != gatewayStatus else { return }
         gatewayStatus = next
+    }
+
+    func streamStallKind(
+        now: TimeInterval = ProcessInfo.processInfo.systemUptime,
+        receiveTimeout: TimeInterval = 2.8,
+        renderTimeout: TimeInterval = 2.8
+    ) -> RemoteStreamStallKind? {
+        guard isConnected else { return nil }
+
+        if lastFrameReceivedAt <= 0 {
+            guard connectedAt > 0, now - connectedAt >= receiveTimeout else { return nil }
+            return .receive
+        }
+
+        if now - lastFrameReceivedAt >= receiveTimeout {
+            return .receive
+        }
+
+        if lastFramePresentedAt <= 0 {
+            let firstReceivedAt = firstFrameReceivedAt > 0 ? firstFrameReceivedAt : lastFrameReceivedAt
+            return now - firstReceivedAt >= renderTimeout ? .render : nil
+        }
+
+        if now - lastFramePresentedAt >= renderTimeout {
+            return .render
+        }
+
+        return nil
+    }
+
+    private func markConnected() {
+        if !isConnected {
+            connectedAt = ProcessInfo.processInfo.systemUptime
+        }
+        connectionState = .connected
     }
 
     private func sendInput(
@@ -1346,14 +1402,53 @@ private extension String {
 enum RemoteShortcut: String, CaseIterable, Identifiable {
     case copy
     case paste
+    case cut
+    case undo
+    case redo
     case selectAll
-    case altTab
-    case showDesktop
-    case taskManager
+    case find
+    case save
+    case print
+    case newTab
+    case closeTab
+    case nextTab
+    case previousTab
+    case reopenClosedTab
+    case newWindow
+    case addressBar
+    case browserBack
+    case browserForward
+    case enter
+    case escape
     case backspace
     case delete
+    case home
+    case end
     case pageUp
     case pageDown
+    case insert
+    case rename
+    case refresh
+    case fullScreen
+    case devTools
+    case properties
+    case windowMenu
+    case closeWindow
+    case altTab
+    case altShiftTab
+    case winTab
+    case showDesktop
+    case taskManager
+    case runDialog
+    case fileExplorer
+    case search
+    case settings
+    case clipboardHistory
+    case minimizeAll
+    case restoreWindows
+    case lock
+    case screenshot
+    case screenSnip
 
     var id: String { rawValue }
 
@@ -1363,22 +1458,100 @@ enum RemoteShortcut: String, CaseIterable, Identifiable {
             return "Copy"
         case .paste:
             return "Paste"
+        case .cut:
+            return "Cut"
+        case .undo:
+            return "Undo"
+        case .redo:
+            return "Redo"
         case .selectAll:
             return "Select All"
-        case .altTab:
-            return "Alt Tab"
-        case .showDesktop:
-            return "Show Desktop"
-        case .taskManager:
-            return "Task Manager"
+        case .find:
+            return "Find"
+        case .save:
+            return "Save"
+        case .print:
+            return "Print"
+        case .newTab:
+            return "New Tab"
+        case .closeTab:
+            return "Close Tab"
+        case .nextTab:
+            return "Next Tab"
+        case .previousTab:
+            return "Previous Tab"
+        case .reopenClosedTab:
+            return "Reopen Tab"
+        case .newWindow:
+            return "New Window"
+        case .addressBar:
+            return "Address Bar"
+        case .browserBack:
+            return "Back"
+        case .browserForward:
+            return "Forward"
+        case .enter:
+            return "Enter"
+        case .escape:
+            return "Escape"
         case .backspace:
             return "Backspace"
         case .delete:
             return "Delete"
+        case .home:
+            return "Home"
+        case .end:
+            return "End"
         case .pageUp:
             return "Page Up"
         case .pageDown:
             return "Page Down"
+        case .insert:
+            return "Insert"
+        case .rename:
+            return "Rename"
+        case .refresh:
+            return "Refresh"
+        case .fullScreen:
+            return "Full Screen"
+        case .devTools:
+            return "Dev Tools"
+        case .properties:
+            return "Properties"
+        case .windowMenu:
+            return "Window Menu"
+        case .closeWindow:
+            return "Close Window"
+        case .altTab:
+            return "Alt Tab"
+        case .altShiftTab:
+            return "Alt Shift Tab"
+        case .winTab:
+            return "Win Tab"
+        case .showDesktop:
+            return "Show Desktop"
+        case .taskManager:
+            return "Task Manager"
+        case .runDialog:
+            return "Run"
+        case .fileExplorer:
+            return "File Explorer"
+        case .search:
+            return "Search"
+        case .settings:
+            return "Settings"
+        case .clipboardHistory:
+            return "Clipboard History"
+        case .minimizeAll:
+            return "Minimize All"
+        case .restoreWindows:
+            return "Restore Windows"
+        case .lock:
+            return "Lock"
+        case .screenshot:
+            return "Screenshot"
+        case .screenSnip:
+            return "Screen Snip"
         }
     }
 
@@ -1388,22 +1561,100 @@ enum RemoteShortcut: String, CaseIterable, Identifiable {
             return "doc.on.doc"
         case .paste:
             return "clipboard"
+        case .cut:
+            return "scissors"
+        case .undo:
+            return "arrow.uturn.backward"
+        case .redo:
+            return "arrow.uturn.forward"
         case .selectAll:
             return "textformat"
+        case .find:
+            return "magnifyingglass"
+        case .save:
+            return "square.and.arrow.down"
+        case .print:
+            return "printer"
+        case .newTab:
+            return "plus.square.on.square"
+        case .closeTab:
+            return "xmark.square"
+        case .nextTab:
+            return "arrow.right.square"
+        case .previousTab:
+            return "arrow.left.square"
+        case .reopenClosedTab:
+            return "arrow.uturn.backward"
+        case .newWindow:
+            return "plus.rectangle"
+        case .addressBar:
+            return "link"
+        case .browserBack:
+            return "chevron.backward"
+        case .browserForward:
+            return "chevron.forward"
+        case .enter:
+            return "return"
+        case .escape:
+            return "xmark.circle"
+        case .backspace:
+            return "delete.left"
+        case .delete:
+            return "delete.right"
+        case .home:
+            return "arrow.up.left"
+        case .end:
+            return "arrow.down.right"
+        case .pageUp:
+            return "arrow.up.to.line"
+        case .pageDown:
+            return "arrow.down.to.line"
+        case .insert:
+            return "plus.rectangle.on.rectangle"
+        case .rename:
+            return "text.cursor"
+        case .refresh:
+            return "arrow.clockwise"
+        case .fullScreen:
+            return "arrow.up.left.and.arrow.down.right"
+        case .devTools:
+            return "hammer"
+        case .properties:
+            return "info.circle"
+        case .windowMenu:
+            return "list.bullet"
+        case .closeWindow:
+            return "xmark.rectangle"
         case .altTab:
+            return "rectangle.stack"
+        case .altShiftTab:
+            return "rectangle.stack.badge.minus"
+        case .winTab:
             return "rectangle.stack"
         case .showDesktop:
             return "desktopcomputer"
         case .taskManager:
             return "speedometer"
-        case .backspace:
-            return "delete.left"
-        case .delete:
-            return "delete.right"
-        case .pageUp:
-            return "arrow.up.to.line"
-        case .pageDown:
-            return "arrow.down.to.line"
+        case .runDialog:
+            return "terminal"
+        case .fileExplorer:
+            return "folder"
+        case .search:
+            return "magnifyingglass"
+        case .settings:
+            return "gearshape"
+        case .clipboardHistory:
+            return "list.clipboard"
+        case .minimizeAll:
+            return "rectangle.compress.vertical"
+        case .restoreWindows:
+            return "rectangle.expand.vertical"
+        case .lock:
+            return "lock"
+        case .screenshot:
+            return "camera.viewfinder"
+        case .screenSnip:
+            return "crop"
         }
     }
 
@@ -1413,22 +1664,98 @@ enum RemoteShortcut: String, CaseIterable, Identifiable {
             return "c"
         case .paste:
             return "v"
+        case .cut:
+            return "x"
+        case .undo:
+            return "z"
+        case .redo:
+            return "y"
         case .selectAll:
             return "a"
-        case .altTab:
+        case .find:
+            return "f"
+        case .save:
+            return "s"
+        case .print:
+            return "p"
+        case .newTab:
+            return "t"
+        case .closeTab:
+            return "w"
+        case .nextTab:
             return "Tab"
-        case .showDesktop:
-            return "d"
-        case .taskManager:
+        case .previousTab:
+            return "Tab"
+        case .reopenClosedTab:
+            return "t"
+        case .newWindow:
+            return "n"
+        case .addressBar:
+            return "l"
+        case .browserBack:
+            return "ArrowLeft"
+        case .browserForward:
+            return "ArrowRight"
+        case .enter:
+            return "Enter"
+        case .escape:
             return "Escape"
         case .backspace:
             return "Backspace"
         case .delete:
             return "Delete"
+        case .home:
+            return "Home"
+        case .end:
+            return "End"
         case .pageUp:
             return "PageUp"
         case .pageDown:
             return "PageDown"
+        case .insert:
+            return "Insert"
+        case .rename:
+            return "F2"
+        case .refresh:
+            return "F5"
+        case .fullScreen:
+            return "F11"
+        case .devTools:
+            return "F12"
+        case .properties:
+            return "Enter"
+        case .windowMenu:
+            return "Space"
+        case .closeWindow:
+            return "F4"
+        case .altTab:
+            return "Tab"
+        case .altShiftTab:
+            return "Tab"
+        case .winTab:
+            return "Tab"
+        case .showDesktop:
+            return "d"
+        case .taskManager:
+            return "Escape"
+        case .runDialog:
+            return "r"
+        case .fileExplorer:
+            return "e"
+        case .search:
+            return "s"
+        case .settings:
+            return "i"
+        case .clipboardHistory:
+            return "v"
+        case .minimizeAll, .restoreWindows:
+            return "m"
+        case .lock:
+            return "l"
+        case .screenshot:
+            return "PrintScreen"
+        case .screenSnip:
+            return "s"
         }
     }
 
@@ -1438,36 +1765,116 @@ enum RemoteShortcut: String, CaseIterable, Identifiable {
             return "KeyC"
         case .paste:
             return "KeyV"
+        case .cut:
+            return "KeyX"
+        case .undo:
+            return "KeyZ"
+        case .redo:
+            return "KeyY"
         case .selectAll:
             return "KeyA"
-        case .altTab:
+        case .find:
+            return "KeyF"
+        case .save:
+            return "KeyS"
+        case .print:
+            return "KeyP"
+        case .newTab:
+            return "KeyT"
+        case .closeTab:
+            return "KeyW"
+        case .nextTab:
             return "Tab"
-        case .showDesktop:
-            return "KeyD"
-        case .taskManager:
+        case .previousTab:
+            return "Tab"
+        case .reopenClosedTab:
+            return "KeyT"
+        case .newWindow:
+            return "KeyN"
+        case .addressBar:
+            return "KeyL"
+        case .browserBack:
+            return "ArrowLeft"
+        case .browserForward:
+            return "ArrowRight"
+        case .enter:
+            return "Enter"
+        case .escape:
             return "Escape"
         case .backspace:
             return "Backspace"
         case .delete:
             return "Delete"
+        case .home:
+            return "Home"
+        case .end:
+            return "End"
         case .pageUp:
             return "PageUp"
         case .pageDown:
             return "PageDown"
+        case .insert:
+            return "Insert"
+        case .rename:
+            return "F2"
+        case .refresh:
+            return "F5"
+        case .fullScreen:
+            return "F11"
+        case .devTools:
+            return "F12"
+        case .properties:
+            return "Enter"
+        case .windowMenu:
+            return "Space"
+        case .closeWindow:
+            return "F4"
+        case .altTab:
+            return "Tab"
+        case .altShiftTab:
+            return "Tab"
+        case .winTab:
+            return "Tab"
+        case .showDesktop:
+            return "KeyD"
+        case .taskManager:
+            return "Escape"
+        case .runDialog:
+            return "KeyR"
+        case .fileExplorer:
+            return "KeyE"
+        case .search, .screenSnip:
+            return "KeyS"
+        case .settings:
+            return "KeyI"
+        case .clipboardHistory:
+            return "KeyV"
+        case .minimizeAll, .restoreWindows:
+            return "KeyM"
+        case .lock:
+            return "KeyL"
+        case .screenshot:
+            return "PrintScreen"
         }
     }
 
     var modifiers: [String: Bool] {
         switch self {
-        case .copy, .paste, .selectAll:
+        case .copy, .paste, .cut, .undo, .redo, .selectAll, .find, .save, .print, .newTab, .closeTab, .nextTab, .newWindow, .addressBar:
             return ["ctrl": true]
-        case .altTab:
+        case .previousTab, .reopenClosedTab:
+            return ["ctrl": true, "shift": true]
+        case .altTab, .browserBack, .browserForward, .properties, .windowMenu, .closeWindow:
             return ["alt": true]
-        case .showDesktop:
+        case .altShiftTab:
+            return ["alt": true, "shift": true]
+        case .winTab, .showDesktop, .runDialog, .fileExplorer, .search, .settings, .clipboardHistory, .minimizeAll, .lock:
             return ["meta": true]
+        case .restoreWindows, .screenSnip:
+            return ["meta": true, "shift": true]
         case .taskManager:
             return ["ctrl": true, "shift": true]
-        case .backspace, .delete, .pageUp, .pageDown:
+        case .enter, .escape, .backspace, .delete, .home, .end, .pageUp, .pageDown, .insert, .rename, .refresh, .fullScreen, .devTools, .screenshot:
             return [:]
         }
     }
