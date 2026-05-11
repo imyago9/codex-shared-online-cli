@@ -423,7 +423,6 @@ struct RemoteDesktopView: View {
     @State private var commandDockHidden = false
     @State private var lastCommandDockActivityUptime: TimeInterval = 0
     @State private var lastStreamRecoveryUptime: TimeInterval = 0
-    @State private var streamRecoveryAttemptCount = 0
     @State private var preferredStreamTransport: RemoteStreamTransport = .video
     private let telemetryTicker = Timer.publish(every: 0.33, on: .main, in: .common).autoconnect()
 
@@ -651,7 +650,6 @@ struct RemoteDesktopView: View {
 
     private func refreshRemoteStream() {
         preferredStreamTransport = .video
-        streamRecoveryAttemptCount = 0
         lastStreamRecoveryUptime = 0
         Task {
             await refreshRemoteMetadata()
@@ -834,8 +832,7 @@ struct RemoteDesktopView: View {
         guard shouldRecover else { return }
         guard now - lastStreamRecoveryUptime >= 3.0 else { return }
         lastStreamRecoveryUptime = now
-        streamRecoveryAttemptCount += 1
-        if shouldPreferFallback || streamRecoveryAttemptCount >= 2 {
+        if shouldPreferFallback {
             preferredStreamTransport = .jpeg
         }
         ensureRemoteStream(forceReconnect: true)
