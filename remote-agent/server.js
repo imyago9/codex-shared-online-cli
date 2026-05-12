@@ -1842,46 +1842,8 @@ public static class NativeInput {
   [DllImport("user32.dll", SetLastError=true)]
   public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 
-  [DllImport("user32.dll")]
-  public static extern uint MapVirtualKey(uint uCode, uint uMapType);
-
-  [DllImport("user32.dll", SetLastError=true)]
-  public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
-
   [DllImport("user32.dll", CharSet=CharSet.Unicode)]
   public static extern short VkKeyScan(char ch);
-
-  [StructLayout(LayoutKind.Sequential)]
-  public struct INPUT {
-    public uint type;
-    public InputUnion U;
-  }
-
-  [StructLayout(LayoutKind.Explicit)]
-  public struct InputUnion {
-    [FieldOffset(0)]
-    public KEYBDINPUT ki;
-  }
-
-  [StructLayout(LayoutKind.Sequential)]
-  public struct KEYBDINPUT {
-    public ushort wVk;
-    public ushort wScan;
-    public uint dwFlags;
-    public uint time;
-    public UIntPtr dwExtraInfo;
-  }
-
-  public static uint SendKeyboardInput(ushort scanCode, uint flags) {
-    INPUT[] inputs = new INPUT[1];
-    inputs[0].type = 1;
-    inputs[0].U.ki.wVk = 0;
-    inputs[0].U.ki.wScan = scanCode;
-    inputs[0].U.ki.dwFlags = flags;
-    inputs[0].U.ki.time = 0;
-    inputs[0].U.ki.dwExtraInfo = UIntPtr.Zero;
-    return SendInput(1, inputs, Marshal.SizeOf(typeof(INPUT)));
-  }
 }
 "@
 $MOUSEEVENTF_LEFTDOWN = 0x0002
@@ -1892,9 +1854,6 @@ $MOUSEEVENTF_MIDDLEDOWN = 0x0020
 $MOUSEEVENTF_MIDDLEUP = 0x0040
 $MOUSEEVENTF_WHEEL = 0x0800
 $KEYEVENTF_KEYUP = 0x0002
-$KEYEVENTF_SCANCODE = 0x0008
-$KEYEVENTF_EXTENDEDKEY = 0x0001
-$MAPVK_VK_TO_VSC = 0
 $VK_SHIFT = 0x10
 $VK_LSHIFT = 0xA0
 $VK_RSHIFT = 0xA1
@@ -1906,22 +1865,6 @@ $VK_LMENU = 0xA4
 $VK_RMENU = 0xA5
 $VK_LWIN = 0x5B
 $VK_RWIN = 0x5C
-$EXTENDED_KEYS = @{
-  0x21 = $true
-  0x22 = $true
-  0x23 = $true
-  0x24 = $true
-  0x25 = $true
-  0x26 = $true
-  0x27 = $true
-  0x28 = $true
-  0x2D = $true
-  0x2E = $true
-  0x5B = $true
-  0x5C = $true
-  0xA3 = $true
-  0xA5 = $true
-}
 
 function Invoke-KeyDown([int]$vk) {
   Invoke-KeyInput $vk $false
@@ -1937,18 +1880,9 @@ function Invoke-KeyPress([int]$vk) {
 }
 
 function Invoke-KeyInput([int]$vk, [bool]$isUp) {
-  $scan = [NativeInput]::MapVirtualKey([uint32]$vk, [uint32]$MAPVK_VK_TO_VSC)
-  if ($scan -eq 0) {
-    $flags = 0
-    if ($isUp) { $flags = $KEYEVENTF_KEYUP }
-    [NativeInput]::keybd_event([byte]$vk, 0, [uint32]$flags, [UIntPtr]::Zero)
-    return
-  }
-
-  $flags = $KEYEVENTF_SCANCODE
+  $flags = 0
   if ($isUp) { $flags = $flags -bor $KEYEVENTF_KEYUP }
-  if ($EXTENDED_KEYS.ContainsKey($vk)) { $flags = $flags -bor $KEYEVENTF_EXTENDEDKEY }
-  [void][NativeInput]::SendKeyboardInput([uint16]$scan, [uint32]$flags)
+  [NativeInput]::keybd_event([byte]$vk, 0, [uint32]$flags, [UIntPtr]::Zero)
 }
 
 function Invoke-ApplyModifierMask([int]$mask, [bool]$down) {
