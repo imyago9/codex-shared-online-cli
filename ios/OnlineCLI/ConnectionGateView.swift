@@ -71,9 +71,9 @@ struct ConnectionGateView: View {
             .disabled(app.isLoading || draftURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
             Button {
-                openTailscaleStorePage()
+                runTailscaleShortcut()
             } label: {
-                Label("Tailscale App", systemImage: "network.badge.shield.half.filled")
+                Label("Run Tailscale Shortcut", systemImage: "bolt.horizontal")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
@@ -96,9 +96,22 @@ struct ConnectionGateView: View {
         localMessage = app.isServerConnected ? "Connected" : app.connectionMessage
     }
 
-    private func openTailscaleStorePage() {
-        if let storeURL = URL(string: "https://apps.apple.com/app/tailscale/id1470499037") {
-            UIApplication.shared.open(storeURL)
+    private func runTailscaleShortcut() {
+        let shortcutName = ServerSettings.normalizedShortcutName(app.settings.tailscaleShortcutName)
+        var components = URLComponents()
+        components.scheme = "shortcuts"
+        components.host = "run-shortcut"
+        components.queryItems = [URLQueryItem(name: "name", value: shortcutName)]
+
+        guard let shortcutURL = components.url else {
+            localMessage = "Unable to open Shortcuts"
+            return
+        }
+
+        UIApplication.shared.open(shortcutURL) { didOpen in
+            if !didOpen {
+                localMessage = "Unable to open Shortcuts"
+            }
         }
     }
 }

@@ -1,11 +1,14 @@
 import Foundation
 
 struct ServerSettings: Codable, Equatable {
+    static let defaultTailscaleShortcutName = "OnlineCLI Connect Tailscale"
+
     var baseURLString = ""
     var defaultTerminalProfile: TerminalProfile = .powershell
     var defaultRemoteMode: RemoteMode = .view
     var remoteStreamProfile: RemoteStreamProfile = .balanced
     var preferNativeRemote = true
+    var tailscaleShortcutName = Self.defaultTailscaleShortcutName
 
     enum CodingKeys: String, CodingKey {
         case baseURLString
@@ -13,6 +16,7 @@ struct ServerSettings: Codable, Equatable {
         case defaultRemoteMode
         case remoteStreamProfile
         case preferNativeRemote
+        case tailscaleShortcutName
     }
 
     init() {}
@@ -50,6 +54,11 @@ struct ServerSettings: Codable, Equatable {
         return components.url?.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")) ?? withScheme
     }
 
+    static func normalizedShortcutName(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? Self.defaultTailscaleShortcutName : trimmed
+    }
+
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         baseURLString = try container.decodeIfPresent(String.self, forKey: .baseURLString) ?? baseURLString
@@ -57,6 +66,9 @@ struct ServerSettings: Codable, Equatable {
         defaultRemoteMode = try container.decodeIfPresent(RemoteMode.self, forKey: .defaultRemoteMode) ?? defaultRemoteMode
         remoteStreamProfile = try container.decodeIfPresent(RemoteStreamProfile.self, forKey: .remoteStreamProfile) ?? remoteStreamProfile
         preferNativeRemote = try container.decodeIfPresent(Bool.self, forKey: .preferNativeRemote) ?? preferNativeRemote
+        tailscaleShortcutName = Self.normalizedShortcutName(
+            try container.decodeIfPresent(String.self, forKey: .tailscaleShortcutName) ?? tailscaleShortcutName
+        )
     }
 
     var normalizedBaseURL: URL? {
@@ -65,7 +77,7 @@ struct ServerSettings: Codable, Equatable {
             return nil
         }
 
-        guard var components = URLComponents(string: Self.normalizedURLString(trimmed)) else {
+        guard let components = URLComponents(string: Self.normalizedURLString(trimmed)) else {
             return nil
         }
         return components.url

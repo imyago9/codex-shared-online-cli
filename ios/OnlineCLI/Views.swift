@@ -4752,6 +4752,7 @@ struct SettingsView: View {
     @State private var draftRemoteMode: RemoteMode = .view
     @State private var draftStreamProfile: RemoteStreamProfile = .balanced
     @State private var preferNativeRemote = true
+    @State private var draftTailscaleShortcutName = ServerSettings.defaultTailscaleShortcutName
 
     var body: some View {
         NavigationStack {
@@ -4776,6 +4777,17 @@ struct SettingsView: View {
                     .disabled(app.settings.baseURLString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !app.isServerConnected)
 
                     LabeledContent("Status", value: app.connectionMessage)
+                }
+
+                Section("Tailscale") {
+                    TextField("Shortcut Name", text: $draftTailscaleShortcutName)
+                        .textInputAutocapitalization(.words)
+                        .autocorrectionDisabled()
+
+                    Button("Save Shortcut") {
+                        app.settings.tailscaleShortcutName = ServerSettings.normalizedShortcutName(draftTailscaleShortcutName)
+                        draftTailscaleShortcutName = app.settings.tailscaleShortcutName
+                    }
                 }
 
                 Section("Remote") {
@@ -4824,6 +4836,7 @@ struct SettingsView: View {
                 draftRemoteMode = app.settings.defaultRemoteMode
                 draftStreamProfile = app.settings.remoteStreamProfile
                 preferNativeRemote = app.settings.preferNativeRemote
+                draftTailscaleShortcutName = app.settings.tailscaleShortcutName
                 Task { await app.refreshAll() }
             }
         }
