@@ -4767,6 +4767,14 @@ struct SettingsView: View {
                         Task { await app.refreshAll() }
                     }
 
+                    Button(role: .destructive) {
+                        app.disconnectFromServer()
+                        draftURL = ""
+                    } label: {
+                        Label("Disconnect", systemImage: "network.slash")
+                    }
+                    .disabled(app.settings.baseURLString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !app.isServerConnected)
+
                     LabeledContent("Status", value: app.connectionMessage)
                 }
 

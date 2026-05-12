@@ -48,7 +48,7 @@ final class AppModel {
 
     func refreshHealth() async {
         guard let api else {
-            connectionMessage = "Enter a tailnet URL"
+            resetConnectionState(message: "Enter a tailnet URL")
             return
         }
 
@@ -67,6 +67,11 @@ final class AppModel {
             health = nil
             connectionMessage = error.localizedDescription
         }
+    }
+
+    func disconnectFromServer() {
+        settings.baseURLString = ""
+        resetConnectionState(message: "Enter a tailnet URL")
     }
 
     func refreshSessions() async {
@@ -163,6 +168,18 @@ final class AppModel {
             return
         }
         activeTerminalSessionId = defaultSessionId ?? sessions.first?.id
+    }
+
+    private func resetConnectionState(message: String) {
+        health = nil
+        sessions = []
+        defaultSessionId = nil
+        activeTerminalSessionId = nil
+        availableTerminalProfiles = [.powershell]
+        remoteStatus = nil
+        remoteCapabilities = nil
+        connectionMessage = message
+        isLoading = false
     }
 }
 
