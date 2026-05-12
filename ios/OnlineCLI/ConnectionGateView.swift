@@ -3,9 +3,7 @@ import UIKit
 
 struct ConnectionGateView: View {
     @Environment(AppModel.self) private var app
-    @State private var draftTailnetName = ServerSettings.defaultTailscaleTailnetName
-    @State private var draftClientID = ""
-    @State private var draftClientSecret = ""
+    @State private var draftURL = ""
     @State private var localMessage = ""
 
     var body: some View {
@@ -24,8 +22,8 @@ struct ConnectionGateView: View {
             .navigationTitle("Connect")
             .navigationBarTitleDisplayMode(.inline)
             .task {
-                draftTailnetName = app.settings.tailscaleTailnetName
-                draftClientID = app.settings.tailscaleClientID
+                draftURL = app.settings.baseURLString
+                await app.refreshAll()
             }
         }
     }
@@ -45,7 +43,7 @@ struct ConnectionGateView: View {
             VStack(spacing: 6) {
                 Text("Online CLI")
                     .font(.largeTitle.weight(.bold))
-                Text(localMessage.isEmpty ? app.tailscaleMessage : localMessage)
+                Text(localMessage.isEmpty ? app.connectionMessage : localMessage)
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -55,80 +53,69 @@ struct ConnectionGateView: View {
 
     private var connectionForm: some View {
         VStack(spacing: 14) {
-            TextField("Tailnet", text: $draftTailnetName)
+            TextField("Tailscale link", text: $draftURL)
+                .keyboardType(.URL)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
-                .padding(14)
-                .background(.background, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-
-            TextField("OAuth Client ID", text: $draftClientID)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .textContentType(.username)
-                .padding(14)
-                .background(.background, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-
-            SecureField("OAuth Client Secret", text: $draftClientSecret)
-                .textContentType(.password)
+                .textContentType(.URL)
                 .padding(14)
                 .background(.background, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
 
             Button {
-                signIn()
+                connect()
             } label: {
-                Label("Sign In", systemImage: "person.badge.key")
+                Label("Connect", systemImage: "network")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
-            .disabled(app.isTailscaleLoading || !canSignIn)
+            .disabled(app.isLoading || draftURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
             Button {
-                runTailscaleShortcut()
+                viewInTailscale()
             } label: {
-                Label("Run Tailscale Shortcut", systemImage: "bolt.horizontal")
+                Label("View in Tailscale", systemImage: "network")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("1. Run Windows Manager.")
+                Text("2. Open Tailscale on IPhone.")
+                Text("3. Copy target machine address.")
+                Text("4. Paste here in app and connect.")
+            }
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 4)
         }
         .padding(16)
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 
-    private var canSignIn: Bool {
-        !draftClientID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && !draftClientSecret.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    private func signIn() {
+    private func connect() {
         Task {
-            localMessage = "Signing in"
-            await app.signInToTailscale(
-                tailnet: draftTailnetName,
-                clientID: draftClientID,
-                clientSecret: draftClientSecret
-            )
-            localMessage = app.tailscaleMessage
-            if app.isTailscaleSignedIn {
-                draftClientSecret = ""
-            }
+            await connect(using: draftURL)
         }
     }
 
-    private func runTailscaleShortcut() {
-        let shortcutName = ServerSettings.normalizedShortcutName(app.settings.tailscaleShortcutName)
-        var components = URLComponents()
-        components.scheme = "shortcuts"
-        components.host = "run-shortcut"
-        components.queryItems = [URLQueryItem(name: "name", value: shortcutName)]
+    private func connect(using urlString: String) async {
+        localMessage = "Checking connection"
+        app.settings.baseURLString = ServerSettings.normalizedURLString(urlString)
+        await app.refreshAll()
+        draftURL = app.settings.baseURLString
+        localMessage = app.isServerConnected ? "Connected" : app.connectionMessage
+    }
 
-        guard let shortcutURL = components.url else {
-            localMessage = "Unable to open Shortcuts"
+    private func viewInTailscale() {
+        guard let tailscaleURL = URL(string: "https://login.tailscale.com/admin/machines") else {
+            localMessage = "Unable to open Tailscale"
             return
         }
 
-        UIApplication.shared.open(shortcutURL) { didOpen in
+        UIApplication.shared.open(tailscaleURL) { didOpen in
             if !didOpen {
-                localMessage = "Unable to open Shortcuts"
+                localMessage = "Unable to open Tailscale"
             }
         }
     }

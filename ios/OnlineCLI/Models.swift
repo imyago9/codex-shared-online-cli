@@ -1,31 +1,18 @@
 import Foundation
 
 struct ServerSettings: Codable, Equatable {
-    static let defaultTailscaleShortcutName = "OnlineCLI Connect Tailscale"
-    static let defaultTailscaleTailnetName = "-"
-
     var baseURLString = ""
-    var tailscaleTailnetName = Self.defaultTailscaleTailnetName
-    var tailscaleClientID = ""
-    var selectedTailscaleDeviceID: String?
-    var selectedTailscaleDeviceName: String?
     var defaultTerminalProfile: TerminalProfile = .powershell
     var defaultRemoteMode: RemoteMode = .view
     var remoteStreamProfile: RemoteStreamProfile = .balanced
     var preferNativeRemote = true
-    var tailscaleShortcutName = Self.defaultTailscaleShortcutName
 
     enum CodingKeys: String, CodingKey {
         case baseURLString
-        case tailscaleTailnetName
-        case tailscaleClientID
-        case selectedTailscaleDeviceID
-        case selectedTailscaleDeviceName
         case defaultTerminalProfile
         case defaultRemoteMode
         case remoteStreamProfile
         case preferNativeRemote
-        case tailscaleShortcutName
     }
 
     init() {}
@@ -63,38 +50,13 @@ struct ServerSettings: Codable, Equatable {
         return components.url?.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")) ?? withScheme
     }
 
-    static func normalizedShortcutName(_ value: String) -> String {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? Self.defaultTailscaleShortcutName : trimmed
-    }
-
-    static func normalizedTailnetName(_ value: String) -> String {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? Self.defaultTailscaleTailnetName : trimmed
-    }
-
-    static func normalizedOAuthClientID(_ value: String) -> String {
-        value.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         baseURLString = try container.decodeIfPresent(String.self, forKey: .baseURLString) ?? baseURLString
-        tailscaleTailnetName = Self.normalizedTailnetName(
-            try container.decodeIfPresent(String.self, forKey: .tailscaleTailnetName) ?? tailscaleTailnetName
-        )
-        tailscaleClientID = Self.normalizedOAuthClientID(
-            try container.decodeIfPresent(String.self, forKey: .tailscaleClientID) ?? tailscaleClientID
-        )
-        selectedTailscaleDeviceID = try container.decodeIfPresent(String.self, forKey: .selectedTailscaleDeviceID)
-        selectedTailscaleDeviceName = try container.decodeIfPresent(String.self, forKey: .selectedTailscaleDeviceName)
         defaultTerminalProfile = try container.decodeIfPresent(TerminalProfile.self, forKey: .defaultTerminalProfile) ?? defaultTerminalProfile
         defaultRemoteMode = try container.decodeIfPresent(RemoteMode.self, forKey: .defaultRemoteMode) ?? defaultRemoteMode
         remoteStreamProfile = try container.decodeIfPresent(RemoteStreamProfile.self, forKey: .remoteStreamProfile) ?? remoteStreamProfile
         preferNativeRemote = try container.decodeIfPresent(Bool.self, forKey: .preferNativeRemote) ?? preferNativeRemote
-        tailscaleShortcutName = Self.normalizedShortcutName(
-            try container.decodeIfPresent(String.self, forKey: .tailscaleShortcutName) ?? tailscaleShortcutName
-        )
     }
 
     var normalizedBaseURL: URL? {
@@ -108,80 +70,6 @@ struct ServerSettings: Codable, Equatable {
         }
         return components.url
     }
-
-    var hasTailscaleOAuthClientID: Bool {
-        !tailscaleClientID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-}
-
-struct TailscaleDevice: Decodable, Equatable, Identifiable {
-    let id: String
-    let nodeID: String?
-    let name: String
-    let hostname: String
-    let addresses: [String]
-    let os: String?
-    let lastSeen: String?
-    let authorized: Bool?
-
-    enum CodingKeys: String, CodingKey {
-        case id
-        case nodeID
-        case nodeId
-        case name
-        case hostname
-        case addresses
-        case os
-        case lastSeen
-        case authorized
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        let nodeID = try container.decodeIfPresent(String.self, forKey: .nodeID)
-            ?? container.decodeIfPresent(String.self, forKey: .nodeId)
-        let legacyID = try container.decodeIfPresent(String.self, forKey: .id)
-        let name = try container.decodeIfPresent(String.self, forKey: .name) ?? ""
-        let hostname = try container.decodeIfPresent(String.self, forKey: .hostname) ?? name
-
-        self.id = nodeID ?? legacyID ?? name
-        self.nodeID = nodeID
-        self.name = name
-        self.hostname = hostname
-        self.addresses = try container.decodeIfPresent([String].self, forKey: .addresses) ?? []
-        self.os = try container.decodeIfPresent(String.self, forKey: .os)
-        self.lastSeen = try container.decodeIfPresent(String.self, forKey: .lastSeen)
-        self.authorized = try container.decodeIfPresent(Bool.self, forKey: .authorized)
-    }
-
-    var displayName: String {
-        hostname.isEmpty ? name : hostname
-    }
-
-    var secondaryText: String {
-        var parts: [String] = []
-        if let os, !os.isEmpty {
-            parts.append(os)
-        }
-        if let firstAddress = addresses.first {
-            parts.append(firstAddress)
-        }
-        return parts.joined(separator: " - ")
-    }
-
-    var serverURLString: String {
-        if !name.isEmpty, name.contains(".") {
-            return "https://\(name)"
-        }
-        if let firstAddress = addresses.first {
-            return "https://\(firstAddress)"
-        }
-        return ""
-    }
-}
-
-struct TailscaleDevicesResponse: Decodable {
-    let devices: [TailscaleDevice]
 }
 
 enum TerminalProfile: String, Codable, CaseIterable, Identifiable {
