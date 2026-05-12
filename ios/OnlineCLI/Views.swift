@@ -79,29 +79,46 @@ struct RootView: View {
 
     var body: some View {
         Group {
-            if app.isServerConnected {
+            if app.isTailscaleSignedIn {
                 AppTabsView()
             } else {
                 ConnectionGateView()
             }
         }
         .task {
-            await app.refreshAll()
+            await app.refreshStartup()
         }
     }
 }
 
+private enum AppTab: Hashable {
+    case console
+    case remote
+    case settings
+}
+
 private struct AppTabsView: View {
+    @Environment(AppModel.self) private var app
+    @State private var selectedTab: AppTab = .console
+
     var body: some View {
-        TabView {
+        TabView(selection: $selectedTab) {
             ConsoleTabView()
+                .tag(AppTab.console)
                 .tabItem { Label("Console", systemImage: "terminal") }
 
             RemoteDesktopView()
+                .tag(AppTab.remote)
                 .tabItem { Label("Remote", systemImage: "desktopcomputer") }
 
             SettingsView()
+                .tag(AppTab.settings)
                 .tabItem { Label("Settings", systemImage: "gearshape") }
+        }
+        .onAppear {
+            if !app.hasSelectedTailscaleDevice {
+                selectedTab = .settings
+            }
         }
     }
 }
@@ -141,7 +158,7 @@ struct ConsoleTabView: View {
                         }
                     }
                 } else {
-                    ContentUnavailableView("Set a tailnet URL", systemImage: "network.slash")
+                    ContentUnavailableView("Choose a Tailscale device", systemImage: "network.slash")
                 }
             }
             .navigationTitle("Console")
@@ -607,7 +624,7 @@ struct RemoteDesktopView: View {
 
     private func connect() {
         guard let url = app.settings.normalizedBaseURL else {
-            client.connectionState = .failed("Set a tailnet URL")
+            client.connectionState = .failed("Choose a Tailscale device")
             return
         }
         client.connect(
@@ -4748,29 +4765,19 @@ private extension CGRect {
 
 struct SettingsView: View {
     @Environment(AppModel.self) private var app
-    @State private var draftURL = ""
     @State private var draftRemoteMode: RemoteMode = .view
     @State private var draftStreamProfile: RemoteStreamProfile = .balanced
     @State private var preferNativeRemote = true
     @State private var draftTailscaleShortcutName = ServerSettings.defaultTailscaleShortcutName
+    @State private var selectedTailscaleDeviceID: String?
 
     var body: some View {
         NavigationStack {
             Form {
                 Section("Connection") {
-                    TextField("Tailnet URL", text: $draftURL)
-                        .keyboardType(.URL)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-
-                    Button("Save and Test") {
-                        app.settings.baseURLString = ServerSettings.normalizedURLString(draftURL)
-                        Task { await app.refreshAll() }
-                    }
-
                     Button(role: .destructive) {
                         app.disconnectFromServer()
-                        draftURL = ""
+                        selectedTailscaleDeviceID = nil
                     } label: {
                         Label("Disconnect", systemImage: "network.slash")
                     }
@@ -4779,7 +4786,47 @@ struct SettingsView: View {
                     LabeledContent("Status", value: app.connectionMessage)
                 }
 
-                Section("Tailscale") {
+                Section("Tailscale OAuth") {
+                    LabeledContent("Tailnet", value: app.settings.tailscaleTailnetName)
+                    LabeledContent("OAuth", value: app.tailscaleMessage)
+
+                    Button {
+                        Task { await app.refreshTailscaleDevices() }
+                    } label: {
+                        Label("Refresh Devices", systemImage: "arrow.clockwise")
+                    }
+                    .disabled(app.isTailscaleLoading)
+
+                    if app.tailscaleDevices.isEmpty {
+                        Text("No devices loaded")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Picker("Device", selection: $selectedTailscaleDeviceID) {
+                            Text("Choose Device").tag(Optional<String>.none)
+                            ForEach(app.tailscaleDevices) { device in
+                                Text(device.displayName).tag(Optional(device.id))
+                            }
+                        }
+                        .onChange(of: selectedTailscaleDeviceID) { _, newValue in
+                            Task { await app.selectTailscaleDevice(id: newValue) }
+                        }
+                    }
+
+                    if let selectedDeviceName = app.settings.selectedTailscaleDeviceName {
+                        LabeledContent("Selected", value: selectedDeviceName)
+                    }
+
+                    LabeledContent("Server URL", value: app.settings.baseURLString.isEmpty ? "None" : app.settings.baseURLString)
+
+                    Button(role: .destructive) {
+                        app.signOutOfTailscale()
+                        selectedTailscaleDeviceID = nil
+                    } label: {
+                        Label("Sign Out", systemImage: "person.crop.circle.badge.xmark")
+                    }
+                }
+
+                Section("Tailscale VPN") {
                     TextField("Shortcut Name", text: $draftTailscaleShortcutName)
                         .textInputAutocapitalization(.words)
                         .autocorrectionDisabled()
@@ -4832,12 +4879,16 @@ struct SettingsView: View {
             }
             .navigationTitle("Settings")
             .onAppear {
-                draftURL = app.settings.baseURLString
                 draftRemoteMode = app.settings.defaultRemoteMode
                 draftStreamProfile = app.settings.remoteStreamProfile
                 preferNativeRemote = app.settings.preferNativeRemote
                 draftTailscaleShortcutName = app.settings.tailscaleShortcutName
-                Task { await app.refreshAll() }
+                selectedTailscaleDeviceID = app.settings.selectedTailscaleDeviceID
+                Task {
+                    await app.refreshTailscaleDevices()
+                    selectedTailscaleDeviceID = app.settings.selectedTailscaleDeviceID
+                    await app.refreshAll()
+                }
             }
         }
     }

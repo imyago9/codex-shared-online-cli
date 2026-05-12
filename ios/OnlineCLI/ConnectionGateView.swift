@@ -3,7 +3,9 @@ import UIKit
 
 struct ConnectionGateView: View {
     @Environment(AppModel.self) private var app
-    @State private var draftURL = ""
+    @State private var draftTailnetName = ServerSettings.defaultTailscaleTailnetName
+    @State private var draftClientID = ""
+    @State private var draftClientSecret = ""
     @State private var localMessage = ""
 
     var body: some View {
@@ -22,8 +24,8 @@ struct ConnectionGateView: View {
             .navigationTitle("Connect")
             .navigationBarTitleDisplayMode(.inline)
             .task {
-                draftURL = app.settings.baseURLString
-                await app.refreshAll()
+                draftTailnetName = app.settings.tailscaleTailnetName
+                draftClientID = app.settings.tailscaleClientID
             }
         }
     }
@@ -43,7 +45,7 @@ struct ConnectionGateView: View {
             VStack(spacing: 6) {
                 Text("Online CLI")
                     .font(.largeTitle.weight(.bold))
-                Text(localMessage.isEmpty ? app.connectionMessage : localMessage)
+                Text(localMessage.isEmpty ? app.tailscaleMessage : localMessage)
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -53,22 +55,32 @@ struct ConnectionGateView: View {
 
     private var connectionForm: some View {
         VStack(spacing: 14) {
-            TextField("Tailnet URL", text: $draftURL)
-                .keyboardType(.URL)
+            TextField("Tailnet", text: $draftTailnetName)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
-                .textContentType(.URL)
+                .padding(14)
+                .background(.background, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+            TextField("OAuth Client ID", text: $draftClientID)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .textContentType(.username)
+                .padding(14)
+                .background(.background, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+            SecureField("OAuth Client Secret", text: $draftClientSecret)
+                .textContentType(.password)
                 .padding(14)
                 .background(.background, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
 
             Button {
-                connect()
+                signIn()
             } label: {
-                Label("Connect", systemImage: "network")
+                Label("Sign In", systemImage: "person.badge.key")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
-            .disabled(app.isLoading || draftURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .disabled(app.isTailscaleLoading || !canSignIn)
 
             Button {
                 runTailscaleShortcut()
@@ -82,18 +94,24 @@ struct ConnectionGateView: View {
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 
-    private func connect() {
-        Task {
-            await connect(using: draftURL)
-        }
+    private var canSignIn: Bool {
+        !draftClientID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !draftClientSecret.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    private func connect(using urlString: String) async {
-        localMessage = "Checking connection"
-        app.settings.baseURLString = ServerSettings.normalizedURLString(urlString)
-        await app.refreshAll()
-        draftURL = app.settings.baseURLString
-        localMessage = app.isServerConnected ? "Connected" : app.connectionMessage
+    private func signIn() {
+        Task {
+            localMessage = "Signing in"
+            await app.signInToTailscale(
+                tailnet: draftTailnetName,
+                clientID: draftClientID,
+                clientSecret: draftClientSecret
+            )
+            localMessage = app.tailscaleMessage
+            if app.isTailscaleSignedIn {
+                draftClientSecret = ""
+            }
+        }
     }
 
     private func runTailscaleShortcut() {

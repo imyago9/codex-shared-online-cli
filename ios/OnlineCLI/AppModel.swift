@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import Security
 
 @MainActor
 @Observable
@@ -17,6 +18,9 @@ final class AppModel {
     var availableTerminalProfiles: [TerminalProfile] = [.powershell]
     var remoteStatus: RemoteStatus?
     var remoteCapabilities: RemoteCapabilities?
+    var tailscaleDevices: [TailscaleDevice] = []
+    var tailscaleMessage = "Sign in with Tailscale OAuth"
+    var isTailscaleLoading = false
     var connectionMessage = "Not checked"
     var isLoading = false
 
@@ -29,6 +33,21 @@ final class AppModel {
             return nil
         }
         return OnlineCLIAPI(baseURL: baseURL)
+    }
+
+    var isTailscaleSignedIn: Bool {
+        settings.hasTailscaleOAuthClientID && TailscaleSecretStore.hasClientSecret()
+    }
+
+    var hasSelectedTailscaleDevice: Bool {
+        settings.selectedTailscaleDeviceID != nil && settings.normalizedBaseURL != nil
+    }
+
+    func refreshStartup() async {
+        if isTailscaleSignedIn {
+            await refreshTailscaleDevices()
+        }
+        await refreshAll()
     }
 
     func refreshAll() async {
@@ -48,7 +67,7 @@ final class AppModel {
 
     func refreshHealth() async {
         guard let api else {
-            resetConnectionState(message: "Enter a tailnet URL")
+            resetConnectionState(message: isTailscaleSignedIn ? "Choose a Tailscale device" : "Sign in with Tailscale OAuth")
             return
         }
 
@@ -71,7 +90,107 @@ final class AppModel {
 
     func disconnectFromServer() {
         settings.baseURLString = ""
-        resetConnectionState(message: "Enter a tailnet URL")
+        settings.selectedTailscaleDeviceID = nil
+        settings.selectedTailscaleDeviceName = nil
+        resetConnectionState(message: "Choose a Tailscale device")
+    }
+
+    func signInToTailscale(tailnet: String, clientID: String, clientSecret: String) async {
+        let normalizedTailnet = ServerSettings.normalizedTailnetName(tailnet)
+        let normalizedClientID = ServerSettings.normalizedOAuthClientID(clientID)
+        let normalizedSecret = clientSecret.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !normalizedClientID.isEmpty, !normalizedSecret.isEmpty else {
+            tailscaleMessage = "Enter OAuth client credentials"
+            return
+        }
+
+        isTailscaleLoading = true
+        tailscaleMessage = "Signing in"
+        defer { isTailscaleLoading = false }
+
+        do {
+            let devices = try await TailscaleAPI().fetchDevices(
+                tailnet: normalizedTailnet,
+                clientID: normalizedClientID,
+                clientSecret: normalizedSecret
+            )
+            try TailscaleSecretStore.saveClientSecret(normalizedSecret)
+            settings.tailscaleTailnetName = normalizedTailnet
+            settings.tailscaleClientID = normalizedClientID
+            tailscaleDevices = devices
+            tailscaleMessage = devices.isEmpty ? "Signed in - no devices found" : "Signed in"
+            if let selectedID = settings.selectedTailscaleDeviceID,
+               let selectedDevice = devices.first(where: { $0.id == selectedID }) {
+                applySelectedDevice(selectedDevice)
+                await refreshAll()
+            } else {
+                clearSelectedDevice(message: "Choose a Tailscale device")
+            }
+        } catch {
+            tailscaleMessage = error.localizedDescription
+            TailscaleSecretStore.deleteClientSecret()
+        }
+    }
+
+    func refreshTailscaleDevices() async {
+        guard isTailscaleSignedIn, let clientSecret = TailscaleSecretStore.loadClientSecret() else {
+            tailscaleDevices = []
+            tailscaleMessage = "Sign in with Tailscale OAuth"
+            return
+        }
+
+        isTailscaleLoading = true
+        tailscaleMessage = "Loading devices"
+        defer { isTailscaleLoading = false }
+
+        do {
+            let devices = try await TailscaleAPI().fetchDevices(
+                tailnet: settings.tailscaleTailnetName,
+                clientID: settings.tailscaleClientID,
+                clientSecret: clientSecret
+            )
+            tailscaleDevices = devices
+            tailscaleMessage = devices.isEmpty ? "No devices found" : "Devices loaded"
+            if let selectedID = settings.selectedTailscaleDeviceID,
+               let selectedDevice = devices.first(where: { $0.id == selectedID }) {
+                applySelectedDevice(selectedDevice)
+            } else if settings.selectedTailscaleDeviceID != nil {
+                clearSelectedDevice(message: "Choose a Tailscale device")
+            }
+        } catch {
+            tailscaleDevices = []
+            tailscaleMessage = error.localizedDescription
+        }
+    }
+
+    func selectTailscaleDevice(id: String?) async {
+        guard let id else {
+            clearSelectedDevice(message: "Choose a Tailscale device")
+            return
+        }
+
+        guard let device = tailscaleDevices.first(where: { $0.id == id }) else {
+            connectionMessage = "Device not found"
+            return
+        }
+
+        guard !device.serverURLString.isEmpty else {
+            connectionMessage = "Device has no Tailscale address"
+            return
+        }
+
+        applySelectedDevice(device)
+        await refreshAll()
+    }
+
+    func signOutOfTailscale() {
+        TailscaleSecretStore.deleteClientSecret()
+        tailscaleDevices = []
+        tailscaleMessage = "Sign in with Tailscale OAuth"
+        settings.tailscaleClientID = ""
+        settings.tailscaleTailnetName = ServerSettings.defaultTailscaleTailnetName
+        clearSelectedDevice(message: "Sign in with Tailscale OAuth")
     }
 
     func refreshSessions() async {
@@ -170,6 +289,19 @@ final class AppModel {
         activeTerminalSessionId = defaultSessionId ?? sessions.first?.id
     }
 
+    private func applySelectedDevice(_ device: TailscaleDevice) {
+        settings.selectedTailscaleDeviceID = device.id
+        settings.selectedTailscaleDeviceName = device.displayName
+        settings.baseURLString = ServerSettings.normalizedURLString(device.serverURLString)
+    }
+
+    private func clearSelectedDevice(message: String) {
+        settings.selectedTailscaleDeviceID = nil
+        settings.selectedTailscaleDeviceName = nil
+        settings.baseURLString = ""
+        resetConnectionState(message: message)
+    }
+
     private func resetConnectionState(message: String) {
         health = nil
         sessions = []
@@ -180,6 +312,63 @@ final class AppModel {
         remoteCapabilities = nil
         connectionMessage = message
         isLoading = false
+    }
+}
+
+enum TailscaleSecretStore {
+    private static let service = "online-cli.tailscale.oauth"
+    private static let account = "client-secret"
+
+    static func hasClientSecret() -> Bool {
+        loadClientSecret() != nil
+    }
+
+    static func loadClientSecret() -> String? {
+        var query = baseQuery()
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess, let data = result as? Data else {
+            return nil
+        }
+        return String(data: data, encoding: .utf8)
+    }
+
+    static func saveClientSecret(_ secret: String) throws {
+        let data = Data(secret.utf8)
+        var query = baseQuery()
+        query[kSecValueData as String] = data
+
+        SecItemDelete(baseQuery() as CFDictionary)
+        let status = SecItemAdd(query as CFDictionary, nil)
+        guard status == errSecSuccess else {
+            throw KeychainError.unhandledStatus(status)
+        }
+    }
+
+    static func deleteClientSecret() {
+        SecItemDelete(baseQuery() as CFDictionary)
+    }
+
+    private static func baseQuery() -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+    }
+}
+
+enum KeychainError: LocalizedError {
+    case unhandledStatus(OSStatus)
+
+    var errorDescription: String? {
+        switch self {
+        case .unhandledStatus(let status):
+            return "Keychain failed (\(status))"
+        }
     }
 }
 

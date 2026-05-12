@@ -17,6 +17,125 @@ enum APIError: LocalizedError {
     }
 }
 
+enum TailscaleAPIError: LocalizedError {
+    case invalidRequest
+    case badStatus(Int, String)
+    case missingToken
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidRequest:
+            return "Invalid Tailscale OAuth settings"
+        case .badStatus(let status, let message):
+            return message.isEmpty ? "Tailscale request failed (\(status))" : message
+        case .missingToken:
+            return "Tailscale did not return an access token"
+        }
+    }
+}
+
+struct TailscaleAPI {
+    private let baseURL = URL(string: "https://api.tailscale.com")!
+    private let decoder = JSONDecoder()
+
+    func fetchDevices(tailnet: String, clientID: String, clientSecret: String) async throws -> [TailscaleDevice] {
+        let token = try await fetchAccessToken(clientID: clientID, clientSecret: clientSecret)
+        return try await fetchDevices(tailnet: tailnet, accessToken: token)
+    }
+
+    private func fetchAccessToken(clientID: String, clientSecret: String) async throws -> String {
+        let trimmedClientID = ServerSettings.normalizedOAuthClientID(clientID)
+        let trimmedSecret = clientSecret.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard
+            !trimmedClientID.isEmpty,
+            !trimmedSecret.isEmpty,
+            let tokenURL = URL(string: "/api/v2/oauth/token", relativeTo: baseURL)
+        else {
+            throw TailscaleAPIError.invalidRequest
+        }
+
+        var form = URLComponents()
+        form.queryItems = [
+            URLQueryItem(name: "grant_type", value: "client_credentials"),
+            URLQueryItem(name: "scope", value: "devices:core:read")
+        ]
+
+        guard let body = form.percentEncodedQuery?.data(using: .utf8) else {
+            throw TailscaleAPIError.invalidRequest
+        }
+
+        var request = URLRequest(url: tokenURL)
+        request.httpMethod = "POST"
+        request.httpBody = body
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "content-type")
+        request.setValue("application/json", forHTTPHeaderField: "accept")
+
+        let credentials = "\(trimmedClientID):\(trimmedSecret)"
+        guard let credentialsData = credentials.data(using: .utf8) else {
+            throw TailscaleAPIError.invalidRequest
+        }
+        request.setValue("Basic \(credentialsData.base64EncodedString())", forHTTPHeaderField: "authorization")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validate(response: response, data: data)
+
+        let token = try decoder.decode(TailscaleOAuthTokenResponse.self, from: data)
+        let accessToken = token.accessToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !accessToken.isEmpty else {
+            throw TailscaleAPIError.missingToken
+        }
+        return accessToken
+    }
+
+    private func fetchDevices(tailnet: String, accessToken: String) async throws -> [TailscaleDevice] {
+        let normalizedTailnet = ServerSettings.normalizedTailnetName(tailnet)
+        let allowed = CharacterSet.urlPathAllowed.subtracting(CharacterSet(charactersIn: "/"))
+        guard
+            let encodedTailnet = normalizedTailnet.addingPercentEncoding(withAllowedCharacters: allowed),
+            let devicesURL = URL(string: "/api/v2/tailnet/\(encodedTailnet)/devices", relativeTo: baseURL)
+        else {
+            throw TailscaleAPIError.invalidRequest
+        }
+
+        var request = URLRequest(url: devicesURL)
+        request.setValue("application/json", forHTTPHeaderField: "accept")
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "authorization")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validate(response: response, data: data)
+
+        let devicesResponse = try decoder.decode(TailscaleDevicesResponse.self, from: data)
+        return devicesResponse.devices.sorted { lhs, rhs in
+            lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
+        }
+    }
+
+    private func validate(response: URLResponse, data: Data) throws {
+        guard let http = response as? HTTPURLResponse else {
+            return
+        }
+
+        guard (200..<300).contains(http.statusCode) else {
+            let message = (try? decoder.decode(TailscaleErrorResponse.self, from: data).message)
+                ?? (try? decoder.decode(ErrorResponse.self, from: data).error)
+                ?? ""
+            throw TailscaleAPIError.badStatus(http.statusCode, message)
+        }
+    }
+}
+
+private struct TailscaleOAuthTokenResponse: Decodable {
+    let accessToken: String
+
+    enum CodingKeys: String, CodingKey {
+        case accessToken = "access_token"
+    }
+}
+
+private struct TailscaleErrorResponse: Decodable {
+    let message: String?
+}
+
 struct OnlineCLIAPI {
     let baseURL: URL
     private let decoder = JSONDecoder()
