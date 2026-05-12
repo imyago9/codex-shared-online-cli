@@ -18,6 +18,7 @@ private enum RemoteChromeSpacing {
     static let commandDockHeight: CGFloat = 64
     static let commandDockHiddenGap: CGFloat = 24
     static let commandDockRevealStripHeight: CGFloat = 34
+    static let gameControlsHeight: CGFloat = 122
     static let controlsLauncherGap: CGFloat = 8
     static let controlsDockGap: CGFloat = 12
     static let controlsDockHeight = quickDockHeight + controlsLauncherGap + quickDockHeight
@@ -438,13 +439,16 @@ struct RemoteDesktopView: View {
                 let telemetryLeadingInset = max(RemoteChromeSpacing.edgeInset + 8, proxy.safeAreaInsets.leading + 8)
                 let dockBottomInset = quickDockInset
                 let commandDockHiddenOffset = dockBottomInset + RemoteChromeSpacing.commandDockHeight + RemoteChromeSpacing.commandDockHiddenGap
-                let telemetryBottomInset = commandDockHidden
+                let telemetryBaseBottomInset = commandDockHidden
                     ? RemoteChromeSpacing.edgeInset + 8
                     : dockBottomInset + RemoteChromeSpacing.commandDockHeight + 6
                 let monitorPanelBottomInset = dockBottomInset + RemoteChromeSpacing.commandDockHeight + RemoteChromeSpacing.monitorPanelDockGap
                 let gameControlsBottomInset = commandDockHidden
                     ? dockBottomInset + 10
                     : dockBottomInset + RemoteChromeSpacing.commandDockHeight + 10
+                let telemetryBottomInset = gameControlsVisible
+                    ? gameControlsBottomInset + RemoteChromeSpacing.gameControlsHeight + 8
+                    : telemetryBaseBottomInset
                 ZStack {
                     Color.black.ignoresSafeArea()
 
