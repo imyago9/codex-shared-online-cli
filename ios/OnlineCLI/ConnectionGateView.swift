@@ -71,9 +71,9 @@ struct ConnectionGateView: View {
             .disabled(app.isLoading || draftURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
             Button {
-                openTailscale()
+                openTailscaleStorePage()
             } label: {
-                Label("Open Tailscale", systemImage: "network.badge.shield.half.filled")
+                Label("Tailscale App", systemImage: "network.badge.shield.half.filled")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
@@ -96,13 +96,7 @@ struct ConnectionGateView: View {
         localMessage = app.isServerConnected ? "Connected" : app.connectionMessage
     }
 
-    private func openTailscale() {
-        guard let appURL = URL(string: "tailscale://") else { return }
-        if UIApplication.shared.canOpenURL(appURL) {
-            UIApplication.shared.open(appURL)
-            return
-        }
-
+    private func openTailscaleStorePage() {
         if let storeURL = URL(string: "https://apps.apple.com/app/tailscale/id1470499037") {
             UIApplication.shared.open(storeURL)
         }
