@@ -249,6 +249,21 @@ function sanitizeInputEvent(rawValue) {
     }, rawValue);
   }
 
+  if (type === 'mouse_delta') {
+    const deltaX = clampDelta(rawValue.deltaX ?? rawValue.dx, 0);
+    const deltaY = clampDelta(rawValue.deltaY ?? rawValue.dy, 0);
+    if (deltaX === 0 && deltaY === 0) {
+      return null;
+    }
+
+    return attachInputMetadata({
+      type,
+      deltaX,
+      deltaY,
+      at: Date.now()
+    }, rawValue);
+  }
+
   if (type === 'mouse_button') {
     const button = typeof rawValue.button === 'string' ? rawValue.button.trim().toLowerCase() : '';
     const action = typeof rawValue.action === 'string' ? rawValue.action.trim().toLowerCase() : '';
@@ -358,6 +373,7 @@ function shouldAckInput(event) {
 function isLatencyCriticalInput(event) {
   const type = inputEventType(event);
   return type === 'mouse_button'
+    || type === 'mouse_delta'
     || type === 'mouse_wheel'
     || type === 'key'
     || type === 'text'

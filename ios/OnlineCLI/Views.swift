@@ -4510,8 +4510,8 @@ private struct RemoteGameControlsOverlay: View {
 
             Spacer(minLength: 12)
 
-            RemoteGameJoystick { keys in
-                setSource("joystick", keys: keys)
+            RemoteMouseLookJoystick { dx, dy in
+                client.sendMouseDelta(dx: dx, dy: dy)
             }
         }
         .frame(maxWidth: .infinity)
@@ -4639,12 +4639,13 @@ private struct RemoteHeldGameKeyButton: View {
     }
 }
 
-private struct RemoteGameJoystick: View {
+private struct RemoteMouseLookJoystick: View {
     var diameter: CGFloat = 122
-    let onKeysChanged: (Set<RemoteGameKey>) -> Void
+    let onDelta: (CGFloat, CGFloat) -> Void
 
     @State private var knobOffset = CGSize.zero
-    @State private var activeKeys: Set<RemoteGameKey> = []
+    @State private var lookVector = CGSize.zero
+    @State private var repeatTask: Task<Void, Never>?
 
     var body: some View {
         ZStack {
@@ -4671,20 +4672,20 @@ private struct RemoteGameJoystick: View {
                     let radius = diameter * 0.38
                     let clamped = clampedOffset(value.translation, radius: radius)
                     knobOffset = clamped
-                    setActiveKeys(keys(for: clamped, radius: radius))
+                    setLookVector(vector(for: clamped, radius: radius))
                 }
                 .onEnded { _ in
                     withAnimation(.spring(response: 0.22, dampingFraction: 0.72)) {
                         knobOffset = .zero
                     }
-                    setActiveKeys([])
+                    stopRepeating()
                 }
         )
         .onDisappear {
-            setActiveKeys([])
+            stopRepeating()
         }
-        .accessibilityLabel("WASD joystick")
-        .accessibilityHint("Drag to hold movement keys on the remote computer")
+        .accessibilityLabel("Mouse look joystick")
+        .accessibilityHint("Drag to look around on the remote computer")
     }
 
     private func clampedOffset(_ translation: CGSize, radius: CGFloat) -> CGSize {
@@ -4694,32 +4695,43 @@ private struct RemoteGameJoystick: View {
         return CGSize(width: translation.width * scale, height: translation.height * scale)
     }
 
-    private func keys(for offset: CGSize, radius: CGFloat) -> Set<RemoteGameKey> {
-        let deadzone: CGFloat = 0.28
+    private func vector(for offset: CGSize, radius: CGFloat) -> CGSize {
+        let deadzone: CGFloat = 0.16
         let x = offset.width / radius
         let y = offset.height / radius
-        var keys = Set<RemoteGameKey>()
-
-        if y < -deadzone {
-            keys.insert(.w)
-        }
-        if y > deadzone {
-            keys.insert(.s)
-        }
-        if x < -deadzone {
-            keys.insert(.a)
-        }
-        if x > deadzone {
-            keys.insert(.d)
-        }
-
-        return keys
+        let normalizedX = abs(x) < deadzone ? 0 : x
+        let normalizedY = abs(y) < deadzone ? 0 : y
+        return CGSize(width: normalizedX, height: normalizedY)
     }
 
-    private func setActiveKeys(_ keys: Set<RemoteGameKey>) {
-        guard activeKeys != keys else { return }
-        activeKeys = keys
-        onKeysChanged(keys)
+    private func setLookVector(_ vector: CGSize) {
+        lookVector = vector
+        if vector == .zero {
+            stopRepeating()
+        } else {
+            startRepeatingIfNeeded()
+        }
+    }
+
+    private func startRepeatingIfNeeded() {
+        guard repeatTask == nil else { return }
+        repeatTask = Task { @MainActor in
+            while !Task.isCancelled {
+                let vector = lookVector
+                if vector == .zero {
+                    break
+                }
+                onDelta(vector.width * 18, vector.height * 18)
+                try? await Task.sleep(nanoseconds: 16_000_000)
+            }
+            repeatTask = nil
+        }
+    }
+
+    private func stopRepeating() {
+        lookVector = .zero
+        repeatTask?.cancel()
+        repeatTask = nil
     }
 }
 

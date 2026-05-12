@@ -129,6 +129,7 @@ function isMouseMoveEvent(event) {
 function isLatencyCriticalInput(event) {
   const type = inputEventType(event);
   return type === 'mouse_button'
+    || type === 'mouse_delta'
     || type === 'mouse_wheel'
     || type === 'key'
     || type === 'text'
@@ -1577,6 +1578,29 @@ function createNutInputController(nut, displayBounds, logger) {
     await mouse.scrollDown(scrollAmount);
   }
 
+  async function handleMouseDelta(event) {
+    const deltaX = clampInteger(Number(event.deltaX) || 0, -1200, 1200);
+    const deltaY = clampInteger(Number(event.deltaY) || 0, -1200, 1200);
+    if (deltaX === 0 && deltaY === 0) {
+      return;
+    }
+    if (typeof mouse.getPosition !== 'function' || typeof mouse.setPosition !== 'function') {
+      throw new Error('mouse-relative-move-unavailable');
+    }
+
+    const position = await mouse.getPosition();
+    const currentX = Number(position && position.x);
+    const currentY = Number(position && position.y);
+    if (!Number.isFinite(currentX) || !Number.isFinite(currentY)) {
+      throw new Error('mouse-position-unavailable');
+    }
+
+    await mouse.setPosition(buildPoint(
+      Math.round(currentX + deltaX),
+      Math.round(currentY + deltaY)
+    ));
+  }
+
   async function handleKeyEvent(event) {
     const action = typeof event.action === 'string' ? event.action : 'press';
     const key = resolveKey(event);
@@ -1649,6 +1673,11 @@ function createNutInputController(nut, displayBounds, logger) {
 
       if (type === 'mouse_wheel') {
         await handleMouseWheel(event);
+        return { ok: true };
+      }
+
+      if (type === 'mouse_delta') {
+        await handleMouseDelta(event);
         return { ok: true };
       }
 
@@ -1837,7 +1866,7 @@ public static class NativeInput {
   public static extern bool SetCursorPos(int X, int Y);
 
   [DllImport("user32.dll", SetLastError=true)]
-  public static extern void mouse_event(uint dwFlags, uint dx, uint dy, int dwData, UIntPtr dwExtraInfo);
+  public static extern void mouse_event(uint dwFlags, int dx, int dy, int dwData, UIntPtr dwExtraInfo);
 
   [DllImport("user32.dll", SetLastError=true)]
   public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
@@ -1852,6 +1881,7 @@ $MOUSEEVENTF_RIGHTDOWN = 0x0008
 $MOUSEEVENTF_RIGHTUP = 0x0010
 $MOUSEEVENTF_MIDDLEDOWN = 0x0020
 $MOUSEEVENTF_MIDDLEUP = 0x0040
+$MOUSEEVENTF_MOVE = 0x0001
 $MOUSEEVENTF_WHEEL = 0x0800
 $KEYEVENTF_KEYUP = 0x0002
 $VK_SHIFT = 0x10
@@ -1910,6 +1940,11 @@ function Invoke-KeyChord([int]$vk, [int]$modMask) {
 
 function Invoke-MouseMove([int]$x, [int]$y) {
   [NativeInput]::SetCursorPos($x, $y) | Out-Null
+}
+
+function Invoke-MouseDelta([int]$dx, [int]$dy) {
+  if ($dx -eq 0 -and $dy -eq 0) { return }
+  [NativeInput]::mouse_event([uint32]$MOUSEEVENTF_MOVE, $dx, $dy, 0, [UIntPtr]::Zero)
 }
 
 function Invoke-MouseButton([string]$button, [string]$action) {
@@ -2110,6 +2145,15 @@ function Invoke-TextInput([string]$base64) {
 
       if (type === 'mouse_move') {
         moveCursor(event, true);
+        return { ok: true };
+      }
+
+      if (type === 'mouse_delta') {
+        const deltaX = clampInteger(Number(event.deltaX) || 0, -1200, 1200);
+        const deltaY = clampInteger(Number(event.deltaY) || 0, -1200, 1200);
+        if (deltaX !== 0 || deltaY !== 0) {
+          writePowerShellCommand(`Invoke-MouseDelta ${deltaX} ${deltaY}`);
+        }
         return { ok: true };
       }
 

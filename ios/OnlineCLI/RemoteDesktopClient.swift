@@ -364,6 +364,15 @@ final class RemoteDesktopClient {
         ])
     }
 
+    func sendMouseDelta(dx: CGFloat, dy: CGFloat) {
+        guard abs(dx) >= 0.25 || abs(dy) >= 0.25 else { return }
+        sendInput([
+            "type": "mouse_delta",
+            "deltaX": Int(dx.rounded()),
+            "deltaY": Int(dy.rounded())
+        ], reportBlocked: false)
+    }
+
     func nudgePointer(dx: CGFloat, dy: CGFloat) {
         let next = CGPoint(
             x: min(1, max(0, lastPointer.x + dx)),
@@ -899,7 +908,7 @@ final class RemoteDesktopClient {
         }
 
         let type = event["type"] as? String ?? ""
-        guard type == "mouse_move" else { return true }
+        guard type == "mouse_move" || type == "mouse_delta" else { return true }
 
         let now = ProcessInfo.processInfo.systemUptime
         guard now - lastPointerAckRequestAt >= pointerAckInterval else { return false }
