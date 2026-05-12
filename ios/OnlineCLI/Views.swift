@@ -31,6 +31,11 @@ private enum RemoteChromeBehavior {
     static let commandDockActivityThrottle: TimeInterval = 0.25
 }
 
+private enum RemoteDockPanel: Equatable {
+    case shortcuts
+    case clicks
+}
+
 struct RemoteTelemetrySnapshot: Equatable {
     var state: RemoteConnectionState = .disconnected
     var status = "Remote idle"
@@ -427,6 +432,7 @@ struct RemoteDesktopView: View {
     @State private var preferredStreamTransport: RemoteStreamTransport = .video
     @State private var gameControlsVisible = false
     @State private var gameInputReleaseToken = 0
+    @State private var presentedRemoteDockPanel: RemoteDockPanel?
     private let telemetryTicker = Timer.publish(every: 0.33, on: .main, in: .common).autoconnect()
 
     var body: some View {
@@ -449,6 +455,7 @@ struct RemoteDesktopView: View {
                 let telemetryBottomInset = gameControlsVisible
                     ? gameControlsBottomInset + RemoteChromeSpacing.gameControlsHeight + 8
                     : telemetryBaseBottomInset
+                let dockPanelBottomInset = dockBottomInset + RemoteChromeSpacing.commandDockHeight + 8
                 ZStack {
                     Color.black.ignoresSafeArea()
 
@@ -530,6 +537,24 @@ struct RemoteDesktopView: View {
                         .zIndex(54)
                     }
 
+                    if let presentedRemoteDockPanel {
+                        VStack {
+                            Spacer()
+                            RemoteDockPanelOverlay(
+                                panel: presentedRemoteDockPanel,
+                                client: client,
+                                actions: app.remoteCapabilities?.actions ?? [],
+                                isLandscape: isLandscape,
+                                onDismiss: dismissRemoteDockPanel,
+                                onActivity: noteRemoteChromeActivity
+                            )
+                            .padding(.horizontal, max(10, max(proxy.safeAreaInsets.leading, proxy.safeAreaInsets.trailing) + 8))
+                            .padding(.bottom, dockPanelBottomInset)
+                        }
+                        .transition(.opacity)
+                        .zIndex(56)
+                    }
+
                     VStack {
                         Spacer()
                         RemoteCommandDock(
@@ -547,7 +572,9 @@ struct RemoteDesktopView: View {
                             onControlToggle: toggleControlMode,
                             onMonitorToggle: toggleMonitorPanel,
                             onKeyboardToggle: toggleRemoteKeyboard,
-                            onKeyboardLongPress: toggleGameControls
+                            onKeyboardLongPress: toggleGameControls,
+                            onShortcutPanelToggle: toggleShortcutPanel,
+                            onClickPanelToggle: toggleClickPanel
                         )
                         .frame(maxWidth: .infinity)
                         .padding(.horizontal, dockSideInset)
@@ -731,6 +758,7 @@ struct RemoteDesktopView: View {
     }
 
     private func toggleControlMode() {
+        dismissRemoteDockPanel()
         setRemoteMode(desiredMode == .control ? .view : .control)
     }
 
@@ -742,6 +770,7 @@ struct RemoteDesktopView: View {
     }
 
     private func toggleMonitorPanel() {
+        dismissRemoteDockPanel()
         monitorPanelPresented.toggle()
         if monitorPanelPresented {
             reconcileMonitorSelection(availableMonitors)
@@ -794,6 +823,7 @@ struct RemoteDesktopView: View {
     }
 
     private func toggleRemoteKeyboard() {
+        dismissRemoteDockPanel()
         if remoteKeyboardVisible {
             dismissRemoteKeyboard()
         } else {
@@ -807,6 +837,7 @@ struct RemoteDesktopView: View {
 
     private func toggleGameControls() {
         noteRemoteChromeActivity(force: true)
+        dismissRemoteDockPanel()
         if gameControlsVisible {
             withAnimation(.spring(response: 0.24, dampingFraction: 0.86)) {
                 gameControlsVisible = false
@@ -828,6 +859,28 @@ struct RemoteDesktopView: View {
     private func dismissRemoteKeyboard() {
         remoteKeyboardVisible = false
         remoteKeyboardDismissToken += 1
+    }
+
+    private func toggleShortcutPanel() {
+        toggleRemoteDockPanel(.shortcuts)
+    }
+
+    private func toggleClickPanel() {
+        toggleRemoteDockPanel(.clicks)
+    }
+
+    private func toggleRemoteDockPanel(_ panel: RemoteDockPanel) {
+        noteRemoteChromeActivity(force: true)
+        withAnimation(.linear(duration: 0.08)) {
+            presentedRemoteDockPanel = presentedRemoteDockPanel == panel ? nil : panel
+        }
+    }
+
+    private func dismissRemoteDockPanel() {
+        guard presentedRemoteDockPanel != nil else { return }
+        withAnimation(.linear(duration: 0.08)) {
+            presentedRemoteDockPanel = nil
+        }
     }
 
     private func refreshTelemetry() {
@@ -861,6 +914,7 @@ struct RemoteDesktopView: View {
     private func updateCommandDockIdleState() {
         guard lastCommandDockActivityUptime > 0 else { return }
         guard !commandDockHidden else { return }
+        guard presentedRemoteDockPanel == nil, !monitorPanelPresented else { return }
         guard ProcessInfo.processInfo.systemUptime - lastCommandDockActivityUptime >= RemoteChromeBehavior.commandDockIdleDelay else { return }
 
         withAnimation(.spring(response: 0.3, dampingFraction: 0.9)) {
@@ -3096,6 +3150,8 @@ struct RemoteCommandDock: View {
     let onMonitorToggle: () -> Void
     let onKeyboardToggle: () -> Void
     let onKeyboardLongPress: () -> Void
+    let onShortcutPanelToggle: () -> Void
+    let onClickPanelToggle: () -> Void
 
     var body: some View {
         GeometryReader { proxy in
@@ -3150,11 +3206,13 @@ struct RemoteCommandDock: View {
                             client.sendWheel(deltaY: 360)
                         }
 
-                        RemoteShortcutCommandMenu(
-                            client: client,
-                            actions: actions,
+                        RemoteCommandButton(
+                            systemName: "command",
+                            title: "More",
                             isDisabled: inputDisabled,
-                            onActivity: onActivity
+                            minWidth: 58,
+                            accessibilityLabel: "Remote shortcuts",
+                            action: perform(onShortcutPanelToggle)
                         )
 
                         RemoteCommandButton(
@@ -3174,7 +3232,8 @@ struct RemoteCommandDock: View {
                             mode: mode,
                             controlAvailable: controlAvailable,
                             onActivity: onActivity,
-                            onToggle: onControlToggle
+                            onToggle: onControlToggle,
+                            onClickPanelToggle: onClickPanelToggle
                         )
                         .id(Self.controlButtonScrollID)
                     }
@@ -3344,6 +3403,7 @@ struct RemoteControlModeButton: View {
     let controlAvailable: Bool
     let onActivity: () -> Void
     let onToggle: () -> Void
+    let onClickPanelToggle: () -> Void
 
     @State private var lastDragTranslation = CGSize.zero
 
@@ -3353,27 +3413,9 @@ struct RemoteControlModeButton: View {
         } else {
             buttonSurface
                 .highPriorityGesture(trackpadDrag)
-                .contextMenu {
-                    Button {
-                        onActivity()
-                        client.sendClick(button: "left")
-                    } label: {
-                        Label("Left", systemImage: "cursorarrow.click")
-                    }
-
-                    Button {
-                        onActivity()
-                        client.sendClick(button: "right")
-                    } label: {
-                        Label("Right", systemImage: "cursorarrow")
-                    }
-
-                    Button {
-                        onActivity()
-                        client.sendDoubleClick()
-                    } label: {
-                        Label("Double Left", systemImage: "cursorarrow.click")
-                    }
+                .onLongPressGesture(minimumDuration: 0.45) {
+                    onActivity()
+                    onClickPanelToggle()
                 }
         }
     }
@@ -3445,6 +3487,249 @@ struct RemoteCommandMenuLabel: View {
         .frame(height: 44)
         .padding(.horizontal, 2)
         .remoteCommandBubbleSurface(cornerRadius: 16, isActive: isActive)
+    }
+}
+
+private struct RemoteDockPanelOverlay: View {
+    let panel: RemoteDockPanel
+    let client: RemoteDesktopClient
+    let actions: [RemoteActionDescriptor]
+    let isLandscape: Bool
+    let onDismiss: () -> Void
+    let onActivity: () -> Void
+
+    var body: some View {
+        HStack {
+            if panel == .clicks {
+                Spacer(minLength: 0)
+            }
+
+            panelBody
+                .frame(maxWidth: panelMaxWidth, alignment: .leading)
+
+            if panel == .shortcuts {
+                Spacer(minLength: 0)
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    @ViewBuilder
+    private var panelBody: some View {
+        switch panel {
+        case .shortcuts:
+            shortcutsPanel
+        case .clicks:
+            clicksPanel
+        }
+    }
+
+    private var shortcutsPanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            panelHeader(title: "More", systemName: "command")
+
+            ScrollView(.vertical, showsIndicators: false) {
+                LazyVStack(spacing: 7) {
+                    ForEach(RemoteShortcut.allCases) { shortcut in
+                        RemoteDockPanelRow(
+                            title: shortcut.title,
+                            systemName: shortcut.systemImage
+                        ) {
+                            performAndDismiss {
+                                client.sendShortcut(shortcut)
+                            }
+                        }
+                    }
+
+                    if !customActions.isEmpty {
+                        Divider()
+                            .overlay(.white.opacity(0.2))
+                            .padding(.vertical, 2)
+
+                        ForEach(customActions) { action in
+                            RemoteDockPanelRow(
+                                title: action.label,
+                                systemName: systemImage(for: action.id)
+                            ) {
+                                performAndDismiss {
+                                    client.sendAction(action)
+                                }
+                            }
+                        }
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+            .frame(maxHeight: isLandscape ? 232 : 316)
+        }
+        .padding(10)
+        .remoteDockPanelSurface()
+    }
+
+    private var clicksPanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            panelHeader(title: "Click", systemName: "cursorarrow.click")
+
+            RemoteDockPanelRow(title: "Left", systemName: "cursorarrow.click") {
+                performAndDismiss {
+                    client.sendClick(button: "left")
+                }
+            }
+
+            RemoteDockPanelRow(title: "Right", systemName: "cursorarrow") {
+                performAndDismiss {
+                    client.sendClick(button: "right")
+                }
+            }
+
+            RemoteDockPanelRow(title: "Double Left", systemName: "cursorarrow.click.2") {
+                performAndDismiss {
+                    client.sendDoubleClick()
+                }
+            }
+        }
+        .padding(10)
+        .remoteDockPanelSurface()
+    }
+
+    private func panelHeader(title: String, systemName: String) -> some View {
+        HStack(spacing: 8) {
+            Label(title, systemImage: systemName)
+                .font(.caption.weight(.heavy))
+                .foregroundStyle(.white.opacity(0.96))
+            Spacer(minLength: 8)
+            Button(action: onDismiss) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 11, weight: .heavy))
+                    .foregroundStyle(.white.opacity(0.9))
+                    .frame(width: 28, height: 28)
+                    .background(.white.opacity(0.12), in: Circle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Close panel")
+        }
+    }
+
+    private var panelMaxWidth: CGFloat {
+        switch panel {
+        case .shortcuts:
+            return isLandscape ? 330 : 360
+        case .clicks:
+            return 238
+        }
+    }
+
+    private var customActions: [RemoteActionDescriptor] {
+        actions.filter { RemoteShortcut(rawValue: $0.id) == nil }
+    }
+
+    private func performAndDismiss(_ action: () -> Void) {
+        onActivity()
+        action()
+        onDismiss()
+    }
+
+    private func systemImage(for actionId: String) -> String {
+        switch actionId {
+        case "copy":
+            return "doc.on.doc"
+        case "paste":
+            return "clipboard"
+        case "cut":
+            return "scissors"
+        case "undo":
+            return "arrow.uturn.backward"
+        case "redo":
+            return "arrow.uturn.forward"
+        case "selectAll":
+            return "textformat"
+        case "find", "search":
+            return "magnifyingglass"
+        case "save":
+            return "square.and.arrow.down"
+        case "print":
+            return "printer"
+        case "newTab":
+            return "plus.square.on.square"
+        case "closeTab":
+            return "xmark.square"
+        case "nextTab":
+            return "arrow.right.square"
+        case "previousTab":
+            return "arrow.left.square"
+        case "reopenClosedTab":
+            return "arrow.uturn.backward"
+        case "newWindow":
+            return "plus.rectangle"
+        case "addressBar":
+            return "link"
+        case "browserBack":
+            return "chevron.backward"
+        case "browserForward":
+            return "chevron.forward"
+        case "altTab", "winTab":
+            return "rectangle.stack"
+        case "altShiftTab":
+            return "rectangle.stack.badge.minus"
+        case "showDesktop":
+            return "desktopcomputer"
+        case "taskManager":
+            return "speedometer"
+        case "runDialog":
+            return "terminal"
+        case "fileExplorer":
+            return "folder"
+        case "settings":
+            return "gearshape"
+        case "clipboardHistory":
+            return "clipboard"
+        case "minimizeAll":
+            return "rectangle.compress.vertical"
+        case "restoreWindows":
+            return "rectangle.expand.vertical"
+        case "lock":
+            return "lock"
+        case "screenshot":
+            return "camera.viewfinder"
+        case "screenSnip":
+            return "crop"
+        case "devTools":
+            return "hammer"
+        case "properties":
+            return "info.circle"
+        case "windowMenu":
+            return "list.bullet"
+        case "closeWindow":
+            return "xmark.rectangle"
+        default:
+            return "command"
+        }
+    }
+}
+
+private struct RemoteDockPanelRow: View {
+    let title: String
+    let systemName: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: systemName)
+                    .font(.system(size: 14, weight: .semibold))
+                    .frame(width: 22)
+                Text(title)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+                Spacer(minLength: 6)
+            }
+            .foregroundStyle(.white.opacity(0.96))
+            .frame(minHeight: 38)
+            .padding(.horizontal, 10)
+            .background(.white.opacity(0.09), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -5072,6 +5357,24 @@ private extension View {
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                     .stroke(.white.opacity(0.16), lineWidth: 1)
             }
+    }
+
+    func remoteDockPanelSurface() -> some View {
+        self
+            .background {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(.ultraThinMaterial)
+                    .opacity(0.62)
+            }
+            .background {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(Color.black.opacity(0.42))
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .stroke(.white.opacity(0.18), lineWidth: 1)
+            }
+            .shadow(color: .black.opacity(0.26), radius: 18, x: 0, y: 8)
     }
 }
 
