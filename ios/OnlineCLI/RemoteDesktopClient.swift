@@ -372,14 +372,22 @@ final class RemoteDesktopClient {
         sendPointerMove(next)
     }
 
-    func sendKey(_ key: String, code: String = "", modifiers: [String: Bool] = [:]) {
+    func sendKey(_ key: String, code: String = "", action: String = "press", modifiers: [String: Bool] = [:]) {
         sendInput([
             "type": "key",
-            "action": "press",
+            "action": action,
             "key": key,
             "code": code,
             "modifiers": modifiers
         ])
+    }
+
+    func sendKeyDown(_ key: String, code: String = "") {
+        sendKey(key, code: code, action: "down")
+    }
+
+    func sendKeyUp(_ key: String, code: String = "") {
+        sendKey(key, code: code, action: "up")
     }
 
     func sendShortcut(_ shortcut: RemoteShortcut) {

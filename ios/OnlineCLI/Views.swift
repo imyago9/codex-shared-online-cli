@@ -424,6 +424,8 @@ struct RemoteDesktopView: View {
     @State private var lastCommandDockActivityUptime: TimeInterval = 0
     @State private var lastStreamRecoveryUptime: TimeInterval = 0
     @State private var preferredStreamTransport: RemoteStreamTransport = .video
+    @State private var gameControlsVisible = false
+    @State private var gameInputReleaseToken = 0
     private let telemetryTicker = Timer.publish(every: 0.33, on: .main, in: .common).autoconnect()
 
     var body: some View {
@@ -440,6 +442,9 @@ struct RemoteDesktopView: View {
                     ? RemoteChromeSpacing.edgeInset + 8
                     : dockBottomInset + RemoteChromeSpacing.commandDockHeight + 6
                 let monitorPanelBottomInset = dockBottomInset + RemoteChromeSpacing.commandDockHeight + RemoteChromeSpacing.monitorPanelDockGap
+                let gameControlsBottomInset = commandDockHidden
+                    ? dockBottomInset + 10
+                    : dockBottomInset + RemoteChromeSpacing.commandDockHeight + 10
                 ZStack {
                     Color.black.ignoresSafeArea()
 
@@ -507,6 +512,20 @@ struct RemoteDesktopView: View {
                     }
                     .zIndex(54)
 
+                    if gameControlsVisible {
+                        VStack {
+                            Spacer()
+                            RemoteGameControlsOverlay(
+                                client: client,
+                                releaseToken: gameInputReleaseToken
+                            )
+                            .padding(.horizontal, max(12, max(proxy.safeAreaInsets.leading, proxy.safeAreaInsets.trailing) + 8))
+                            .padding(.bottom, gameControlsBottomInset)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                        }
+                        .zIndex(54)
+                    }
+
                     VStack {
                         Spacer()
                         RemoteCommandDock(
@@ -515,6 +534,7 @@ struct RemoteDesktopView: View {
                             monitorActive: monitorPanelPresented,
                             monitorCount: availableMonitors.count,
                             keyboardFocused: remoteKeyboardVisible,
+                            gameControlsVisible: gameControlsVisible,
                             controlAvailable: remoteControlAvailable,
                             scrollToTrailingOnAppear: !isLandscape,
                             actions: app.remoteCapabilities?.actions ?? [],
@@ -522,7 +542,8 @@ struct RemoteDesktopView: View {
                             onRefresh: refreshRemoteStream,
                             onControlToggle: toggleControlMode,
                             onMonitorToggle: toggleMonitorPanel,
-                            onKeyboardToggle: toggleRemoteKeyboard
+                            onKeyboardToggle: toggleRemoteKeyboard,
+                            onKeyboardLongPress: toggleGameControls
                         )
                         .frame(maxWidth: .infinity)
                         .padding(.horizontal, dockSideInset)
@@ -588,9 +609,11 @@ struct RemoteDesktopView: View {
                 updateKeyboardHeight(notification)
             }
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
+                gameInputReleaseToken += 1
                 client.releaseRemoteInputState()
             }
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
+                gameInputReleaseToken += 1
                 client.releaseRemoteInputState()
             }
             .onReceive(telemetryTicker) { _ in
@@ -599,6 +622,7 @@ struct RemoteDesktopView: View {
                 recoverStaleRemoteStreamIfNeeded()
             }
             .onDisappear {
+                gameInputReleaseToken += 1
                 client.releaseRemoteInputState()
                 dismissRemoteKeyboard()
             }
@@ -675,6 +699,7 @@ struct RemoteDesktopView: View {
             }
         case .inactive, .background:
             reconnectOnNextActivation = true
+            gameInputReleaseToken += 1
             client.releaseRemoteInputState()
         @unknown default:
             break
@@ -687,6 +712,10 @@ struct RemoteDesktopView: View {
         case .view:
             gestureMode = .viewport
             dismissRemoteKeyboard()
+            if gameControlsVisible {
+                gameControlsVisible = false
+                gameInputReleaseToken += 1
+            }
         case .control:
             focusedMonitorId = nil
             if gestureMode == .viewport {
@@ -764,7 +793,31 @@ struct RemoteDesktopView: View {
         if remoteKeyboardVisible {
             dismissRemoteKeyboard()
         } else {
+            if gameControlsVisible {
+                gameControlsVisible = false
+                gameInputReleaseToken += 1
+            }
             focusRemoteKeyboard()
+        }
+    }
+
+    private func toggleGameControls() {
+        noteRemoteChromeActivity(force: true)
+        if gameControlsVisible {
+            withAnimation(.spring(response: 0.24, dampingFraction: 0.86)) {
+                gameControlsVisible = false
+            }
+            gameInputReleaseToken += 1
+            return
+        }
+
+        if desiredMode != .control {
+            setRemoteMode(.control)
+        }
+        dismissRemoteKeyboard()
+        gameInputReleaseToken += 1
+        withAnimation(.spring(response: 0.24, dampingFraction: 0.86)) {
+            gameControlsVisible = true
         }
     }
 
@@ -3029,6 +3082,7 @@ struct RemoteCommandDock: View {
     let monitorActive: Bool
     let monitorCount: Int
     let keyboardFocused: Bool
+    let gameControlsVisible: Bool
     let controlAvailable: Bool
     let scrollToTrailingOnAppear: Bool
     let actions: [RemoteActionDescriptor]
@@ -3037,6 +3091,7 @@ struct RemoteCommandDock: View {
     let onControlToggle: () -> Void
     let onMonitorToggle: () -> Void
     let onKeyboardToggle: () -> Void
+    let onKeyboardLongPress: () -> Void
 
     var body: some View {
         GeometryReader { proxy in
@@ -3059,12 +3114,16 @@ struct RemoteCommandDock: View {
                             action: perform(onRefresh)
                         )
 
-                        RemoteCommandButton(
-                            systemName: keyboardFocused ? "keyboard.chevron.compact.down" : "keyboard",
-                            title: keyboardFocused ? "Hide" : "Keys",
-                            isActive: keyboardFocused,
-                            accessibilityLabel: keyboardFocused ? "Hide remote keyboard" : "Show remote keyboard",
-                            action: perform(onKeyboardToggle)
+                        RemoteCommandHoldButton(
+                            systemName: gameControlsVisible ? "gamecontroller" : (keyboardFocused ? "keyboard.chevron.compact.down" : "keyboard"),
+                            title: gameControlsVisible ? "Game" : (keyboardFocused ? "Hide" : "Keys"),
+                            isActive: keyboardFocused || gameControlsVisible,
+                            accessibilityLabel: gameControlsVisible
+                                ? "Hide game controls"
+                                : (keyboardFocused ? "Hide remote keyboard" : "Show remote keyboard"),
+                            accessibilityHint: "Long press to toggle game controls",
+                            tapAction: perform(onKeyboardToggle),
+                            longPressAction: perform(onKeyboardLongPress)
                         )
 
                         RemoteCommandButton(
@@ -3240,6 +3299,38 @@ struct RemoteCommandButton: View {
         .disabled(isDisabled)
         .opacity(isDisabled ? 0.44 : 1)
         .accessibilityLabel(accessibilityLabel)
+    }
+}
+
+struct RemoteCommandHoldButton: View {
+    let systemName: String
+    let title: String
+    var isActive = false
+    var minWidth: CGFloat = 54
+    let accessibilityLabel: String
+    let accessibilityHint: String
+    let tapAction: () -> Void
+    let longPressAction: () -> Void
+
+    var body: some View {
+        VStack(spacing: 3) {
+            Image(systemName: systemName)
+                .font(.system(size: 15, weight: .semibold))
+            Text(title)
+                .font(.caption2.weight(.bold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+        }
+        .foregroundStyle(isActive ? .white : .white.opacity(0.9))
+        .frame(minWidth: minWidth)
+        .frame(height: 44)
+        .padding(.horizontal, 2)
+        .remoteCommandBubbleSurface(cornerRadius: 16, isActive: isActive)
+        .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .onTapGesture(perform: tapAction)
+        .onLongPressGesture(minimumDuration: 0.45, perform: longPressAction)
+        .accessibilityLabel(accessibilityLabel)
+        .accessibilityHint(accessibilityHint)
     }
 }
 
@@ -4100,6 +4191,246 @@ struct FloatingRemoteControls: View {
 
     private var panelWidth: CGFloat {
         return compact ? min(430, containerSize.width * 0.54) : min(620, containerSize.width - 24)
+    }
+}
+
+private enum RemoteGameKey: String, CaseIterable, Identifiable, Hashable {
+    case w
+    case a
+    case s
+    case d
+
+    var id: String { rawValue }
+    var title: String { rawValue.uppercased() }
+    var key: String { rawValue }
+    var code: String { "Key\(title)" }
+}
+
+private struct RemoteGameControlsOverlay: View {
+    let client: RemoteDesktopClient
+    let releaseToken: Int
+
+    @State private var activeSources: [String: Set<RemoteGameKey>] = [:]
+    @State private var sentKeys: Set<RemoteGameKey> = []
+
+    var body: some View {
+        HStack(alignment: .bottom, spacing: 16) {
+            RemoteWASDPad { key, isHeld in
+                setSource("button-\(key.rawValue)", keys: isHeld ? [key] : [])
+            }
+
+            Spacer(minLength: 12)
+
+            RemoteGameJoystick { keys in
+                setSource("joystick", keys: keys)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .onChange(of: releaseToken) { _, _ in
+            releaseAllGameKeys()
+        }
+        .onDisappear {
+            releaseAllGameKeys()
+        }
+    }
+
+    private func setSource(_ source: String, keys: Set<RemoteGameKey>) {
+        if activeSources[source] == keys {
+            return
+        }
+
+        var nextSources = activeSources
+        if keys.isEmpty {
+            nextSources.removeValue(forKey: source)
+        } else {
+            nextSources[source] = keys
+        }
+        activeSources = nextSources
+
+        let nextKeys = nextSources.values.reduce(into: Set<RemoteGameKey>()) { partialResult, keys in
+            partialResult.formUnion(keys)
+        }
+        syncSentKeys(to: nextKeys)
+    }
+
+    private func syncSentKeys(to nextKeys: Set<RemoteGameKey>) {
+        let keysToRelease = sentKeys.subtracting(nextKeys)
+        let keysToPress = nextKeys.subtracting(sentKeys)
+
+        for key in keysToRelease {
+            client.sendKeyUp(key.key, code: key.code)
+        }
+        for key in keysToPress {
+            client.sendKeyDown(key.key, code: key.code)
+        }
+
+        sentKeys = nextKeys
+    }
+
+    private func releaseAllGameKeys() {
+        for key in sentKeys {
+            client.sendKeyUp(key.key, code: key.code)
+        }
+        sentKeys = []
+        activeSources = [:]
+    }
+}
+
+private struct RemoteWASDPad: View {
+    let onHoldChanged: (RemoteGameKey, Bool) -> Void
+
+    var body: some View {
+        VStack(spacing: 8) {
+            RemoteHeldGameKeyButton(gameKey: .w, onHoldChanged: onHoldChanged)
+                .padding(.leading, 62)
+
+            HStack(spacing: 8) {
+                RemoteHeldGameKeyButton(gameKey: .a, onHoldChanged: onHoldChanged)
+                RemoteHeldGameKeyButton(gameKey: .s, onHoldChanged: onHoldChanged)
+                RemoteHeldGameKeyButton(gameKey: .d, onHoldChanged: onHoldChanged)
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("WASD movement buttons")
+    }
+}
+
+private struct RemoteHeldGameKeyButton: View {
+    let gameKey: RemoteGameKey
+    let onHoldChanged: (RemoteGameKey, Bool) -> Void
+
+    @State private var isHolding = false
+
+    var body: some View {
+        Text(gameKey.title)
+            .font(.system(size: 19, weight: .heavy, design: .rounded))
+            .foregroundStyle(isHolding ? .black : .white)
+            .frame(width: 54, height: 54)
+            .background {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(isHolding ? Color.white.opacity(0.88) : Color.black.opacity(0.28))
+            }
+            .background {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(.ultraThinMaterial)
+                    .opacity(0.48)
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(.white.opacity(isHolding ? 0.58 : 0.24), lineWidth: 1)
+            }
+            .shadow(color: .black.opacity(0.22), radius: 10, x: 0, y: 5)
+            .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { _ in
+                        holdIfNeeded()
+                    }
+                    .onEnded { _ in
+                        releaseIfNeeded()
+                    }
+            )
+            .onDisappear {
+                releaseIfNeeded()
+            }
+            .accessibilityLabel("\(gameKey.title) key")
+            .accessibilityHint("Hold to keep the key pressed on the remote computer")
+    }
+
+    private func holdIfNeeded() {
+        guard !isHolding else { return }
+        isHolding = true
+        onHoldChanged(gameKey, true)
+    }
+
+    private func releaseIfNeeded() {
+        guard isHolding else { return }
+        isHolding = false
+        onHoldChanged(gameKey, false)
+    }
+}
+
+private struct RemoteGameJoystick: View {
+    var diameter: CGFloat = 122
+    let onKeysChanged: (Set<RemoteGameKey>) -> Void
+
+    @State private var knobOffset = CGSize.zero
+    @State private var activeKeys: Set<RemoteGameKey> = []
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(.ultraThinMaterial)
+                .opacity(0.5)
+            Circle()
+                .stroke(.white.opacity(0.24), lineWidth: 1)
+            Circle()
+                .fill(Color.black.opacity(0.24))
+                .frame(width: diameter * 0.42, height: diameter * 0.42)
+                .overlay {
+                    Circle()
+                        .stroke(.white.opacity(0.28), lineWidth: 1)
+                }
+                .offset(knobOffset)
+        }
+        .frame(width: diameter, height: diameter)
+        .shadow(color: .black.opacity(0.22), radius: 12, x: 0, y: 6)
+        .contentShape(Circle())
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { value in
+                    let radius = diameter * 0.38
+                    let clamped = clampedOffset(value.translation, radius: radius)
+                    knobOffset = clamped
+                    setActiveKeys(keys(for: clamped, radius: radius))
+                }
+                .onEnded { _ in
+                    withAnimation(.spring(response: 0.22, dampingFraction: 0.72)) {
+                        knobOffset = .zero
+                    }
+                    setActiveKeys([])
+                }
+        )
+        .onDisappear {
+            setActiveKeys([])
+        }
+        .accessibilityLabel("WASD joystick")
+        .accessibilityHint("Drag to hold movement keys on the remote computer")
+    }
+
+    private func clampedOffset(_ translation: CGSize, radius: CGFloat) -> CGSize {
+        let distance = hypot(translation.width, translation.height)
+        guard distance > radius, distance > 0 else { return translation }
+        let scale = radius / distance
+        return CGSize(width: translation.width * scale, height: translation.height * scale)
+    }
+
+    private func keys(for offset: CGSize, radius: CGFloat) -> Set<RemoteGameKey> {
+        let deadzone: CGFloat = 0.28
+        let x = offset.width / radius
+        let y = offset.height / radius
+        var keys = Set<RemoteGameKey>()
+
+        if y < -deadzone {
+            keys.insert(.w)
+        }
+        if y > deadzone {
+            keys.insert(.s)
+        }
+        if x < -deadzone {
+            keys.insert(.a)
+        }
+        if x > deadzone {
+            keys.insert(.d)
+        }
+
+        return keys
+    }
+
+    private func setActiveKeys(_ keys: Set<RemoteGameKey>) {
+        guard activeKeys != keys else { return }
+        activeKeys = keys
+        onKeysChanged(keys)
     }
 }
 
