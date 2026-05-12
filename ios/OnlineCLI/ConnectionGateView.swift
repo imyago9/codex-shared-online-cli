@@ -109,23 +109,19 @@ struct ConnectionGateView: View {
 
     private func viewInTailscale() {
         guard
-            let appURL = URL(string: "tailscale://"),
+            let appStoreURL = URL(string: "itms-apps://apps.apple.com/app/tailscale/id1470499037"),
             let webURL = URL(string: "https://login.tailscale.com/admin/machines")
         else {
             localMessage = "Unable to open Tailscale"
             return
         }
 
-        if UIApplication.shared.canOpenURL(appURL) {
-            UIApplication.shared.open(appURL) { didOpen in
-                if !didOpen {
-                    UIApplication.shared.open(webURL)
-                }
-            }
-        } else {
-            UIApplication.shared.open(webURL) { didOpen in
-                if !didOpen {
-                    localMessage = "Unable to open Tailscale"
+        UIApplication.shared.open(appStoreURL) { didOpen in
+            if !didOpen {
+                UIApplication.shared.open(webURL) { didOpen in
+                    if !didOpen {
+                        localMessage = "Unable to open Tailscale"
+                    }
                 }
             }
         }
