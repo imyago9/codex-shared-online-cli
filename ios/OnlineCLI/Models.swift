@@ -17,16 +17,21 @@ struct ServerSettings: Codable, Equatable {
 
     init() {}
 
-    static var bundledDefaultURLString: String {
-        guard let rawValue = Bundle.main.object(forInfoDictionaryKey: "OnlineCLIDefaultServerURL") as? String else {
-            return ""
+    static func importedConnectionURLString(from url: URL) -> String? {
+        guard url.scheme?.lowercased() == "onlinecli" else {
+            return nil
         }
-        return normalizedURLString(rawValue)
-    }
 
-    static var defaultConnectionCandidate: String? {
-        let candidate = bundledDefaultURLString
-        return candidate.isEmpty ? nil : candidate
+        guard
+            url.host?.lowercased() == "connect",
+            let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+            let rawValue = components.queryItems?.first(where: { $0.name == "url" })?.value
+        else {
+            return nil
+        }
+
+        let normalized = normalizedURLString(rawValue)
+        return normalized.isEmpty ? nil : normalized
     }
 
     static func normalizedURLString(_ value: String) -> String {

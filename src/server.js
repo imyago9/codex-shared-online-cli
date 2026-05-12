@@ -49,6 +49,21 @@ function startServer(options = {}) {
     res.sendFile(path.join(publicDir, 'index.html'));
   });
 
+  app.get('/ios-connect', (req, res) => {
+    const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+    const forwardedHost = String(req.headers['x-forwarded-host'] || '').split(',')[0].trim();
+    const protocol = forwardedProto || req.protocol || 'https';
+    const host = forwardedHost || req.headers.host;
+
+    if (!host) {
+      return res.status(400).send('Missing host header');
+    }
+
+    const baseUrl = `${protocol}://${host}`;
+    const deepLink = `onlinecli://connect?url=${encodeURIComponent(baseUrl)}`;
+    return res.redirect(302, deepLink);
+  });
+
   const sessionManager = new SessionManager({
     logger,
     maxSessions: config.maxSessions,

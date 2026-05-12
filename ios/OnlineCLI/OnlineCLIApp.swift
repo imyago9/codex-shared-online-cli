@@ -8,6 +8,15 @@ struct OnlineCLIApp: App {
         WindowGroup {
             RootView()
                 .environment(appModel)
+                .onOpenURL { url in
+                    guard let serverURL = ServerSettings.importedConnectionURLString(from: url) else {
+                        return
+                    }
+                    appModel.settings.baseURLString = serverURL
+                    Task {
+                        await appModel.refreshAll()
+                    }
+                }
         }
     }
 }

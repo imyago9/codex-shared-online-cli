@@ -4,6 +4,7 @@ const hintElement = document.getElementById('hint');
 const sessionSelectElement = document.getElementById('session-select');
 const createSessionButton = document.getElementById('new-session');
 const deleteSessionButton = document.getElementById('delete-session');
+const openIOSAppButton = document.getElementById('open-ios-app');
 const viewPillConsoleElement = document.getElementById('view-pill-console');
 const consoleViewElement = document.getElementById('console-view');
 const scrollSliderElement = document.getElementById('scroll-slider');
@@ -15,6 +16,13 @@ const isLikelyIOS =
   /iPad|iPhone|iPod/.test(navigator.userAgent) ||
   (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 const terminalScrollback = 200_000;
+
+if (isLikelyIOS && openIOSAppButton) {
+  openIOSAppButton.hidden = false;
+  openIOSAppButton.addEventListener('click', () => {
+    window.location.href = `/ios-connect`;
+  });
+}
 
 const state = {
   socket: null,
