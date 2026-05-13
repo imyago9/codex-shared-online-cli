@@ -141,6 +141,7 @@ final class RemoteDesktopClient {
     @ObservationIgnored private var firstFrameReceivedAt: TimeInterval = 0
     @ObservationIgnored private var lastFrameReceivedAt: TimeInterval = 0
     @ObservationIgnored private var lastFramePresentedAt: TimeInterval = 0
+    @ObservationIgnored private var lastVideoSamplePublishedAt: TimeInterval = 0
     private var lastControlPromptAt: TimeInterval = 0
     private let monitorLayoutSendInterval: TimeInterval = 1.0 / 30.0
     private var lastMonitorLayoutSendAt: TimeInterval = 0
@@ -229,6 +230,7 @@ final class RemoteDesktopClient {
         firstFrameReceivedAt = 0
         lastFrameReceivedAt = 0
         lastFramePresentedAt = 0
+        lastVideoSamplePublishedAt = 0
         webSocketTask?.cancel(with: .goingAway, reason: nil)
         webSocketTask = nil
         frameImage = nil
@@ -568,6 +570,7 @@ final class RemoteDesktopClient {
 
     private func publishVideoFrame(_ sample: RemoteVideoSample) {
         videoSequence &+= 1
+        lastVideoSamplePublishedAt = ProcessInfo.processInfo.systemUptime
         desktopSize = sample.pixelSize
         diagnosticsDraft.decodeMs = sample.packetizeMs
         diagnosticsDraft.frameBytes = sample.byteCount
@@ -817,6 +820,19 @@ final class RemoteDesktopClient {
 
         if now - lastFrameReceivedAt >= receiveTimeout {
             return .receive
+        }
+
+        if streamTransport == .video {
+            if lastVideoSamplePublishedAt <= 0 {
+                let firstReceivedAt = firstFrameReceivedAt > 0 ? firstFrameReceivedAt : lastFrameReceivedAt
+                return now - firstReceivedAt >= renderTimeout ? .render : nil
+            }
+
+            if now - lastVideoSamplePublishedAt >= renderTimeout {
+                return .render
+            }
+
+            return nil
         }
 
         if lastFramePresentedAt <= 0 {
